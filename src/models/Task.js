@@ -1,0 +1,32 @@
+import mongoose from 'mongoose';
+
+const TaskSchema = new mongoose.Schema(
+  {
+    date: { type: Date, required: true },
+    productTitle: { type: String, required: true },
+    link: { type: String, required: true },
+    sourcePrice: { type: Number, required: true },
+    sellingPrice: { type: Number, required: true },
+    quantity: { type: Number, required: true },
+    completedQuantity: { type: Number, default: 0 },
+    sourcePlatform: { type: mongoose.Schema.Types.ObjectId, ref: 'Platform', required: true },
+    range: { type: String, required: true },
+    category: { type: String, required: true },
+    listingPlatform: { type: mongoose.Schema.Types.ObjectId, ref: 'Platform', required: true },
+    store: { type: mongoose.Schema.Types.ObjectId, ref: 'Store', required: true },
+    assignedLister: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+    status: { type: String, enum: ['draft', 'assigned', 'completed'], default: 'draft' },
+    assignedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+    assignedAt: { type: Date },
+    completedAt: { type: Date }
+  },
+  { timestamps: true }
+);
+
+TaskSchema.index({ date: 1 });
+TaskSchema.index({ listingPlatform: 1, store: 1 });
+TaskSchema.index({ assignedLister: 1, status: 1, date: 1 });
+
+export default mongoose.model('Task', TaskSchema);
+
+
