@@ -9,6 +9,8 @@ import userRoutes from './routes/users.js';
 import platformRoutes from './routes/platforms.js';
 import storeRoutes from './routes/stores.js';
 import taskRoutes from './routes/tasks.js';
+import rangeRoutes from './routes/ranges.js';
+import categoryRoutes from './routes/categories.js';
 
 dotenv.config();
 
@@ -32,6 +34,8 @@ app.use('/api/users', userRoutes);
 app.use('/api/platforms', platformRoutes);
 app.use('/api/stores', storeRoutes);
 app.use('/api/tasks', taskRoutes);
+app.use('/api/ranges', rangeRoutes);
+app.use('/api/categories', categoryRoutes);
 
 const port = process.env.PORT || 5000;
 

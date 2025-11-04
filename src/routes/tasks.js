@@ -1,30 +1,33 @@
 import { Router } from 'express';
+import mongoose from 'mongoose';
 import { requireAuth, requireRole } from '../middleware/auth.js';
 import Task from '../models/Task.js';
 
 const router = Router();
 
-// Create a product research entry (admin or superadmin)
-router.post('/', requireAuth, requireRole('superadmin', 'admin'), async (req, res) => {
+// Create a product research entry (productadmin or superadmin)
+router.post('/', requireAuth, requireRole('superadmin', 'productadmin'), async (req, res) => {
   const body = req.body || {};
   try {
+    // normalize legacy field names and defaults
+    if (!body.supplierLink && body.link) body.supplierLink = body.link;
+    // createdBy is derived from auth; date defaults if not provided
     const task = await Task.create({
       date: body.date ? new Date(body.date) : new Date(),
       productTitle: body.productTitle,
-      link: body.link,
+      supplierLink: body.supplierLink,
       sourcePrice: body.sourcePrice,
       sellingPrice: body.sellingPrice,
-      quantity: body.quantity,
+      quantity: body.quantity || null,
       completedQuantity: 0,
       sourcePlatform: body.sourcePlatformId,
       range: body.range,
       category: body.category,
-      listingPlatform: body.listingPlatformId,
-      store: body.storeId,
+      listingPlatform: body.listingPlatformId || null,
+      store: body.storeId || null,
       assignedLister: body.assignedListerId || null,
-      status: body.assignedListerId ? 'assigned' : 'draft',
-      assignedBy: body.assignedListerId ? req.user.userId : null,
-      assignedAt: body.assignedListerId ? new Date() : null
+      status: 'draft',
+      createdBy: req.user.userId
     });
     res.json(task);
   } catch (e) {
@@ -32,11 +35,13 @@ router.post('/', requireAuth, requireRole('superadmin', 'admin'), async (req, re
   }
 });
 
-// List tasks (admins see all; listers see assigned to them)
+// List tasks (productadmin see all; listingadmin see all; listers see assigned to them)
 router.get('/', requireAuth, async (req, res) => {
   const { role, userId } = req.user;
-  const { platformId, storeId, listerId, date } = req.query || {};
+  const { platformId, storeId, listerId, date, page = 1, limit = 10, sortBy = 'date', sortOrder = 'desc', search } = req.query || {};
   const query = role === 'lister' ? { assignedLister: userId } : {};
+
+  // Basic filters
   if (role !== 'lister') {
     if (platformId) query.listingPlatform = platformId;
     if (storeId) query.store = storeId;
@@ -48,22 +53,63 @@ router.get('/', requireAuth, async (req, res) => {
       query.date = { $gte: start, $lt: end };
     }
   }
-  const tasks = await Task.find(query)
-    .populate('sourcePlatform')
-    .populate('listingPlatform')
-    .populate('store')
-    .populate('assignedLister', 'email username')
-    .sort({ createdAt: -1 });
-  res.json(tasks);
+
+  // Search functionality
+  if (search) {
+    query.$or = [
+      { productTitle: { $regex: search, $options: 'i' } },
+      { supplierLink: { $regex: search, $options: 'i' } }
+    ];
+  }
+
+  try {
+    // Calculate total count for pagination
+    const total = await Task.countDocuments(query);
+
+    // Prepare sort options
+    const sortOptions = {};
+    sortOptions[sortBy] = sortOrder === 'desc' ? -1 : 1;
+
+    // Get paginated and sorted results
+    const tasks = await Task.find(query)
+      .sort(sortOptions)
+      .skip((Number(page) - 1) * Number(limit))
+      .limit(Number(limit))
+      .populate('sourcePlatform')
+      .populate('listingPlatform')
+      .populate('store')
+      .populate('assignedLister', 'email username')
+      .populate('createdBy', 'username');
+
+    // If the client did not request pagination (legacy clients), return the raw tasks array
+    if (!req.query.page) {
+      return res.json(tasks);
+    }
+
+    res.json({
+      tasks,
+      total,
+      page: Number(page),
+      totalPages: Math.ceil(total / Number(limit))
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
-// Assign a task to a lister (from draft)
-router.post('/:id/assign', requireAuth, requireRole('superadmin', 'admin'), async (req, res) => {
-  const { listerId } = req.body || {};
+// Assign a task to a lister (listingadmin or superadmin)
+router.post('/:id/assign', requireAuth, requireRole('superadmin', 'listingadmin'), async (req, res) => {
+  const { listerId, quantity, listingPlatformId, storeId } = req.body || {};
   if (!listerId) return res.status(400).json({ error: 'listerId required' });
+  if (!quantity) return res.status(400).json({ error: 'quantity required' });
+  if (!listingPlatformId) return res.status(400).json({ error: 'listingPlatformId required' });
+  if (!storeId) return res.status(400).json({ error: 'storeId required' });
   const task = await Task.findById(req.params.id);
   if (!task) return res.status(404).json({ error: 'Not found' });
   task.assignedLister = listerId;
+  task.quantity = quantity;
+  task.listingPlatform = listingPlatformId;
+  task.store = storeId;
   task.status = 'assigned';
   task.assignedBy = req.user.userId;
   task.assignedAt = new Date();
@@ -71,15 +117,27 @@ router.post('/:id/assign', requireAuth, requireRole('superadmin', 'admin'), asyn
   res.json(task);
 });
 
-// Update task fields (admin/superadmin), only when not completed
-router.put('/:id', requireAuth, requireRole('superadmin', 'admin'), async (req, res) => {
+// Update task fields (productadmin edits product fields; listingadmin can reassign)
+router.put('/:id', requireAuth, requireRole('superadmin', 'productadmin', 'listingadmin'), async (req, res) => {
+  const { role } = req.user;
   const updates = req.body || {};
   const task = await Task.findById(req.params.id);
   if (!task) return res.status(404).json({ error: 'Not found' });
-  if (task.status === 'completed') return res.status(400).json({ error: 'Cannot edit completed task' });
-  const editable = ['date','productTitle','link','sourcePrice','sellingPrice','quantity','range','category','sourcePlatform','listingPlatform','store'];
-  for (const k of editable) {
-    if (updates[k] !== undefined) task[k] = updates[k];
+  if (role === 'productadmin') {
+    // Product admin can only edit product fields (not listing fields)
+    const editable = ['date','productTitle','supplierLink','sourcePrice','sellingPrice','range','category','sourcePlatform'];
+    for (const k of editable) {
+      if (updates[k] !== undefined) {
+        if (k === 'sourcePlatform') task.sourcePlatform = updates[k];
+        else task[k] = updates[k];
+      }
+    }
+  } else if (role === 'listingadmin' || role === 'superadmin') {
+    // Listing admin can reassign lister, update quantity, listing platform, store
+    if (updates.listerId !== undefined) task.assignedLister = updates.listerId;
+    if (updates.quantity !== undefined) task.quantity = updates.quantity;
+    if (updates.listingPlatformId !== undefined) task.listingPlatform = updates.listingPlatformId;
+    if (updates.storeId !== undefined) task.store = updates.storeId;
   }
   await task.save();
   res.json(task);
@@ -105,7 +163,7 @@ router.post('/:id/complete', requireAuth, requireRole('lister'), async (req, res
 });
 
 // Admin-side analytics (platform/store/lister/date filters)
-router.get('/analytics', requireAuth, requireRole('superadmin', 'admin'), async (req, res) => {
+router.get('/analytics', requireAuth, requireRole('superadmin', 'productadmin', 'listingadmin'), async (req, res) => {
   const { platformId, storeId, listerId, date } = req.query || {};
   const match = {};
   if (platformId) match.listingPlatform = platformId;
@@ -127,13 +185,15 @@ router.get('/analytics', requireAuth, requireRole('superadmin', 'admin'), async 
         numListers: { $addToSet: '$assignedLister' },
         numStores: { $addToSet: '$store' },
         ranges: { $addToSet: '$range' },
-        categories: { $addToSet: '$category' }
+        categories: { $addToSet: '$category' },
+        completedQty: { $sum: { $ifNull: ['$completedQuantity', 0] } },
       }
     },
     {
       $project: {
         _id: 0,
         totalListings: 1,
+        completedQty: 1,
         numListers: { $size: '$numListers' },
         numStores: { $size: '$numStores' },
         numRanges: { $size: '$ranges' },
@@ -146,8 +206,8 @@ router.get('/analytics', requireAuth, requireRole('superadmin', 'admin'), async 
   res.json(result || { totalListings: 0, numListers: 0, numStores: 0, numRanges: 0, numCategories: 0 });
 });
 
-// Superadmin/admin: admin-lister assignment summary
-router.get('/analytics/admin-lister', requireAuth, requireRole('superadmin', 'admin'), async (req, res) => {
+// Superadmin/listingadmin: admin-lister assignment summary
+router.get('/analytics/admin-lister', requireAuth, requireRole('superadmin', 'listingadmin'), async (req, res) => {
   const { platformId, storeId, listerId, date } = req.query || {};
   const match = {};
   if (platformId) match.listingPlatform = platformId;
@@ -164,11 +224,11 @@ router.get('/analytics/admin-lister', requireAuth, requireRole('superadmin', 'ad
     { $match: match },
     {
       $group: {
-        _id: { admin: '$assignedBy', lister: '$assignedLister' },
+        _id: { day: { $dateToString: { format: '%Y-%m-%d', date: '$date' } }, admin: '$assignedBy', lister: '$assignedLister' },
         tasksCount: { $sum: 1 },
-        quantityTotal: { $sum: '$quantity' },
-        completedCount: { $sum: { $cond: [{ $eq: ['$status', 'completed'] }, 1, 0] } },
-        completedQty: { $sum: { $cond: [{ $eq: ['$status', 'completed'] }, '$quantity', 0] } }
+        quantityTotal: { $sum: { $ifNull: ['$quantity', 0] } },
+        completedCount: { $sum: { $cond: [{ $gt: ['$completedQuantity', 0] }, 1, 0] } },
+        completedQty: { $sum: { $ifNull: ['$completedQuantity', 0] } }
       }
     },
     {
@@ -182,6 +242,7 @@ router.get('/analytics/admin-lister', requireAuth, requireRole('superadmin', 'ad
     {
       $project: {
         _id: 0,
+        date: '$_id.day',
         adminId: '$_id.admin',
         listerId: '$_id.lister',
         adminName: '$admin.username',
@@ -192,7 +253,7 @@ router.get('/analytics/admin-lister', requireAuth, requireRole('superadmin', 'ad
         completedQty: 1
       }
     },
-    { $sort: { adminName: 1, listerName: 1 } }
+    { $sort: { date: -1, adminName: 1, listerName: 1 } }
   ];
 
   const rows = await Task.aggregate(pipeline);
@@ -200,7 +261,7 @@ router.get('/analytics/admin-lister', requireAuth, requireRole('superadmin', 'ad
 });
 
 // Daily totals (optionally filtered by platform/store/lister)
-router.get('/analytics/daily', requireAuth, requireRole('superadmin', 'admin'), async (req, res) => {
+router.get('/analytics/daily', requireAuth, requireRole('superadmin', 'productadmin', 'listingadmin'), async (req, res) => {
   const { platformId, storeId, listerId } = req.query || {};
   const match = {};
   if (platformId) match.listingPlatform = platformId;
@@ -238,7 +299,7 @@ router.get('/analytics/daily', requireAuth, requireRole('superadmin', 'admin'), 
 });
 
 // Per-lister per day with platform/store breakdown
-router.get('/analytics/lister-daily', requireAuth, requireRole('superadmin', 'admin'), async (req, res) => {
+router.get('/analytics/lister-daily', requireAuth, requireRole('superadmin', 'listingadmin'), async (req, res) => {
   const { listerId, platformId, storeId } = req.query || {};
   const match = {};
   if (listerId) match.assignedLister = listerId;
@@ -278,6 +339,65 @@ router.get('/analytics/lister-daily', requireAuth, requireRole('superadmin', 'ad
         completedQty: 1,
         numRanges: { $size: '$ranges' },
         numCategories: { $size: '$categories' }
+      }
+    },
+    { $sort: { date: -1, platform: 1, store: 1 } }
+  ];
+
+  const rows = await Task.aggregate(pipeline);
+  res.json(rows);
+});
+
+// Listings summary grouped by assignment-day, platform and store (optional filters: platformId, storeId)
+router.get('/analytics/listings-summary', requireAuth, requireRole('superadmin', 'listingadmin', 'productadmin'), async (req, res) => {
+  const { platformId, storeId } = req.query || {};
+  const match = {};
+  if (platformId) match.listingPlatform = new mongoose.Types.ObjectId(platformId);
+  if (storeId) match.store = new mongoose.Types.ObjectId(storeId);
+
+  // Include both assigned and completed tasks
+  match.status = { $in: ['assigned', 'completed'] };
+  
+  const pipeline = [
+    { $match: match },
+    // Look up platform first to ensure we only get listing platforms
+    { $lookup: { from: 'platforms', localField: 'listingPlatform', foreignField: '_id', as: 'platformData' } },
+    { $unwind: '$platformData' },
+    // Only include tasks for listing platforms
+    { $match: { 'platformData.type': 'listing' } },
+    // Look up store
+    { $lookup: { from: 'stores', localField: 'store', foreignField: '_id', as: 'storeData' } },
+    { $unwind: { path: '$storeData', preserveNullAndEmptyArrays: true } },
+    // Group by day, platform, and store
+    {
+      $group: {
+        _id: {
+          day: { $dateToString: { format: '%Y-%m-%d', date: { $ifNull: ['$assignedAt', '$date'] } } },
+          platform: '$listingPlatform',
+          platformName: '$platformData.name',
+          store: '$store',
+          storeName: '$storeData.name'
+        },
+        totalQuantity: { $sum: { $ifNull: ['$quantity', 0] } },
+        listers: { $addToSet: '$assignedLister' },
+        ranges: { $addToSet: '$range' },
+        categories: { $addToSet: '$category' },
+        assignmentsCount: { $sum: 1 }
+      }
+    },
+    {
+      $project: {
+        _id: 0,
+        date: '$_id.day',
+        platformId: '$_id.platform',
+        platform: '$_id.platformName',
+        storeId: '$_id.store',
+        store: '$_id.storeName',
+        totalQuantity: 1,
+        numListers: { $size: '$listers' },
+        numRanges: { $size: '$ranges' },
+        numCategories: { $size: '$categories' },
+        assignmentsCount: 1
       }
     },
     { $sort: { date: -1, platform: 1, store: 1 } }
