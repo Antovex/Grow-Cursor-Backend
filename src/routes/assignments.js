@@ -291,4 +291,100 @@ router.get('/analytics/listings-summary',
   }
 );
 
+// ===== STOCK LEDGER: totals by (platform, store, category, range) =====
+router.get(
+  '/analytics/stock-ledger',
+  requireAuth,
+  requireRole('superadmin', 'listingadmin', 'productadmin'),
+  async (req, res) => {
+    try {
+      const { platformId, storeId, category, range } = req.query || {};
+      const match = {};
+      if (platformId) match.listingPlatform = new mongoose.Types.ObjectId(platformId);
+      if (storeId) match.store = new mongoose.Types.ObjectId(storeId);
+
+      // We need category & range from the linked Task
+      const pipeline = [
+        ...(platformId ? [{ $match: { listingPlatform: new mongoose.Types.ObjectId(platformId) } }] : []),
+        ...(storeId ? [{ $match: { store: new mongoose.Types.ObjectId(storeId) } }] : []),
+
+        // Pull category & range off the Task
+        { $lookup: { from: 'tasks', localField: 'task', foreignField: '_id', as: 'task' } },
+        { $unwind: '$task' },
+
+        // (Optional) filters for category/range after join
+        ...(category ? [{ $match: { 'task.category': category } }] : []),
+        ...(range ? [{ $match: { 'task.range': range } }] : []),
+
+        {
+          $project: {
+            platformId: '$listingPlatform',
+            storeId: '$store',
+            quantity: 1,
+            completedQuantity: { $ifNull: ['$completedQuantity', 0] },
+            category: '$task.category',
+            range: '$task.range'
+          }
+        },
+        {
+          $group: {
+            _id: {
+              platformId: '$platformId',
+              storeId: '$storeId',
+              category: '$category',
+              range: '$range'
+            },
+            totalAssigned: { $sum: '$quantity' },
+            totalCompleted: { $sum: '$completedQuantity' }
+          }
+        },
+        {
+          $project: {
+            _id: 0,
+            platformId: '$_id.platformId',
+            storeId: '$_id.storeId',
+            category: '$_id.category',
+            range: '$_id.range',
+            totalAssigned: 1,
+            totalCompleted: 1,
+            pending: {
+              $cond: [
+                { $gt: [{ $subtract: ['$totalAssigned', '$totalCompleted'] }, 0] },
+                { $subtract: ['$totalAssigned', '$totalCompleted'] },
+                0
+              ]
+            }
+          }
+        },
+        // Look up names
+        { $lookup: { from: 'platforms', localField: 'platformId', foreignField: '_id', as: 'platformDoc' } },
+        { $unwind: { path: '$platformDoc', preserveNullAndEmptyArrays: true } },
+        { $lookup: { from: 'stores', localField: 'storeId', foreignField: '_id', as: 'storeDoc' } },
+        { $unwind: { path: '$storeDoc', preserveNullAndEmptyArrays: true } },
+        {
+          $project: {
+            platformId: 1,
+            platform: { $ifNull: ['$platformDoc.name', null] },
+            storeId: 1,
+            store: { $ifNull: ['$storeDoc.name', null] },
+            category: 1,
+            range: 1,
+            totalAssigned: 1,
+            totalCompleted: 1,
+            pending: 1
+          }
+        },
+        { $sort: { platform: 1, store: 1, category: 1, range: 1 } }
+      ];
+
+      const rows = await Assignment.aggregate(pipeline);
+      res.json(rows);
+    } catch (e) {
+      console.error(e);
+      res.status(500).json({ message: 'Failed to compute stock ledger.' });
+    }
+  }
+);
+
+
 export default router;

@@ -125,7 +125,7 @@ router.put('/:id', requireAuth, requireRole('superadmin', 'productadmin', 'listi
   const updates = req.body || {};
   const task = await Task.findById(req.params.id);
   if (!task) return res.status(404).json({ error: 'Not found' });
-  if (role === 'productadmin') {
+  if (role === 'productadmin' || role === 'superadmin') {
     // Product admin can only edit product fields (not listing fields)
     const editable = ['date','productTitle','supplierLink','sourcePrice','sellingPrice','range','category','sourcePlatform'];
     for (const k of editable) {
