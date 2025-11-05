@@ -118,6 +118,54 @@ router.get('/mine',
     }
   }
 );
+router.get('/mine/with-status',
+  requireAuth,
+  requireRole('superadmin', 'listingadmin', 'lister'),
+  async (req, res) => {
+    try {
+      const me = req.user?.userId || req.user?.id;
+      if (!me) return res.status(401).json({ message: 'Unauthorized' });
+
+      const meObjId = mongoose.Types.ObjectId.isValid(me) ? new mongoose.Types.ObjectId(me) : me;
+
+      const allAssignments = await Assignment.find({ lister: meObjId })
+        .populate([
+          { path: 'task', populate: [{ path: 'sourcePlatform createdBy', select: 'name username' }] },
+          { path: 'listingPlatform', select: 'name' },
+          { path: 'store', select: 'name' },
+        ])
+        .sort({ createdAt: -1 });
+
+      const today = new Date();
+      const startOfToday = new Date(today.getFullYear(), today.getMonth(), today.getDate());
+      const endOfToday = new Date(today.getFullYear(), today.getMonth(), today.getDate() + 1);
+
+      const todaysTasks = [];
+      const pendingTasks = [];
+      const completedTasks = [];
+
+      for (const a of allAssignments) {
+        const isCompleted = (a.completedQuantity || 0) >= a.quantity;
+        const createdAt = new Date(a.createdAt);
+        const isToday = createdAt >= startOfToday && createdAt < endOfToday;
+
+        if (isCompleted) {
+          completedTasks.push(a);
+        } else if (isToday) {
+          todaysTasks.push(a);
+        } else {
+          pendingTasks.push(a);
+        }
+      }
+
+      res.json({ todaysTasks, pendingTasks, completedTasks });
+    } catch (e) {
+      console.error(e);
+      res.status(500).json({ message: 'Failed to fetch categorized assignments.' });
+    }
+  }
+);
+
 
 // Lister/admin completes an assignment
 router.post('/:id/complete',
