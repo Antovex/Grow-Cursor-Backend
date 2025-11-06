@@ -21,14 +21,16 @@ router.post('/', requireAuth, requireRole('superadmin', 'productadmin'), async (
       quantity: body.quantity || null,
       completedQuantity: 0,
       sourcePlatform: body.sourcePlatformId,
-      range: body.range,
-      category: body.category,
+      category: body.categoryId,
+      subcategory: body.subcategoryId,
+      range: body.rangeId || null,
       listingPlatform: body.listingPlatformId || null,
       store: body.storeId || null,
       assignedLister: body.assignedListerId || null,
       status: 'draft',
       createdBy: req.user.userId
     });
+    await task.populate(['category', 'subcategory', 'range', 'sourcePlatform']);
     res.json(task);
   } catch (e) {
     res.status(400).json({ error: e.message });
@@ -68,6 +70,9 @@ router.get('/', requireAuth, async (req, res) => {
     const base = Task.find(query)
       .sort(sortOptions)
       .populate('sourcePlatform')
+      .populate('category')
+      .populate('subcategory')
+      .populate('range')
       .populate('listingPlatform')
       .populate('store')
       .populate('assignedLister', 'email username')
@@ -127,13 +132,15 @@ router.put('/:id', requireAuth, requireRole('superadmin', 'productadmin', 'listi
   if (!task) return res.status(404).json({ error: 'Not found' });
   if (role === 'productadmin' || role === 'superadmin') {
     // Product admin can only edit product fields (not listing fields)
-    const editable = ['date','productTitle','supplierLink','sourcePrice','sellingPrice','range','category','sourcePlatform'];
-    for (const k of editable) {
-      if (updates[k] !== undefined) {
-        if (k === 'sourcePlatform') task.sourcePlatform = updates[k];
-        else task[k] = updates[k];
-      }
-    }
+    if (updates.date !== undefined) task.date = new Date(updates.date);
+    if (updates.productTitle !== undefined) task.productTitle = updates.productTitle;
+    if (updates.supplierLink !== undefined) task.supplierLink = updates.supplierLink;
+    if (updates.sourcePrice !== undefined) task.sourcePrice = updates.sourcePrice;
+    if (updates.sellingPrice !== undefined) task.sellingPrice = updates.sellingPrice;
+    if (updates.sourcePlatformId !== undefined) task.sourcePlatform = updates.sourcePlatformId;
+    if (updates.categoryId !== undefined) task.category = updates.categoryId;
+    if (updates.subcategoryId !== undefined) task.subcategory = updates.subcategoryId;
+    if (updates.rangeId !== undefined) task.range = updates.rangeId;
   } else if (role === 'listingadmin' || role === 'superadmin') {
     // Listing admin can reassign lister, update quantity, listing platform, store
     if (updates.listerId !== undefined) task.assignedLister = updates.listerId;
@@ -142,6 +149,7 @@ router.put('/:id', requireAuth, requireRole('superadmin', 'productadmin', 'listi
     if (updates.storeId !== undefined) task.store = updates.storeId;
   }
   await task.save();
+  await task.populate(['category', 'subcategory', 'range', 'sourcePlatform', 'listingPlatform', 'store', 'assignedLister', 'createdBy']);
   res.json(task);
 });
 
@@ -186,8 +194,8 @@ router.get('/analytics', requireAuth, requireRole('superadmin', 'productadmin', 
         totalListings: { $sum: '$quantity' },
         numListers: { $addToSet: '$assignedLister' },
         numStores: { $addToSet: '$store' },
-        ranges: { $addToSet: '$range' },
         categories: { $addToSet: '$category' },
+        subcategories: { $addToSet: '$subcategory' },
         completedQty: { $sum: { $ifNull: ['$completedQuantity', 0] } },
       }
     },
@@ -198,14 +206,14 @@ router.get('/analytics', requireAuth, requireRole('superadmin', 'productadmin', 
         completedQty: 1,
         numListers: { $size: '$numListers' },
         numStores: { $size: '$numStores' },
-        numRanges: { $size: '$ranges' },
-        numCategories: { $size: '$categories' }
+        numCategories: { $size: '$categories' },
+        numSubcategories: { $size: '$subcategories' }
       }
     }
   ];
 
   const [result] = await Task.aggregate(pipeline);
-  res.json(result || { totalListings: 0, numListers: 0, numStores: 0, numRanges: 0, numCategories: 0 });
+  res.json(result || { totalListings: 0, numListers: 0, numStores: 0, numCategories: 0, numSubcategories: 0 });
 });
 
 // Superadmin/listingadmin: admin-lister assignment summary
@@ -278,8 +286,8 @@ router.get('/analytics/daily', requireAuth, requireRole('superadmin', 'productad
         totalQuantity: { $sum: '$quantity' },
         numListers: { $addToSet: '$assignedLister' },
         numStores: { $addToSet: '$store' },
-        ranges: { $addToSet: '$range' },
-        categories: { $addToSet: '$category' }
+        categories: { $addToSet: '$category' },
+        subcategories: { $addToSet: '$subcategory' }
       }
     },
     {
@@ -289,8 +297,8 @@ router.get('/analytics/daily', requireAuth, requireRole('superadmin', 'productad
         totalQuantity: 1,
         numListers: { $size: '$numListers' },
         numStores: { $size: '$numStores' },
-        numRanges: { $size: '$ranges' },
-        numCategories: { $size: '$categories' }
+        numCategories: { $size: '$categories' },
+        numSubcategories: { $size: '$subcategories' }
       }
     },
     { $sort: { date: -1 } }
@@ -339,8 +347,8 @@ router.get('/analytics/lister-daily', requireAuth, requireRole('superadmin', 'li
         quantityTotal: 1,
         completedCount: 1,
         completedQty: 1,
-        numRanges: { $size: '$ranges' },
-        numCategories: { $size: '$categories' }
+        numCategories: { $size: '$categories' },
+        numSubcategories: { $size: '$subcategories' }
       }
     },
     { $sort: { date: -1, platform: 1, store: 1 } }
@@ -397,8 +405,8 @@ router.get('/analytics/listings-summary', requireAuth, requireRole('superadmin',
         store: '$_id.storeName',
         totalQuantity: 1,
         numListers: { $size: '$listers' },
-        numRanges: { $size: '$ranges' },
         numCategories: { $size: '$categories' },
+        numSubcategories: { $size: '$subcategories' },
         assignmentsCount: 1
       }
     },

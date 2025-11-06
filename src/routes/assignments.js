@@ -4,6 +4,7 @@ import mongoose from 'mongoose';
 import { requireAuth, requireRole } from '../middleware/auth.js';
 import Assignment from '../models/Assignment.js';
 import Task from '../models/Task.js';
+import Range from '../models/Range.js'
 
 const IST_TZ = '+05:30';
 
@@ -61,11 +62,12 @@ router.get('/', requireAuth, requireRole('superadmin', 'listingadmin', 'producta
 
     const cursor = Assignment.find(q)
       .populate([
-        { path: 'task', populate: [{ path: 'sourcePlatform createdBy', select: 'name username' }] },
+        { path: 'task', populate: [{ path: 'sourcePlatform createdBy category subcategory range', select: 'name username' }] },
         { path: 'lister', select: 'username email' },
         { path: 'listingPlatform', select: 'name' },
         { path: 'store', select: 'name' },
         { path: 'createdBy', select: 'username' },
+        { path: 'rangeQuantities.range', select: 'name' },
       ])
       .sort({ [sortBy]: sortOrder === 'asc' ? 1 : -1 });
 
@@ -105,9 +107,10 @@ router.get('/mine',
 
       const items = await Assignment.find({ lister: meObjId })
         .populate([
-          { path: 'task', populate: [{ path: 'sourcePlatform createdBy', select: 'name username' }] },
+          { path: 'task', populate: [{ path: 'sourcePlatform createdBy category subcategory range', select: 'name username' }] },
           { path: 'listingPlatform', select: 'name' },
           { path: 'store', select: 'name' },
+          { path: 'rangeQuantities.range', select: 'name' },
         ])
         .sort({ createdAt: -1 });
 
@@ -130,9 +133,10 @@ router.get('/mine/with-status',
 
       const allAssignments = await Assignment.find({ lister: meObjId })
         .populate([
-          { path: 'task', populate: [{ path: 'sourcePlatform createdBy', select: 'name username' }] },
+          { path: 'task', populate: [{ path: 'sourcePlatform createdBy category subcategory range', select: 'name username' }] },
           { path: 'listingPlatform', select: 'name' },
           { path: 'store', select: 'name' },
+          { path: 'rangeQuantities.range', select: 'name' },
         ])
         .sort({ createdAt: -1 });
 
@@ -145,7 +149,9 @@ router.get('/mine/with-status',
       const completedTasks = [];
 
       for (const a of allAssignments) {
-        const isCompleted = (a.completedQuantity || 0) >= a.quantity;
+        // Check completion based on rangeQuantities sum or completedQuantity
+        const rangeQuantitiesSum = (a.rangeQuantities || []).reduce((sum, rq) => sum + (rq.quantity || 0), 0);
+        const isCompleted = rangeQuantitiesSum >= a.quantity || (a.completedQuantity || 0) >= a.quantity;
         const createdAt = new Date(a.createdAt);
         const isToday = createdAt >= startOfToday && createdAt < endOfToday;
 
@@ -282,19 +288,33 @@ router.get('/analytics/listings-summary',
             listerId: "$lister",
             quantity: 1,
             completedQuantity: { $ifNull: ["$completedQuantity", 0] },
-            range: "$task.range",
-            category: "$task.category"
+            categoryId: "$task.category",
+            subcategoryId: "$task.subcategory",
+            rangeQuantities: { $ifNull: ["$rangeQuantities", []] }
           }
         },
+        // Store assignment-level data before unwinding
+        {
+          $addFields: {
+            assignmentId: "$_id",
+            assignmentQuantity: "$quantity",
+            assignmentCompletedQty: "$completedQuantity"
+          }
+        },
+        // Unwind rangeQuantities to get individual ranges
+        { $unwind: { path: "$rangeQuantities", preserveNullAndEmptyArrays: true } },
         {
           $group: {
             _id: { date: "$date", platformId: "$platformId", storeId: "$storeId" },
-            totalQuantity: { $sum: "$quantity" },
-            assignmentsCount: { $sum: 1 },
-            completedQty: { $sum: "$completedQuantity" },
+            // Use $addToSet to get unique assignment quantities (each assignment counted once)
+            assignmentQuantities: { $addToSet: "$assignmentQuantity" },
+            assignmentCompletedQuantities: { $addToSet: "$assignmentCompletedQty" },
+            // Count unique assignments (not ranges)
+            assignmentIds: { $addToSet: "$assignmentId" },
             listers: { $addToSet: "$listerId" },
-            ranges: { $addToSet: "$range" },
-            categories: { $addToSet: "$category" }
+            categories: { $addToSet: "$categoryId" },
+            subcategories: { $addToSet: "$subcategoryId" },
+            ranges: { $addToSet: "$rangeQuantities.range" }
           }
         },
         {
@@ -303,12 +323,13 @@ router.get('/analytics/listings-summary',
             date: "$_id.date",
             platformId: "$_id.platformId",
             storeId: "$_id.storeId",
-            totalQuantity: 1,
-            assignmentsCount: 1,
-            completedQty: 1,
+            totalQuantity: { $sum: "$assignmentQuantities" },
+            assignmentsCount: { $size: "$assignmentIds" },
+            completedQty: { $sum: "$assignmentCompletedQuantities" },
             numListers: { $size: "$listers" },
-            numRanges: { $size: "$ranges" },
-            numCategories: { $size: "$categories" }
+            numCategories: { $size: "$categories" },
+            numSubcategories: { $size: "$subcategories" },
+            numRanges: { $size: { $filter: { input: "$ranges", as: "r", cond: { $ne: ["$$r", null] } } } }
           }
         },
         { $lookup: { from: "platforms", localField: "platformId", foreignField: "_id", as: "platformDoc" } },
@@ -346,32 +367,41 @@ router.get(
   requireRole('superadmin', 'listingadmin', 'productadmin'),
   async (req, res) => {
     try {
-      const { platformId, storeId, category, range } = req.query || {};
+      const { platformId, storeId, categoryId, subcategoryId } = req.query || {};
       const match = {};
       if (platformId) match.listingPlatform = new mongoose.Types.ObjectId(platformId);
       if (storeId) match.store = new mongoose.Types.ObjectId(storeId);
 
-      // We need category & range from the linked Task
+      // We need category & subcategory from the linked Task, and ranges from rangeQuantities
       const pipeline = [
         ...(platformId ? [{ $match: { listingPlatform: new mongoose.Types.ObjectId(platformId) } }] : []),
         ...(storeId ? [{ $match: { store: new mongoose.Types.ObjectId(storeId) } }] : []),
 
-        // Pull category & range off the Task
+        // Pull category & subcategory off the Task
         { $lookup: { from: 'tasks', localField: 'task', foreignField: '_id', as: 'task' } },
         { $unwind: '$task' },
 
-        // (Optional) filters for category/range after join
-        ...(category ? [{ $match: { 'task.category': category } }] : []),
-        ...(range ? [{ $match: { 'task.range': range } }] : []),
+        // (Optional) filters for category/subcategory after join
+        ...(categoryId ? [{ $match: { 'task.category': new mongoose.Types.ObjectId(categoryId) } }] : []),
+        ...(subcategoryId ? [{ $match: { 'task.subcategory': new mongoose.Types.ObjectId(subcategoryId) } }] : []),
+
+        // Unwind rangeQuantities to get individual range-quantity pairs
+        { $unwind: { path: '$rangeQuantities', preserveNullAndEmptyArrays: false } },
+
+        // Filter out entries with quantity 0
+        { $match: { 'rangeQuantities.quantity': { $gt: 0 } } },
 
         {
           $project: {
             platformId: '$listingPlatform',
             storeId: '$store',
-            quantity: 1,
-            completedQuantity: { $ifNull: ['$completedQuantity', 0] },
-            category: '$task.category',
-            range: '$task.range'
+            categoryId: '$task.category',
+            subcategoryId: '$task.subcategory',
+            rangeId: '$rangeQuantities.range',
+            rangeQuantity: { $ifNull: ['$rangeQuantities.quantity', 0] },
+            // Store assignment quantity and assignment ID for proper grouping
+            assignmentId: '$_id',
+            assignmentQuantity: '$quantity'
           }
         },
         {
@@ -379,26 +409,32 @@ router.get(
             _id: {
               platformId: '$platformId',
               storeId: '$storeId',
-              category: '$category',
-              range: '$range'
+              categoryId: '$categoryId',
+              subcategoryId: '$subcategoryId',
+              rangeId: '$rangeId'
             },
-            totalAssigned: { $sum: '$quantity' },
-            totalCompleted: { $sum: '$completedQuantity' }
+            // For assigned: sum the assignment quantity, but only count each assignment once
+            assignmentIds: { $addToSet: '$assignmentId' },
+            assignmentQuantities: { $addToSet: '$assignmentQuantity' },
+            totalCompleted: { $sum: '$rangeQuantity' } // Sum of distributed quantities
           }
         },
         {
+          // Calculate totalAssigned from assignment quantities (each assignment counted once)
           $project: {
             _id: 0,
             platformId: '$_id.platformId',
             storeId: '$_id.storeId',
-            category: '$_id.category',
-            range: '$_id.range',
-            totalAssigned: 1,
+            categoryId: '$_id.categoryId',
+            subcategoryId: '$_id.subcategoryId',
+            rangeId: '$_id.rangeId',
+            // Sum unique assignment quantities (each assignment contributes its full quantity)
+            totalAssigned: { $sum: '$assignmentQuantities' },
             totalCompleted: 1,
             pending: {
               $cond: [
-                { $gt: [{ $subtract: ['$totalAssigned', '$totalCompleted'] }, 0] },
-                { $subtract: ['$totalAssigned', '$totalCompleted'] },
+                { $gt: [{ $subtract: [{ $sum: '$assignmentQuantities' }, '$totalCompleted'] }, 0] },
+                { $subtract: [{ $sum: '$assignmentQuantities' }, '$totalCompleted'] },
                 0
               ]
             }
@@ -409,20 +445,30 @@ router.get(
         { $unwind: { path: '$platformDoc', preserveNullAndEmptyArrays: true } },
         { $lookup: { from: 'stores', localField: 'storeId', foreignField: '_id', as: 'storeDoc' } },
         { $unwind: { path: '$storeDoc', preserveNullAndEmptyArrays: true } },
+        { $lookup: { from: 'categories', localField: 'categoryId', foreignField: '_id', as: 'categoryDoc' } },
+        { $unwind: { path: '$categoryDoc', preserveNullAndEmptyArrays: true } },
+        { $lookup: { from: 'subcategories', localField: 'subcategoryId', foreignField: '_id', as: 'subcategoryDoc' } },
+        { $unwind: { path: '$subcategoryDoc', preserveNullAndEmptyArrays: true } },
+        { $lookup: { from: 'ranges', localField: 'rangeId', foreignField: '_id', as: 'rangeDoc' } },
+        { $unwind: { path: '$rangeDoc', preserveNullAndEmptyArrays: true } },
         {
           $project: {
             platformId: 1,
             platform: { $ifNull: ['$platformDoc.name', null] },
             storeId: 1,
             store: { $ifNull: ['$storeDoc.name', null] },
-            category: 1,
-            range: 1,
+            categoryId: 1,
+            category: { $ifNull: ['$categoryDoc.name', null] },
+            subcategoryId: 1,
+            subcategory: { $ifNull: ['$subcategoryDoc.name', null] },
+            rangeId: 1,
+            range: { $ifNull: ['$rangeDoc.name', null] },
             totalAssigned: 1,
             totalCompleted: 1,
             pending: 1
           }
         },
-        { $sort: { platform: 1, store: 1, category: 1, range: 1 } }
+        { $sort: { platform: 1, store: 1, category: 1, subcategory: 1, range: 1 } }
       ];
 
       const rows = await Assignment.aggregate(pipeline);
@@ -434,5 +480,155 @@ router.get(
   }
 );
 
+/* -------------------- RANGE QUANTITY DISTRIBUTION -------------------- */
+
+// Get range quantity distribution for an assignment
+router.get('/:id/ranges',
+  requireAuth,
+  requireRole('superadmin', 'listingadmin', 'lister'),
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+      const doc = await Assignment.findById(id)
+        .populate('rangeQuantities.range', 'name')
+        .populate('task', 'category subcategory');
+      
+      if (!doc) return res.status(404).json({ message: 'Assignment not found' });
+
+      const me = req.user?.userId || req.user?.id;
+      const isAdmin = ['superadmin', 'listingadmin'].includes(req.user?.role);
+      
+      // Lister can only view their own assignments
+      if (!isAdmin && String(doc.lister) !== String(me)) {
+        return res.status(403).json({ message: 'Forbidden' });
+      }
+
+      res.json(doc.rangeQuantities || []);
+    } catch (e) {
+      console.error(e);
+      res.status(500).json({ message: 'Failed to fetch range quantities.' });
+    }
+  }
+);
+
+// Add or update range quantity for an assignment
+router.post('/:id/complete-range',
+  requireAuth,
+  requireRole('superadmin', 'listingadmin', 'lister'),
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+      const { rangeId, quantity } = req.body || {};
+      
+      if (!rangeId || quantity == null || quantity < 0) {
+        return res.status(400).json({ message: 'rangeId and quantity (>= 0) required' });
+      }
+
+      const doc = await Assignment.findById(id).populate('task', 'category subcategory');
+      if (!doc) return res.status(404).json({ message: 'Assignment not found' });
+
+      const me = req.user?.userId || req.user?.id;
+      const isAdmin = ['superadmin', 'listingadmin'].includes(req.user?.role);
+      
+      // Lister can only update their own assignments
+      if (!isAdmin && String(doc.lister) !== String(me)) {
+        return res.status(403).json({ message: 'Forbidden' });
+      }
+
+      // Validate that range belongs to the task's subcategory
+      
+      const range = await Range.findById(rangeId).populate('subcategory');
+      if (!range) return res.status(404).json({ message: 'Range not found' });
+      
+      if (String(range.subcategory._id) !== String(doc.task.subcategory)) {
+        return res.status(400).json({ message: 'Range does not belong to task subcategory' });
+      }
+
+      // Update or add range quantity
+      const existingIndex = doc.rangeQuantities.findIndex(
+        rq => String(rq.range) === String(rangeId)
+      );
+
+      if (existingIndex >= 0) {
+        // Update existing
+        doc.rangeQuantities[existingIndex].quantity = quantity;
+      } else {
+        // Add new
+        doc.rangeQuantities.push({ range: rangeId, quantity });
+      }
+
+      // Calculate total distributed quantity
+      const totalDistributed = doc.rangeQuantities.reduce((sum, rq) => sum + (rq.quantity || 0), 0);
+      
+      // Update completedQuantity but don't auto-complete assignment
+      doc.completedQuantity = Math.min(totalDistributed, doc.quantity);
+      // Don't set completedAt here - only on submit
+
+      await doc.save();
+
+      const populated = await doc.populate([
+        { path: 'task', populate: [{ path: 'sourcePlatform createdBy category subcategory range', select: 'name username' }] },
+        { path: 'listingPlatform', select: 'name' },
+        { path: 'store', select: 'name' },
+        { path: 'rangeQuantities.range', select: 'name' },
+      ]);
+
+      res.json(populated);
+    } catch (e) {
+      console.error(e);
+      res.status(500).json({ message: 'Failed to update range quantity.' });
+    }
+  }
+);
+
+// Submit assignment (mark as complete)
+router.post('/:id/submit',
+  requireAuth,
+  requireRole('superadmin', 'listingadmin', 'lister'),
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+      const doc = await Assignment.findById(id).populate('task', 'category subcategory');
+      
+      if (!doc) return res.status(404).json({ message: 'Assignment not found' });
+
+      const me = req.user?.userId || req.user?.id;
+      const isAdmin = ['superadmin', 'listingadmin'].includes(req.user?.role);
+      
+      // Lister can only submit their own assignments
+      if (!isAdmin && String(doc.lister) !== String(me)) {
+        return res.status(403).json({ message: 'Forbidden' });
+      }
+
+      // Calculate total distributed quantity
+      const totalDistributed = doc.rangeQuantities.reduce((sum, rq) => sum + (rq.quantity || 0), 0);
+      
+      // Validate that total distributed equals assigned quantity
+      if (totalDistributed < doc.quantity) {
+        return res.status(400).json({ 
+          message: `Cannot submit: distributed quantity (${totalDistributed}) is less than assigned quantity (${doc.quantity})` 
+        });
+      }
+
+      // Mark assignment as complete
+      doc.completedQuantity = doc.quantity;
+      doc.completedAt = new Date();
+
+      await doc.save();
+
+      const populated = await doc.populate([
+        { path: 'task', populate: [{ path: 'sourcePlatform createdBy category subcategory range', select: 'name username' }] },
+        { path: 'listingPlatform', select: 'name' },
+        { path: 'store', select: 'name' },
+        { path: 'rangeQuantities.range', select: 'name' },
+      ]);
+
+      res.json(populated);
+    } catch (e) {
+      console.error(e);
+      res.status(500).json({ message: 'Failed to submit assignment.' });
+    }
+  }
+);
 
 export default router;

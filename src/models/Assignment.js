@@ -13,6 +13,12 @@ const AssignmentSchema = new mongoose.Schema(
     // ✅ Completion tracking
     completedQuantity: { type: Number, default: 0, min: 0 },
     completedAt: { type: Date, default: null },
+    
+    // Range quantity distribution
+    rangeQuantities: [{
+      range: { type: mongoose.Schema.Types.ObjectId, ref: 'Range', required: true },
+      quantity: { type: Number, required: true, min: 0 }
+    }],
   },
   { timestamps: true }
 );
