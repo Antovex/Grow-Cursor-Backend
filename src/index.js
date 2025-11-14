@@ -4,6 +4,7 @@ import helmet from 'helmet';
 import morgan from 'morgan';
 import dotenv from 'dotenv';
 import { connectToDatabase } from './lib/db.js';
+import User from './models/User.js';
 import authRoutes from './routes/auth.js';
 import userRoutes from './routes/users.js';
 import platformRoutes from './routes/platforms.js';
@@ -18,6 +19,7 @@ import compatibilityRoutes from './routes/compatibility.js';
 
 import ebayRoutes from './routes/ebay.js';
 import sellersRoutes from './routes/sellers.js';
+import employeeProfilesRoutes from './routes/employeeProfiles.js';
 
 
 dotenv.config();
@@ -52,12 +54,26 @@ app.use('/api/compatibility', compatibilityRoutes);
 
 app.use('/api/ebay', ebayRoutes);
 app.use('/api/sellers', sellersRoutes);
+app.use('/api/employee-profiles', employeeProfilesRoutes);
 
 
 const port = process.env.PORT || 5000;
 
 connectToDatabase()
-  .then(() => {
+  .then(async () => {
+    // Ensure email index is sparse unique to allow multiple nulls
+    try {
+      // Drop existing non-sparse unique index if present
+      await User.collection.dropIndex('email_1');
+    } catch (e) {
+      // Ignore if index does not exist
+    }
+    try {
+      await User.collection.createIndex({ email: 1 }, { unique: true, sparse: true });
+    } catch (e) {
+      console.error('Failed to create sparse unique index on email:', e?.message || e);
+    }
+
     app.listen(port, () => {
       console.log(`API listening on :${port}`);
     });

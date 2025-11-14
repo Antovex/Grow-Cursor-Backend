@@ -9,11 +9,11 @@ const router = Router();
 // Superadmin creates all (productadmin, listingadmin, lister); Listing Admin creates listers only
 router.post('/', requireAuth, async (req, res) => {
   const { role } = req.user;
-  const { email, username, password, newUserRole } = req.body || {};
-  if (!email || !username || !password || !newUserRole) {
-    return res.status(400).json({ error: 'email, username, password, newUserRole required' });
+  const { email, username, password, newUserRole, department } = req.body || {};
+  if (!username || !password || !newUserRole) {
+    return res.status(400).json({ error: 'username, password, newUserRole required' });
   }
-  const allowedRoles = ['productadmin', 'listingadmin', 'lister', 'compatibilityadmin', 'compatibilityeditor', 'seller', 'fulfillmentadmin'];
+  const allowedRoles = ['productadmin', 'listingadmin', 'lister', 'advancelister', 'compatibilityadmin', 'compatibilityeditor', 'seller', 'fulfillmentadmin', 'hradmin', 'hr', 'operationhead', 'trainee'];
   if (!allowedRoles.includes(newUserRole)) return res.status(400).json({ error: 'Invalid newUserRole' });
 
   // Forbidden base roles
@@ -22,8 +22,8 @@ router.post('/', requireAuth, async (req, res) => {
   }
 
   // Only superadmin can create high-level admins (productadmin, listingadmin, compatibilityadmin, fulfillmentadmin)
-  if (['productadmin', 'listingadmin', 'compatibilityadmin', 'seller', 'fulfillmentadmin'].includes(newUserRole) && role !== 'superadmin') {
-    return res.status(403).json({ error: 'Only superadmin can create admin roles or sellers' });
+  if (['productadmin', 'listingadmin', 'compatibilityadmin', 'seller', 'fulfillmentadmin', 'hradmin', 'operationhead'].includes(newUserRole) && !['superadmin','hradmin','operationhead'].includes(role)) {
+    return res.status(403).json({ error: 'Only superadmin, hradmin or operationhead can create admin roles or sellers' });
   }
 
   // Listing admin can only create listers
@@ -37,21 +37,30 @@ router.post('/', requireAuth, async (req, res) => {
   }
 
   // Check both email and username uniqueness
-  const existingEmail = await User.findOne({ email });
-  if (existingEmail) return res.status(409).json({ error: 'Email already in use' });
+  if (email) {
+    const existingEmail = await User.findOne({ email });
+    if (existingEmail) return res.status(409).json({ error: 'Email already in use' });
+  }
 
   const existingUsername = await User.findOne({ username });
   if (existingUsername) return res.status(409).json({ error: 'Username already in use' });
   const passwordHash = await bcrypt.hash(password, 10);
 
-  const user = await User.create({ email, username, passwordHash, role: newUserRole });
+  // Compute department rules
+  let finalDepartment = department || '';
+  // Listing admins add to Listing department
+  if (role === 'listingadmin') finalDepartment = 'Listing';
+  // Compatibility admins and creating compatibility editors default to Compatibility
+  if (role === 'compatibilityadmin' || newUserRole === 'compatibilityeditor') finalDepartment = 'Compatibility';
+
+  const user = await User.create({ email, username, passwordHash, role: newUserRole, department: finalDepartment });
 
   // If creating a seller, also create a Seller document
   if (newUserRole === 'seller') {
     await Seller.create({ user: user._id, ebayMarketplaces: [] });
   }
 
-  if (role === 'superadmin') {
+  if (['superadmin','hradmin','operationhead'].includes(role)) {
     // Return credentials for superadmin record-keeping
     res.json({
       id: user._id,
