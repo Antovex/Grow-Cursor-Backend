@@ -21,6 +21,7 @@ import listingCompletionsRoutes from './routes/listingCompletions.js';
 import ebayRoutes from './routes/ebay.js';
 import sellersRoutes from './routes/sellers.js';
 import employeeProfilesRoutes from './routes/employeeProfiles.js';
+import storeWiseTasksRoutes from './routes/storeWiseTasks.js';
 
 
 dotenv.config();
@@ -35,6 +36,14 @@ app.use(cors({
 }));
 app.use(express.json());
 app.use(morgan('dev'));
+
+// Disable caching globally for all API routes
+app.use('/api', (req, res, next) => {
+  res.set('Cache-Control', 'no-store, no-cache, must-revalidate, private');
+  res.set('Pragma', 'no-cache');
+  res.set('Expires', '0');
+  next();
+});
 
 app.get('/health', (req, res) => {
   res.json({ ok: true });
@@ -57,6 +66,7 @@ app.use('/api/listing-completions', listingCompletionsRoutes);
 app.use('/api/ebay', ebayRoutes);
 app.use('/api/sellers', sellersRoutes);
 app.use('/api/employee-profiles', employeeProfilesRoutes);
+app.use('/api/store-wise-tasks', storeWiseTasksRoutes);
 
 
 const port = process.env.PORT || 5000;

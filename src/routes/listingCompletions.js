@@ -43,7 +43,7 @@ router.get('/', requireAuth, requireRole('superadmin', 'listingadmin', 'producta
 // Get aggregated listing sheet data
 router.get('/sheet', requireAuth, requireRole('superadmin', 'listingadmin', 'productadmin'), async (req, res) => {
   try {
-    const { platformId, storeId, marketplace, startDate, endDate } = req.query;
+    const { platformId, storeId, marketplace, startDate, endDate, page, limit, category, subcategory, range } = req.query;
     
     const match = {};
     if (platformId) match.listingPlatform = new mongoose.Types.ObjectId(platformId);
@@ -52,8 +52,18 @@ router.get('/sheet', requireAuth, requireRole('superadmin', 'listingadmin', 'pro
     
     if (startDate || endDate) {
       match.date = {};
-      if (startDate) match.date.$gte = new Date(startDate);
-      if (endDate) match.date.$lte = new Date(endDate);
+      if (startDate) {
+        // Set to start of day in UTC
+        const start = new Date(startDate);
+        start.setUTCHours(0, 0, 0, 0);
+        match.date.$gte = start;
+      }
+      if (endDate) {
+        // Set to end of day in UTC
+        const end = new Date(endDate);
+        end.setUTCHours(23, 59, 59, 999);
+        match.date.$lte = end;
+      }
     }
     
     const pipeline = [
@@ -133,9 +143,49 @@ router.get('/sheet', requireAuth, requireRole('superadmin', 'listingadmin', 'pro
       },
       { $sort: { date: -1, marketplace: 1, platform: 1, store: 1, category: 1, subcategory: 1, range: 1 } }
     ];
+
+    // Apply additional filters after lookup
+    if (category) {
+      const categories = category.split(',');
+      pipeline.push({ $match: { category: { $in: categories } } });
+    }
+    if (subcategory) {
+      const subcategories = subcategory.split(',');
+      pipeline.push({ $match: { subcategory: { $in: subcategories } } });
+    }
+    if (range) {
+      const ranges = range.split(',');
+      pipeline.push({ $match: { range: { $in: ranges } } });
+    }
     
+    // If pagination is not requested, return all results
+    if (page === undefined && limit === undefined) {
+      const results = await ListingCompletion.aggregate(pipeline);
+      return res.json(results);
+    }
+
+    // Add pagination
+    const pageNum = Math.max(1, Number(page) || 1);
+    const limitNum = Math.max(1, Number(limit) || 50);
+
+    // Get total count
+    const countPipeline = [...pipeline, { $count: 'total' }];
+    const countResult = await ListingCompletion.aggregate(countPipeline);
+    const total = countResult[0]?.total || 0;
+
+    // Add skip and limit to the pipeline
+    pipeline.push({ $skip: (pageNum - 1) * limitNum });
+    pipeline.push({ $limit: limitNum });
+
     const results = await ListingCompletion.aggregate(pipeline);
-    res.json(results);
+    
+    res.json({
+      items: results,
+      total,
+      page: pageNum,
+      limit: limitNum,
+      totalPages: Math.ceil(total / limitNum)
+    });
   } catch (e) {
     console.error(e);
     res.status(500).json({ message: 'Failed to fetch listing sheet.' });

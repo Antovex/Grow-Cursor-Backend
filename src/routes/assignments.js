@@ -13,6 +13,75 @@ const router = express.Router();
 
 /* -------------------- CREATE / LIST -------------------- */
 
+// Get all available filter options
+router.get('/filter-options', requireAuth, requireRole('superadmin', 'listingadmin', 'productadmin'), async (req, res) => {
+  try {
+    const [
+      platforms,
+      stores,
+      categories,
+      subcategories,
+      listers,
+      assigners
+    ] = await Promise.all([
+      Assignment.distinct('listingPlatform').then(ids => 
+        mongoose.model('Platform').find({ _id: { $in: ids } }).select('name').lean()
+      ),
+      Assignment.distinct('store').then(ids => 
+        mongoose.model('Store').find({ _id: { $in: ids } }).select('name').lean()
+      ),
+      // Fetch ALL categories from database, not just ones in assignments
+      mongoose.model('Category').find({}).select('name').lean(),
+      // Fetch ALL subcategories from database, not just ones in assignments
+      mongoose.model('Subcategory').find({}).select('name').lean(),
+      Assignment.distinct('lister').then(ids => 
+        mongoose.model('User').find({ _id: { $in: ids } }).select('username').lean()
+      ),
+      Assignment.distinct('createdBy').then(ids => 
+        mongoose.model('User').find({ _id: { $in: ids } }).select('username').lean()
+      )
+    ]);
+    
+    // Define all available marketplaces from enum
+    const allMarketplaces = ['EBAY_US', 'EBAY_AUS', 'EBAY_CANADA'];
+
+    // Get source platforms and task creators from tasks linked to assignments
+    const [sourcePlatforms, taskCreators] = await Promise.all([
+      Assignment.aggregate([
+        { $lookup: { from: 'tasks', localField: 'task', foreignField: '_id', as: 'taskData' } },
+        { $unwind: '$taskData' },
+        { $group: { _id: '$taskData.sourcePlatform' } },
+        { $lookup: { from: 'platforms', localField: '_id', foreignField: '_id', as: 'platform' } },
+        { $unwind: '$platform' },
+        { $project: { _id: '$platform._id', name: '$platform.name' } }
+      ]),
+      Assignment.aggregate([
+        { $lookup: { from: 'tasks', localField: 'task', foreignField: '_id', as: 'taskData' } },
+        { $unwind: '$taskData' },
+        { $group: { _id: '$taskData.createdBy' } },
+        { $lookup: { from: 'users', localField: '_id', foreignField: '_id', as: 'user' } },
+        { $unwind: '$user' },
+        { $project: { _id: '$user._id', username: '$user.username' } }
+      ])
+    ]);
+
+    res.json({
+      sourcePlatforms: sourcePlatforms.map(p => ({ _id: p._id, name: p.name })),
+      listingPlatforms: platforms.map(p => ({ _id: p._id, name: p.name })),
+      stores: stores.map(s => ({ _id: s._id, name: s.name })),
+      categories: categories.map(c => ({ _id: c._id, name: c.name })),
+      subcategories: subcategories.map(s => ({ _id: s._id, name: s.name })),
+      listers: listers.map(l => ({ _id: l._id, username: l.username })),
+      assigners: assigners.map(a => ({ _id: a._id, username: a.username })),
+      taskCreators: taskCreators.map(t => ({ _id: t._id, username: t.username })),
+      marketplaces: allMarketplaces // Return all available marketplaces
+    });
+  } catch (e) {
+    console.error('Failed to fetch filter options:', e);
+    res.status(500).json({ message: 'Failed to fetch filter options.' });
+  }
+});
+
 router.post('/', requireAuth, requireRole('superadmin', 'listingadmin'), async (req, res) => {
   try {
     const { taskId, listerId, quantity, listingPlatformId, storeId, notes } = req.body || {};
@@ -59,7 +128,12 @@ router.post('/', requireAuth, requireRole('superadmin', 'listingadmin'), async (
 
 router.get('/', requireAuth, requireRole('superadmin', 'listingadmin', 'productadmin'), async (req, res) => {
   try {
-    const { taskId, listerId, platformId, storeId } = req.query;
+    const { 
+      taskId, listerId, platformId, storeId,
+      // New filter parameters
+      marketplace, productTitle,
+      dateFrom, dateTo, dateMode, dateSingle
+    } = req.query;
     const { page, limit, sortBy = 'createdAt', sortOrder = 'desc' } = req.query;
 
     const q = {};
@@ -67,8 +141,23 @@ router.get('/', requireAuth, requireRole('superadmin', 'listingadmin', 'producta
     if (listerId) q.lister = listerId;
     if (platformId) q.listingPlatform = platformId;
     if (storeId) q.store = storeId;
+    if (marketplace) q.marketplace = marketplace;
 
-    const cursor = Assignment.find(q)
+    // Date filtering (IST timezone)
+    if (dateMode === 'single' && dateSingle) {
+      const startDate = new Date(dateSingle + 'T00:00:00+05:30');
+      const endDate = new Date(dateSingle + 'T23:59:59+05:30');
+      q.createdAt = { $gte: startDate, $lte: endDate };
+    } else if (dateMode === 'range') {
+      if (dateFrom || dateTo) {
+        q.createdAt = {};
+        if (dateFrom) q.createdAt.$gte = new Date(dateFrom + 'T00:00:00+05:30');
+        if (dateTo) q.createdAt.$lte = new Date(dateTo + 'T23:59:59+05:30');
+      }
+    }
+
+    // First get assignments with basic filters
+    let items = await Assignment.find(q)
       .populate([
         { path: 'task', populate: [{ path: 'sourcePlatform createdBy category subcategory range', select: 'name username' }] },
         { path: 'lister', select: 'username email' },
@@ -79,19 +168,55 @@ router.get('/', requireAuth, requireRole('superadmin', 'listingadmin', 'producta
       ])
       .sort({ [sortBy]: sortOrder === 'asc' ? 1 : -1 });
 
+    // Apply additional filters that require populated data
+    const {
+      sourcePlatform, category, subcategory, createdByTask,
+      listerUsername, sharedBy
+    } = req.query;
+
+    if (sourcePlatform) {
+      const platforms = sourcePlatform.split(',');
+      items = items.filter(item => platforms.includes(item.task?.sourcePlatform?.name));
+    }
+    if (category) {
+      const categories = category.split(',');
+      items = items.filter(item => categories.includes(item.task?.category?.name));
+    }
+    if (subcategory) {
+      const subcategories = subcategory.split(',');
+      items = items.filter(item => subcategories.includes(item.task?.subcategory?.name));
+    }
+    if (createdByTask) {
+      const creators = createdByTask.split(',');
+      items = items.filter(item => creators.includes(item.task?.createdBy?.username));
+    }
+    if (listerUsername) {
+      const listers = listerUsername.split(',');
+      items = items.filter(item => listers.includes(item.lister?.username));
+    }
+    if (sharedBy) {
+      const sharers = sharedBy.split(',');
+      items = items.filter(item => sharers.includes(item.createdBy?.username));
+    }
+    if (productTitle) {
+      const titleLower = productTitle.toLowerCase();
+      items = items.filter(item => 
+        item.task?.productTitle?.toLowerCase().includes(titleLower)
+      );
+    }
+
+    const total = items.length;
+
     if (page === undefined && limit === undefined) {
-      const items = await cursor;
       return res.json(items);
     }
 
+    // Apply pagination
     const pageNum = Math.max(1, Number(page) || 1);
     const limitNum = Math.max(1, Number(limit) || 50);
-    const [items, total] = await Promise.all([
-      cursor.skip((pageNum - 1) * limitNum).limit(limitNum),
-      Assignment.countDocuments(q),
-    ]);
+    const paginatedItems = items.slice((pageNum - 1) * limitNum, pageNum * limitNum);
 
-    res.json({ items, total, page: pageNum, limit: limitNum });
+    res.json({ items: paginatedItems, total, page: pageNum, limit: limitNum });
   } catch (e) {
     console.error(e);
     res.status(500).json({ message: 'Failed to fetch assignments.' });
@@ -304,11 +429,29 @@ router.get('/analytics/listings-summary',
   requireRole('superadmin', 'listingadmin', 'productadmin'),
   async (req, res) => {
     try {
-      const { platformId, storeId } = req.query;
+      const { platformId, storeId, dateMode, dateSingle, dateFrom, dateTo } = req.query;
+
+      // Build match conditions
+      const matchConditions = [];
+      if (platformId) matchConditions.push({ $match: { listingPlatform: new mongoose.Types.ObjectId(platformId) } });
+      if (storeId) matchConditions.push({ $match: { store: new mongoose.Types.ObjectId(storeId) } });
+
+      // Date filtering (IST timezone)
+      if (dateMode === 'single' && dateSingle) {
+        const startDate = new Date(dateSingle + 'T00:00:00+05:30');
+        const endDate = new Date(dateSingle + 'T23:59:59+05:30');
+        matchConditions.push({ $match: { createdAt: { $gte: startDate, $lte: endDate } } });
+      } else if (dateMode === 'range') {
+        const dateMatch = {};
+        if (dateFrom) dateMatch.$gte = new Date(dateFrom + 'T00:00:00+05:30');
+        if (dateTo) dateMatch.$lte = new Date(dateTo + 'T23:59:59+05:30');
+        if (Object.keys(dateMatch).length > 0) {
+          matchConditions.push({ $match: { createdAt: dateMatch } });
+        }
+      }
 
       const rows = await Assignment.aggregate([
-        ...(platformId ? [{ $match: { listingPlatform: new mongoose.Types.ObjectId(platformId) } }] : []),
-        ...(storeId ? [{ $match: { store: new mongoose.Types.ObjectId(storeId) } }] : []),
+        ...matchConditions,
 
         { $lookup: { from: "tasks", localField: "task", foreignField: "_id", as: "task" } },
         { $unwind: "$task" },
@@ -327,28 +470,36 @@ router.get('/analytics/listings-summary',
             rangeQuantities: { $ifNull: ["$rangeQuantities", []] }
           }
         },
-        // Store assignment-level data before unwinding
+        // First, group by assignment to ensure each assignment is counted only once
+        // even if it has multiple ranges
         {
-          $addFields: {
-            assignmentId: "$_id",
-            assignmentQuantity: "$quantity",
-            assignmentCompletedQty: "$completedQuantity"
+          $group: {
+            _id: "$_id", // Group by assignment ID
+            date: { $first: "$date" },
+            platformId: { $first: "$platformId" },
+            storeId: { $first: "$storeId" },
+            listerId: { $first: "$listerId" },
+            quantity: { $first: "$quantity" },
+            completedQuantity: { $first: "$completedQuantity" },
+            categoryId: { $first: "$categoryId" },
+            subcategoryId: { $first: "$subcategoryId" },
+            rangeQuantities: { $first: "$rangeQuantities" }
           }
         },
-        // Unwind rangeQuantities to get individual ranges
-        { $unwind: { path: "$rangeQuantities", preserveNullAndEmptyArrays: true } },
+        // Now group by date, platform, and store
         {
           $group: {
             _id: { date: "$date", platformId: "$platformId", storeId: "$storeId" },
-            // Use $addToSet to get unique assignment quantities (each assignment counted once)
-            assignmentQuantities: { $addToSet: "$assignmentQuantity" },
-            assignmentCompletedQuantities: { $addToSet: "$assignmentCompletedQty" },
-            // Count unique assignments (not ranges)
-            assignmentIds: { $addToSet: "$assignmentId" },
+            // Sum all assignment quantities (each assignment counted once)
+            totalQuantity: { $sum: "$quantity" },
+            totalCompletedQty: { $sum: "$completedQuantity" },
+            // Count unique values
+            assignmentIds: { $addToSet: "$_id" },
             listers: { $addToSet: "$listerId" },
             categories: { $addToSet: "$categoryId" },
             subcategories: { $addToSet: "$subcategoryId" },
-            ranges: { $addToSet: "$rangeQuantities.range" }
+            // Collect all rangeQuantities arrays
+            allRangeQuantities: { $push: "$rangeQuantities" }
           }
         },
         {
@@ -357,13 +508,32 @@ router.get('/analytics/listings-summary',
             date: "$_id.date",
             platformId: "$_id.platformId",
             storeId: "$_id.storeId",
-            totalQuantity: { $sum: "$assignmentQuantities" },
+            totalQuantity: 1,
             assignmentsCount: { $size: "$assignmentIds" },
-            completedQty: { $sum: "$assignmentCompletedQuantities" },
+            completedQty: "$totalCompletedQty",
             numListers: { $size: "$listers" },
             numCategories: { $size: "$categories" },
             numSubcategories: { $size: "$subcategories" },
-            numRanges: { $size: { $filter: { input: "$ranges", as: "r", cond: { $ne: ["$$r", null] } } } }
+            numRanges: {
+              $size: {
+                $reduce: {
+                  input: "$allRangeQuantities",
+                  initialValue: [],
+                  in: {
+                    $setUnion: [
+                      "$$value",
+                      {
+                        $map: {
+                          input: { $filter: { input: "$$this", as: "rq", cond: { $ne: ["$$rq.range", null] } } },
+                          as: "rq",
+                          in: "$$rq.range"
+                        }
+                      }
+                    ]
+                  }
+                }
+              }
+            }
           }
         },
         { $lookup: { from: "platforms", localField: "platformId", foreignField: "_id", as: "platformDoc" } },
@@ -401,7 +571,7 @@ router.get(
   requireRole('superadmin', 'listingadmin', 'productadmin'),
   async (req, res) => {
     try {
-      const { platformId, storeId, categoryId, subcategoryId } = req.query || {};
+      const { platformId, storeId, categoryId, subcategoryId, category, range } = req.query || {};
       const match = {};
       if (platformId) match.listingPlatform = new mongoose.Types.ObjectId(platformId);
       if (storeId) match.store = new mongoose.Types.ObjectId(storeId);
@@ -415,7 +585,7 @@ router.get(
         { $lookup: { from: 'tasks', localField: 'task', foreignField: '_id', as: 'task' } },
         { $unwind: '$task' },
 
-        // (Optional) filters for category/subcategory after join
+        // (Optional) filters for category/subcategory after join (by ID)
         ...(categoryId ? [{ $match: { 'task.category': new mongoose.Types.ObjectId(categoryId) } }] : []),
         ...(subcategoryId ? [{ $match: { 'task.subcategory': new mongoose.Types.ObjectId(subcategoryId) } }] : []),
 
@@ -504,6 +674,16 @@ router.get(
         },
         { $sort: { platform: 1, store: 1, category: 1, subcategory: 1, range: 1 } }
       ];
+
+      // Apply filters by name (after lookups)
+      if (category) {
+        const categories = category.split(',');
+        pipeline.push({ $match: { category: { $in: categories } } });
+      }
+      if (range) {
+        const ranges = range.split(',');
+        pipeline.push({ $match: { range: { $in: ranges } } });
+      }
 
       const rows = await Assignment.aggregate(pipeline);
       res.json(rows);

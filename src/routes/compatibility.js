@@ -11,11 +11,44 @@ const router = Router();
 // Conditions: Category = "Ebay Motors" AND Pending Quantity = 0 (completedQuantity >= quantity)
 router.get('/eligible', requireAuth, requireRole('superadmin', 'compatibilityadmin'), async (req, res) => {
   try {
-    // Fetch assignments where category is "Ebay Motors" and pending quantity is 0
-    const assignments = await Assignment.find({
-      $expr: { $gte: ['$completedQuantity', '$quantity'] }, // completedQuantity >= quantity (no pending work)
+    // Pagination
+    const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+    const limit = Math.max(1, Math.min(100, parseInt(req.query.limit, 10) || 50));
+    const skip = (page - 1) * limit;
+    
+    // Base query: completed assignments with Ebay Motors category
+    const baseQuery = {
+      $expr: { $gte: ['$completedQuantity', '$quantity'] }, // completedQuantity >= quantity
       quantity: { $gt: 0 }
-    })
+    };
+    
+    // Build filter conditions
+    const filters = { ...baseQuery };
+    
+    // Date filters
+    if (req.query.dateMode === 'single' && req.query.dateSingle) {
+      const d = new Date(req.query.dateSingle);
+      const next = new Date(d);
+      next.setDate(next.getDate() + 1);
+      filters.createdAt = { $gte: d, $lt: next };
+    } else if (req.query.dateMode === 'range') {
+      const dateFilter = {};
+      if (req.query.dateFrom) dateFilter.$gte = new Date(req.query.dateFrom);
+      if (req.query.dateTo) {
+        const toDate = new Date(req.query.dateTo);
+        toDate.setDate(toDate.getDate() + 1);
+        dateFilter.$lt = toDate;
+      }
+      if (Object.keys(dateFilter).length > 0) filters.createdAt = dateFilter;
+    }
+    
+    // Direct ObjectId filters
+    if (req.query.listingPlatform) filters.listingPlatform = req.query.listingPlatform;
+    if (req.query.store) filters.store = req.query.store;
+    if (req.query.marketplace) filters.marketplace = req.query.marketplace;
+    
+    // Fetch assignments
+    const assignments = await Assignment.find(filters)
       .populate([
         { path: 'task', populate: [{ path: 'sourcePlatform category subcategory', select: 'name' }] },
         { path: 'listingPlatform store', select: 'name' },
@@ -23,13 +56,50 @@ router.get('/eligible', requireAuth, requireRole('superadmin', 'compatibilityadm
         { path: 'createdBy', select: 'username' },
         { path: 'rangeQuantities.range', select: 'name' }
       ])
-      .select('+marketplace') // Include marketplace field
-      .sort({ createdAt: -1 });
+      .select('+marketplace')
+      .sort({ createdAt: -1 })
+      .lean();
 
-    // Filter for "Ebay Motors" category only
-    const filtered = assignments.filter(a => a.task?.category?.name === 'Ebay Motors');
-
-    res.json(filtered);
+    // Filter for "Ebay Motors" category and subcategory if provided
+    let filtered = assignments.filter(a => a.task?.category?.name === 'Ebay Motors');
+    
+    if (req.query.subcategory) {
+      filtered = filtered.filter(a => a.task?.subcategory?._id?.toString() === req.query.subcategory);
+    }
+    
+    // Check shared status if filter is applied
+    let sharedMap = {};
+    if (req.query.sharedStatus) {
+      const compatAssignments = await CompatibilityAssignment.find({}).select('sourceAssignment').lean();
+      sharedMap = {};
+      compatAssignments.forEach(ca => {
+        if (ca.sourceAssignment) sharedMap[ca.sourceAssignment.toString()] = true;
+      });
+      
+      if (req.query.sharedStatus === 'shared') {
+        filtered = filtered.filter(a => sharedMap[a._id.toString()]);
+      } else if (req.query.sharedStatus === 'notShared') {
+        filtered = filtered.filter(a => !sharedMap[a._id.toString()]);
+      }
+    } else {
+      // Always fetch shared status for display
+      const compatAssignments = await CompatibilityAssignment.find({}).select('sourceAssignment').lean();
+      compatAssignments.forEach(ca => {
+        if (ca.sourceAssignment) sharedMap[ca.sourceAssignment.toString()] = true;
+      });
+    }
+    
+    const totalItems = filtered.length;
+    const paginatedItems = filtered.slice(skip, skip + limit);
+    
+    res.json({
+      items: paginatedItems,
+      sharedStatus: sharedMap,
+      totalItems,
+      totalPages: Math.ceil(totalItems / limit),
+      currentPage: page,
+      itemsPerPage: limit
+    });
   } catch (e) {
     console.error(e);
     res.status(500).json({ message: 'Failed to fetch eligible compatibility items.' });
@@ -82,10 +152,45 @@ router.post('/assign', requireAuth, requireRole('superadmin', 'compatibilityadmi
 router.get('/progress', requireAuth, requireRole('superadmin', 'compatibilityadmin'), async (req, res) => {
   try {
     const me = req.user?.userId || req.user?.id;
-    // For superadmin, show all; for compatibility admin, show only their assignments
-    const query = req.user?.role === 'superadmin' ? {} : { admin: me };
     
-    const items = await CompatibilityAssignment.find(query)
+    // Pagination
+    const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+    const limit = Math.max(1, Math.min(100, parseInt(req.query.limit, 10) || 50));
+    const skip = (page - 1) * limit;
+    
+    // Base query - superadmin sees all, compatibility admin sees only their assignments
+    const baseQuery = req.user?.role === 'superadmin' ? {} : { admin: me };
+    
+    // Build filter conditions from query params
+    const filters = { ...baseQuery };
+    
+    // Date filters (single or range)
+    if (req.query.dateMode === 'single' && req.query.dateSingle) {
+      const d = new Date(req.query.dateSingle);
+      const next = new Date(d);
+      next.setDate(next.getDate() + 1);
+      filters.createdAt = { $gte: d, $lt: next };
+    } else if (req.query.dateMode === 'range') {
+      const dateFilter = {};
+      if (req.query.dateFrom) dateFilter.$gte = new Date(req.query.dateFrom);
+      if (req.query.dateTo) {
+        const toDate = new Date(req.query.dateTo);
+        toDate.setDate(toDate.getDate() + 1);
+        dateFilter.$lt = toDate;
+      }
+      if (Object.keys(dateFilter).length > 0) filters.createdAt = dateFilter;
+    }
+    
+    // Editor filter
+    if (req.query.editor) {
+      filters.editor = req.query.editor;
+    }
+    
+    // First get matching IDs, then do filtering that requires populated data
+    let query = CompatibilityAssignment.find(filters);
+    
+    // Populate for filtering and display
+    const items = await query
       .populate([
         { path: 'task', populate: [{ path: 'sourcePlatform category subcategory', select: 'name' }] },
         { path: 'sourceAssignment', select: 'listingPlatform store marketplace', populate: [{ path: 'listingPlatform store', select: 'name' }] },
@@ -94,12 +199,119 @@ router.get('/progress', requireAuth, requireRole('superadmin', 'compatibilityadm
         { path: 'assignedRangeQuantities.range', select: 'name' },
         { path: 'completedRangeQuantities.range', select: 'name' },
       ])
-      .sort({ createdAt: -1 });
+      .sort({ createdAt: -1 })
+      .lean();
     
-    res.json(items);
+    // Apply filters that require populated data (client-side style but on server)
+    let filtered = items;
+    
+    if (req.query.subcategory) {
+      filtered = filtered.filter(item => item.task?.subcategory?._id?.toString() === req.query.subcategory);
+    }
+    if (req.query.listingPlatform) {
+      filtered = filtered.filter(item => item.sourceAssignment?.listingPlatform?._id?.toString() === req.query.listingPlatform);
+    }
+    if (req.query.store) {
+      filtered = filtered.filter(item => item.sourceAssignment?.store?._id?.toString() === req.query.store);
+    }
+    if (req.query.marketplace) {
+      filtered = filtered.filter(item => item.sourceAssignment?.marketplace === req.query.marketplace);
+    }
+    
+    // Pending quantity filter
+    if (req.query.pendingMode && req.query.pendingMode !== 'none' && req.query.pendingValue) {
+      const pendingValue = parseInt(req.query.pendingValue, 10);
+      filtered = filtered.filter(item => {
+        const pending = Math.max(0, (item.quantity || 0) - (item.completedQuantity || 0));
+        if (req.query.pendingMode === 'equal') return pending === pendingValue;
+        if (req.query.pendingMode === 'greater') return pending > pendingValue;
+        if (req.query.pendingMode === 'less') return pending < pendingValue;
+        return true;
+      });
+    }
+    
+    // Get total count after filtering
+    const totalItems = filtered.length;
+    
+    // Apply pagination
+    const paginatedItems = filtered.slice(skip, skip + limit);
+    
+    res.json({
+      items: paginatedItems,
+      totalItems,
+      totalPages: Math.ceil(totalItems / limit),
+      currentPage: page,
+      itemsPerPage: limit
+    });
   } catch (e) {
     console.error(e);
     res.status(500).json({ message: 'Failed to fetch compatibility progress.' });
+  }
+});
+
+// Get filter options for eligible assignments (AdminTaskList)
+router.get('/eligible-filter-options', requireAuth, requireRole('superadmin', 'compatibilityadmin'), async (req, res) => {
+  try {
+    const [subcategories, listingPlatforms, stores] = await Promise.all([
+      // Get all subcategories from database
+      mongoose.model('Subcategory').find({}).select('name').lean(),
+      // Get all listing platforms from database
+      mongoose.model('Platform').find({}).select('name').lean(),
+      // Get all stores from database
+      mongoose.model('Store').find({}).select('name').lean()
+    ]);
+    
+    // Get unique marketplaces from completed Ebay Motors assignments
+    const assignments = await Assignment.find({
+      $expr: { $gte: ['$completedQuantity', '$quantity'] },
+      quantity: { $gt: 0 }
+    }).populate('task', 'category').select('marketplace').lean();
+    
+    const ebayMotorsAssignments = assignments.filter(a => a.task?.category?.name === 'Ebay Motors');
+    const marketplaces = [...new Set(ebayMotorsAssignments.map(a => a.marketplace).filter(Boolean))];
+    
+    res.json({
+      subcategories,
+      listingPlatforms,
+      stores,
+      marketplaces
+    });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ message: 'Failed to fetch filter options.' });
+  }
+});
+
+// Get filter options for compatibility progress page
+router.get('/filter-options', requireAuth, requireRole('superadmin', 'compatibilityadmin'), async (req, res) => {
+  try {
+    const [subcategories, listingPlatforms, stores, editors] = await Promise.all([
+      // Get all subcategories from database
+      mongoose.model('Subcategory').find({}).select('name').lean(),
+      // Get all listing platforms from database
+      mongoose.model('Platform').find({}).select('name').lean(),
+      // Get all stores from database
+      mongoose.model('Store').find({}).select('name').lean(),
+      // Get all compatibility editors
+      mongoose.model('User').find({ role: 'compatibilityeditor' }).select('username').lean()
+    ]);
+    
+    // Get unique marketplaces from compatibility assignments
+    const marketplaces = await CompatibilityAssignment.distinct('sourceAssignment').then(async ids => {
+      const assignments = await Assignment.find({ _id: { $in: ids } }).select('marketplace').lean();
+      return [...new Set(assignments.map(a => a.marketplace).filter(Boolean))];
+    });
+    
+    res.json({
+      subcategories,
+      listingPlatforms,
+      stores,
+      marketplaces,
+      editors
+    });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ message: 'Failed to fetch filter options.' });
   }
 });
 
