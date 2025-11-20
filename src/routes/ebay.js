@@ -322,16 +322,93 @@ router.get('/orders', async (req, res) => {
   }
 });
 
+// New endpoint: Get orders with IN_PROGRESS cancellation status (last 30 days only)
+router.get('/cancelled-orders', async (req, res) => {
+  try {
+    // Calculate 30 days ago in UTC
+    const nowUTC = Date.now();
+    const thirtyDaysAgoMs = 30 * 24 * 60 * 60 * 1000;
+    const thirtyDaysAgo = new Date(nowUTC - thirtyDaysAgoMs);
+
+    console.log(`[Cancelled Orders] Fetching IN_PROGRESS orders from last 30 days (since ${thirtyDaysAgo.toISOString()})`);
+
+    // Query for orders with IN_PROGRESS cancellation AND within 30 days
+    const cancelledOrders = await Order.find({
+      cancelState: 'IN_PROGRESS', // Filter by cancel state
+      creationDate: { $gte: thirtyDaysAgo } // Only last 30 days
+    })
+      .populate('seller', 'username ebayUserId')
+      .sort({ creationDate: -1 }); // Newest first
+
+    console.log(`[Cancelled Orders] Found ${cancelledOrders.length} IN_PROGRESS orders`);
+
+    res.json({ 
+      orders: cancelledOrders,
+      totalOrders: cancelledOrders.length,
+      filterDate: thirtyDaysAgo.toISOString()
+    });
+  } catch (err) {
+    console.error('[Cancelled Orders] Error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // New endpoint: Get stored orders from database
+// Get stored orders from database with pagination support
 router.get('/stored-orders', async (req, res) => {
-  const { sellerId } = req.query;
+  const { sellerId, page = 1, limit = 50, searchOrderId, searchBuyerName, searchSoldDate, searchMarketplace } = req.query;
   
   try {
+    // Build base query
     let query = {};
     if (sellerId) {
       query.seller = sellerId;
     }
-    
+
+    // Apply search filters
+    if (searchOrderId) {
+      query.$or = [
+        { orderId: { $regex: searchOrderId, $options: 'i' } },
+        { legacyOrderId: { $regex: searchOrderId, $options: 'i' } }
+      ];
+    }
+
+    if (searchBuyerName) {
+      query['buyer.buyerRegistrationAddress.fullName'] = { $regex: searchBuyerName, $options: 'i' };
+    }
+
+    if (searchSoldDate) {
+      // Parse date as UTC and create range for the entire day (00:00:00 to 23:59:59.999 UTC)
+      const dateMatch = searchSoldDate.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+      if (dateMatch) {
+        const year = parseInt(dateMatch[1], 10);
+        const month = parseInt(dateMatch[2], 10) - 1; // JS months are 0-indexed
+        const day = parseInt(dateMatch[3], 10);
+        
+        const startOfDay = new Date(Date.UTC(year, month, day, 0, 0, 0, 0));
+        const endOfDay = new Date(Date.UTC(year, month, day, 23, 59, 59, 999));
+        
+        query.dateSold = {
+          $gte: startOfDay,
+          $lte: endOfDay
+        };
+      }
+    }
+
+    if (searchMarketplace && searchMarketplace !== '') {
+      query.purchaseMarketplaceId = searchMarketplace;
+    }
+
+    // Calculate pagination
+    const pageNum = parseInt(page, 10);
+    const limitNum = parseInt(limit, 10);
+    const skip = (pageNum - 1) * limitNum;
+
+    // Get total count for pagination metadata
+    const totalOrders = await Order.countDocuments(query);
+    const totalPages = Math.ceil(totalOrders / limitNum);
+
+    // Fetch orders with pagination
     const orders = await Order.find(query)
       .populate({
         path: 'seller',
@@ -341,20 +418,22 @@ router.get('/stored-orders', async (req, res) => {
         }
       })
       .sort({ creationDate: -1 })
-      .limit(500);
+      .skip(skip)
+      .limit(limitNum);
     
-    console.log(`[Stored Orders] Query: ${JSON.stringify(query)}, Found ${orders.length} orders`);
-    if (!sellerId) {
-      // Log order count per seller when showing all
-      const sellerCounts = {};
-      orders.forEach(order => {
-        const sellerKey = order.seller?.user?.username || order.seller?._id || 'Unknown';
-        sellerCounts[sellerKey] = (sellerCounts[sellerKey] || 0) + 1;
-      });
-      console.log('[Stored Orders] Breakdown by seller:', sellerCounts);
-    }
+    console.log(`[Stored Orders] Query: ${JSON.stringify(query)}, Page: ${pageNum}/${totalPages}, Found ${orders.length}/${totalOrders} orders`);
     
-    res.json({ orders });
+    res.json({ 
+      orders,
+      pagination: {
+        currentPage: pageNum,
+        totalPages,
+        totalOrders,
+        ordersPerPage: limitNum,
+        hasNextPage: pageNum < totalPages,
+        hasPrevPage: pageNum > 1
+      }
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -412,10 +491,49 @@ router.patch('/orders/:orderId/manual-tracking', async (req, res) => {
   }
 });
 
-// Poll all sellers for new/updated orders
+// Poll all sellers for new/updated orders with smart detection (PARALLEL + UTC-based)
 router.post('/poll-all-sellers', requireAuth, requireRole('fulfillmentadmin', 'superadmin'), async (req, res) => {
   try {
-    // Properly populate user data upfront
+    // Helper function to normalize dates for comparison (ignore milliseconds/format)
+    function normalizeDateForComparison(date) {
+      if (!date) return null;
+      if (date instanceof Date) {
+        return Math.floor(date.getTime() / 1000); // Unix timestamp in seconds
+      }
+      if (typeof date === 'string') {
+        return Math.floor(new Date(date).getTime() / 1000);
+      }
+      return null;
+    }
+
+    // Helper function to check if field actually changed
+    function hasFieldChanged(oldValue, newValue, fieldName) {
+      // Skip system fields
+      const systemFields = ['_id', '__v', 'seller', 'updatedAt', 'createdAt'];
+      if (systemFields.includes(fieldName)) return false;
+      
+      // Date fields - compare Unix timestamps (ignore milliseconds)
+      const dateFields = ['creationDate', 'lastModifiedDate', 'dateSold', 'shipByDate', 'estimatedDelivery'];
+      if (dateFields.includes(fieldName)) {
+        const oldTime = normalizeDateForComparison(oldValue);
+        const newTime = normalizeDateForComparison(newValue);
+        return oldTime !== newTime;
+      }
+      
+      // Null/undefined checks
+      if (oldValue === null || oldValue === undefined) {
+        return newValue !== null && newValue !== undefined;
+      }
+      
+      // Objects/Arrays - deep comparison
+      if (typeof newValue === 'object' && newValue !== null) {
+        return JSON.stringify(oldValue) !== JSON.stringify(newValue);
+      }
+      
+      // Primitives - direct comparison
+      return oldValue !== newValue;
+    }
+
     const sellers = await Seller.find({ 'ebayTokens.access_token': { $exists: true, $ne: null } })
       .populate('user', 'username email');
     
@@ -429,24 +547,29 @@ router.post('/poll-all-sellers', requireAuth, requireRole('fulfillmentadmin', 's
       });
     }
 
-    const pollResults = [];
-    let totalNewOrders = 0;
-    let totalUpdatedOrders = 0;
+    // Calculate 30 days ago in UTC
+    const nowUTC = Date.now();
+    const thirtyDaysAgoMs = 30 * 24 * 60 * 60 * 1000;
+    const thirtyDaysAgo = new Date(nowUTC - thirtyDaysAgoMs);
 
-    for (const seller of sellers) {
+    console.log(`\n========== POLLING ${sellers.length} SELLERS IN PARALLEL ==========`);
+    console.log(`UTC Time: ${new Date(nowUTC).toISOString()}`);
+    console.log(`30-day window starts: ${thirtyDaysAgo.toISOString()}`);
+
+    // Process all sellers in parallel using Promise.allSettled
+    const pollingPromises = sellers.map(async (seller) => {
+      const sellerName = seller.user?.username || seller.user?.email || seller._id.toString();
+      
       try {
-        const sellerName = seller.user?.username || seller.user?.email || seller._id.toString();
-        console.log(`\n========== Processing Seller: ${sellerName} ==========`);
+        console.log(`\n[${sellerName}] Starting poll...`);
         
-        // Check token expiry and refresh if needed
-        const now = Date.now();
+        // ========== TOKEN REFRESH CHECK ==========
         const fetchedAt = seller.ebayTokens.fetchedAt ? new Date(seller.ebayTokens.fetchedAt).getTime() : 0;
         const expiresInMs = (seller.ebayTokens.expires_in || 0) * 1000;
         let accessToken = seller.ebayTokens.access_token;
 
-        if (fetchedAt && (now - fetchedAt > expiresInMs - 2 * 60 * 1000)) {
-          console.log(`[Seller ${sellerName}] Token expired, refreshing...`);
-          // Refresh token
+        if (fetchedAt && (nowUTC - fetchedAt > expiresInMs - 2 * 60 * 1000)) {
+          console.log(`[${sellerName}] Token expired, refreshing...`);
           try {
             const refreshRes = await axios.post(
               'https://api.ebay.com/identity/v1/oauth2/token',
@@ -464,231 +587,145 @@ router.post('/poll-all-sellers', requireAuth, requireRole('fulfillmentadmin', 's
             );
             seller.ebayTokens.access_token = refreshRes.data.access_token;
             seller.ebayTokens.expires_in = refreshRes.data.expires_in;
-            seller.ebayTokens.fetchedAt = new Date();
+            seller.ebayTokens.fetchedAt = new Date(nowUTC);
             await seller.save();
             accessToken = refreshRes.data.access_token;
-            console.log(`[Seller ${sellerName}] Token refreshed successfully`);
+            console.log(`[${sellerName}] Token refreshed`);
           } catch (refreshErr) {
-            console.error(`[Seller ${sellerName}] Failed to refresh token:`, refreshErr.message);
-            pollResults.push({
+            console.error(`[${sellerName}] Token refresh failed:`, refreshErr.message);
+            return {
               sellerId: seller._id,
               sellerName,
               success: false,
               error: 'Failed to refresh token'
-            });
-            continue;
+            };
           }
         }
 
-        // ========== PHASE 1: FETCH NEW ORDERS (by creationdate) ==========
+        // ========== DETERMINE POLLING STRATEGY ==========
         const orderCount = await Order.countDocuments({ seller: seller._id });
-        const newestOrder = await Order.findOne({ seller: seller._id }).sort({ creationDate: -1 });
-        const newestCreationDate = newestOrder ? newestOrder.creationDate : null;
-        
-        // Get oldest order for Phase 2 date range
-        const oldestOrder = await Order.findOne({ seller: seller._id }).sort({ creationDate: 1 });
-        const oldestCreationDate = oldestOrder ? oldestOrder.creationDate : null;
+        const latestOrder = await Order.findOne({ seller: seller._id }).sort({ creationDate: -1 });
+        const latestCreationDate = latestOrder ? latestOrder.creationDate : null;
+        const lastPolledAt = seller.lastPolledAt || null;
+        const initialSyncDate = seller.initialSyncDate || new Date(Date.UTC(2025, 9, 17, 0, 0, 0, 0));
 
-        const newOrdersParams = {
-          limit: orderCount === 0 ? 15 : 200
-        };
-
-        // Fetch orders created AFTER the newest order in database
-        let skipPhase1 = false;
-        if (newestCreationDate) {
-          // Add 1 second to exclude the newest order we already have
-          const exclusiveStartDate = new Date(new Date(newestCreationDate).getTime() + 1000);
-          // Subtract 10 seconds from current time to avoid "future date" errors due to clock drift
-          const currentDate = new Date(Date.now() - 10000);
-          const timeDiffMinutes = (currentDate - exclusiveStartDate) / (1000 * 60);
-          
-          // Only fetch if there's at least a 1 minute gap (eBay might not like very narrow date ranges)
-          if (timeDiffMinutes >= 1) {
-            newOrdersParams.filter = `creationdate:[${exclusiveStartDate.toISOString()}..${currentDate.toISOString()}]`;
-            console.log(`[Seller ${sellerName}] PHASE 1: Fetching NEW orders created after: ${exclusiveStartDate.toISOString()}`);
-          } else {
-            // Too recent, skip Phase 1 to avoid 400 error
-            console.log(`[Seller ${sellerName}] PHASE 1: Newest order too recent (${timeDiffMinutes.toFixed(2)} min ago), skipping new order fetch`);
-            skipPhase1 = true;
-          }
-        } else {
-          console.log(`[Seller ${sellerName}] PHASE 1: First time fetch - getting initial 5 orders`);
-        }
+        console.log(`[${sellerName}] Orders in DB: ${orderCount}, Latest: ${latestCreationDate?.toISOString() || 'NONE'}, LastPolled: ${lastPolledAt?.toISOString() || 'NEVER'}`);
 
         const newOrders = [];
         const updatedOrders = [];
-        let newEbayOrders = [];
+        // Use 5-second buffer for clock skew (UTC-based)
+        const currentTimeUTC = new Date(nowUTC - 5000);
 
-        // API CALL #1: Fetch new orders from eBay (skip if too recent)
-        if (!skipPhase1) {
+        // ========== PHASE 1: FETCH NEW ORDERS ==========
+        let newOrdersFilter = null;
+        let newOrdersLimit = 15;
+
+        if (orderCount === 0) {
+          // First sync: get orders from Oct 17, 2025 onwards (UTC)
+          newOrdersFilter = `creationdate:[${initialSyncDate.toISOString()}..${currentTimeUTC.toISOString()}]`;
+          newOrdersLimit = 200;
+          console.log(`[${sellerName}] PHASE 1: Initial sync from ${initialSyncDate.toISOString()}`);
+        } else if (latestCreationDate) {
+          // Subsequent syncs: fetch orders created after our latest order
+          const afterLatestMs = new Date(latestCreationDate).getTime() + 1000; // +1 sec
+          const afterLatest = new Date(afterLatestMs);
+          const timeDiffMinutes = (currentTimeUTC.getTime() - afterLatestMs) / (1000 * 60);
+          
+          if (timeDiffMinutes >= 1) {
+            newOrdersFilter = `creationdate:[${afterLatest.toISOString()}..${currentTimeUTC.toISOString()}]`;
+            newOrdersLimit = 200;
+            console.log(`[${sellerName}] PHASE 1: New orders after ${afterLatest.toISOString()}`);
+          } else {
+            console.log(`[${sellerName}] PHASE 1: Skipped (too recent: ${timeDiffMinutes.toFixed(2)} min)`);
+          }
+        }
+
+        // Fetch new orders if filter is set
+        if (newOrdersFilter) {
           try {
-            console.log(`[Seller ${sellerName}] PHASE 1: Params:`, JSON.stringify(newOrdersParams));
             const newOrdersRes = await axios.get('https://api.ebay.com/sell/fulfillment/v1/order', {
               headers: {
                 Authorization: `Bearer ${accessToken}`,
                 'Content-Type': 'application/json',
               },
-              params: newOrdersParams
+              params: {
+                filter: newOrdersFilter,
+                limit: newOrdersLimit
+              }
             });
 
-            newEbayOrders = newOrdersRes.data.orders || [];
-            console.log(`[Seller ${sellerName}] PHASE 1: eBay returned ${newEbayOrders.length} NEW orders`);
-          } catch (phase1Err) {
-            console.error(`[Seller ${sellerName}] PHASE 1 error:`, phase1Err.message);
-            if (phase1Err.response?.data) {
-              console.error(`[Seller ${sellerName}] eBay API error details:`, JSON.stringify(phase1Err.response.data));
+            const ebayNewOrders = newOrdersRes.data.orders || [];
+            console.log(`[${sellerName}] PHASE 1: Got ${ebayNewOrders.length} new orders from eBay`);
+
+            // Insert new orders
+            for (const ebayOrder of ebayNewOrders) {
+              const existingOrder = await Order.findOne({ orderId: ebayOrder.orderId });
+              
+              if (!existingOrder) {
+                const orderData = await buildOrderData(ebayOrder, seller._id, accessToken);
+                const newOrder = await Order.create(orderData);
+                newOrders.push(newOrder);
+                console.log(`  🆕 NEW: ${ebayOrder.orderId}`);
+              } else {
+                // Order exists, check if needs update
+                const ebayModTime = new Date(ebayOrder.lastModifiedDate).getTime();
+                const dbModTime = new Date(existingOrder.lastModifiedDate).getTime();
+                
+                if (ebayModTime > dbModTime) {
+                  const orderData = await buildOrderData(ebayOrder, seller._id, accessToken);
+                  Object.assign(existingOrder, orderData);
+                  await existingOrder.save();
+                  updatedOrders.push(existingOrder);
+                  console.log(`  🔄 UPDATED: ${ebayOrder.orderId}`);
+                }
+              }
             }
-            // Continue to Phase 2 even if Phase 1 fails
+          } catch (phase1Err) {
+            console.error(`[${sellerName}] PHASE 1 error:`, phase1Err.message);
           }
-        } else {
-          console.log(`[Seller ${sellerName}] PHASE 1: Skipped (too recent)`);
         }
 
-        // Process Phase 1 new orders
-        for (const ebayOrder of newEbayOrders) {
-          const existingOrder = await Order.findOne({ 
-            orderId: ebayOrder.orderId,
-            seller: seller._id 
-          });
+        // ========== PHASE 2: CHECK FOR UPDATES ON RECENT ORDERS ==========
+        console.log(`[${sellerName}] PHASE 2: Checking orders < 30 days old`);
 
-          // Extract new fields
-          const cancelState = ebayOrder.cancelStatus?.cancelState || null;
-          const refunds = ebayOrder.paymentSummary?.refunds || [];
-          const trackingNumber = await extractTrackingNumber(
-            ebayOrder.fulfillmentStartInstructions?.[0]?.fulfillmentInstructionsType === 'SHIP_TO' 
-              ? ebayOrder.fulfillmentHrefs 
-              : null,
-            accessToken
-          );
+        const recentOrders = await Order.find({
+          seller: seller._id,
+          creationDate: { $gte: thirtyDaysAgo }
+        }).select('orderId lastModifiedDate creationDate');
 
-          // Extract denormalized fields for dashboard
-          const lineItem = ebayOrder.lineItems?.[0] || {};
-          const fulfillmentInstr = ebayOrder.fulfillmentStartInstructions?.[0] || {};
-          const shipTo = fulfillmentInstr.shippingStep?.shipTo || {};
-          const buyerAddr = `${shipTo.contactAddress?.addressLine1 || ''}, ${shipTo.contactAddress?.city || ''}, ${shipTo.contactAddress?.stateOrProvince || ''}, ${shipTo.contactAddress?.postalCode || ''}, ${shipTo.contactAddress?.countryCode || ''}`.trim();
+        console.log(`[${sellerName}] PHASE 2: ${recentOrders.length} orders < 30 days old`);
+
+        if (recentOrders.length > 0) {
+          const checkFromDate = lastPolledAt || thirtyDaysAgo;
+          const modifiedFilter = `lastmodifieddate:[${checkFromDate.toISOString()}..${currentTimeUTC.toISOString()}]`;
           
-          // Extract purchaseMarketplaceId from lineItems
-          const purchaseMarketplaceId = lineItem.purchaseMarketplaceId || '';
+          console.log(`[${sellerName}] PHASE 2: Checking mods since ${checkFromDate.toISOString()}`);
 
-          // Always upsert with all fields, so new and updated orders are consistent
-          const upsertedOrder = await Order.findOneAndUpdate(
-            { orderId: ebayOrder.orderId },
-            {
-              orderId: ebayOrder.orderId,
-              seller: seller._id,
-              orderFulfillmentStatus: ebayOrder.orderFulfillmentStatus,
-              creationDate: ebayOrder.creationDate,
-              lastModifiedDate: ebayOrder.lastModifiedDate,
-              pricingSummary: ebayOrder.pricingSummary,
-              buyer: ebayOrder.buyer,
-              lineItems: ebayOrder.lineItems,
-              paymentSummary: ebayOrder.paymentSummary,
-              fulfillmentStartInstructions: ebayOrder.fulfillmentStartInstructions,
-              orderPaymentStatus: ebayOrder.orderPaymentStatus,
-              salesRecordReference: ebayOrder.salesRecordReference,
-              totalFeeBasisAmount: ebayOrder.totalFeeBasisAmount,
-              totalMarketplaceFee: ebayOrder.totalMarketplaceFee,
-              fulfillmentHrefs: ebayOrder.fulfillmentHrefs,
-              cancelState,
-              refunds,
-              trackingNumber,
-              purchaseMarketplaceId,
-              // Denormalized fields for dashboard
-              dateSold: ebayOrder.creationDate,
-              shipByDate: lineItem.lineItemFulfillmentInstructions?.shipByDate,
-              estimatedDelivery: lineItem.lineItemFulfillmentInstructions?.maxEstimatedDeliveryDate,
-              productName: lineItem.title,
-              itemNumber: lineItem.legacyItemId,
-              buyerAddress: buyerAddr,
-              shippingFullName: shipTo.fullName || '',
-              shippingAddressLine1: shipTo.contactAddress?.addressLine1 || '',
-              shippingAddressLine2: shipTo.contactAddress?.addressLine2 || '',
-              shippingCity: shipTo.contactAddress?.city || '',
-              shippingState: shipTo.contactAddress?.stateOrProvince || '',
-              shippingPostalCode: shipTo.contactAddress?.postalCode || '',
-              shippingCountry: shipTo.contactAddress?.countryCode || '',
-              shippingPhone: '0000000000',
-              quantity: lineItem.quantity,
-              subtotal: parseFloat(ebayOrder.pricingSummary?.priceSubtotal?.value || 0),
-              salesTax: parseFloat(lineItem.ebayCollectAndRemitTaxes?.[0]?.amount?.value || 0),
-              discount: parseFloat(ebayOrder.pricingSummary?.priceDiscount?.value || 0),
-              shipping: parseFloat(ebayOrder.pricingSummary?.deliveryCost?.value || 0),
-              transactionFees: parseFloat(ebayOrder.totalMarketplaceFee?.value || 0),
-              adFee: parseFloat(lineItem.appliedPromotions?.[0]?.discountAmount?.value || 0)
-            },
-            { upsert: true, new: true }
-          );
-          newOrders.push(upsertedOrder);
-          console.log(`  🆕 NEW/UPSERTED: ${ebayOrder.orderId}`);
-        }
-
-        // ========== PHASE 2: CHECK FOR UPDATES TO EXISTING ORDERS ==========
-        // Get all existing order IDs from database to filter locally
-        const existingOrderIds = await Order.find({ seller: seller._id }).distinct('orderId');
-        const existingOrderIdSet = new Set(existingOrderIds);
-        console.log(`[Seller ${sellerName}] PHASE 2: Found ${existingOrderIds.length} existing orders in database`);
-
-        if (existingOrderIds.length > 0) {
-          // Get the oldest order to determine how far back to check
-          // This ensures we catch updates to ALL orders, not just recent ones
-          const oldestOrderInDb = await Order.findOne({ seller: seller._id }).sort({ creationDate: 1 });
-          
-          // Subtract 10 seconds from current time to avoid "future date" errors due to clock drift
-          const currentDate = new Date(Date.now() - 10000);
-          
-          // Check from 1 day BEFORE oldest order (to catch any edge cases)
-          let sinceDate;
-          if (oldestOrderInDb && oldestOrderInDb.creationDate) {
-            sinceDate = new Date(oldestOrderInDb.creationDate);
-            sinceDate.setDate(sinceDate.getDate() - 1); // 1 day before oldest order
-            
-            const daysCovered = Math.ceil((currentDate - sinceDate) / (1000 * 60 * 60 * 24));
-            console.log(`[Seller ${sellerName}] PHASE 2: Checking orders from ${sinceDate.toISOString()} to ${currentDate.toISOString()}`);
-            console.log(`[Seller ${sellerName}] PHASE 2: Date range covers ${daysCovered} days (all orders)`);
-          } else {
-            // Fallback to 30 days if no oldest order found (shouldn't happen but safety check)
-            sinceDate = new Date(currentDate.getTime() - (30 * 24 * 60 * 60 * 1000));
-            console.log(`[Seller ${sellerName}] PHASE 2: Checking for updates in last 30 days (fallback)`);
-          }
-          
           let offset = 0;
           const batchSize = 100;
-          let hasMoreBatches = true;
-          let phase2UpdateCount = 0;
+          let hasMore = true;
+          const recentOrderIdSet = new Set(recentOrders.map(o => o.orderId));
 
-          while (hasMoreBatches) {
+          while (hasMore) {
             try {
-              const filterString = `lastmodifieddate:[${sinceDate.toISOString()}..${currentDate.toISOString()}]`;
-              console.log(`[Seller ${sellerName}] PHASE 2: Fetching batch at offset ${offset}`);
-              console.log(`[Seller ${sellerName}] PHASE 2: Filter: ${filterString}`);
-              
-              // API CALL: Fetch orders with lastmodifieddate filter
-              const phase2Params = {
-                filter: filterString,
-                limit: batchSize
-              };
-              
-              // Only add offset if it's not 0 (some APIs don't like offset with filters)
-              if (offset > 0) {
-                phase2Params.offset = offset;
-              }
-              
               const phase2Res = await axios.get('https://api.ebay.com/sell/fulfillment/v1/order', {
                 headers: {
                   Authorization: `Bearer ${accessToken}`,
                   'Content-Type': 'application/json',
                 },
-                params: phase2Params
+                params: {
+                  filter: modifiedFilter,
+                  limit: batchSize,
+                  offset: offset > 0 ? offset : undefined
+                }
               });
-              
+
               const batchOrders = phase2Res.data.orders || [];
-              console.log(`[Seller ${sellerName}] PHASE 2: eBay returned ${batchOrders.length} orders in this batch`);
-              
-              // Filter locally: only process orders that exist in our database
-              const relevantOrders = batchOrders.filter(order => existingOrderIdSet.has(order.orderId));
-              console.log(`[Seller ${sellerName}] PHASE 2: ${relevantOrders.length} orders match our database`);
-              
-              // Process relevant orders
+              console.log(`[${sellerName}] PHASE 2: Got ${batchOrders.length} orders at offset ${offset}`);
+
+              const relevantOrders = batchOrders.filter(o => recentOrderIdSet.has(o.orderId));
+              console.log(`[${sellerName}] PHASE 2: ${relevantOrders.length} relevant`);
+
               for (const ebayOrder of relevantOrders) {
                 const existingOrder = await Order.findOne({ 
                   orderId: ebayOrder.orderId,
@@ -696,133 +733,130 @@ router.post('/poll-all-sellers', requireAuth, requireRole('fulfillmentadmin', 's
                 });
 
                 if (existingOrder) {
-                  // Check if actually modified
                   const ebayModTime = new Date(ebayOrder.lastModifiedDate).getTime();
                   const dbModTime = new Date(existingOrder.lastModifiedDate).getTime();
                   
-                  if (ebayModTime > dbModTime) {
-                    // Extract new fields
-                    const cancelState = ebayOrder.cancelStatus?.cancelState || null;
-                    const refunds = ebayOrder.paymentSummary?.refunds || [];
-                    const trackingNumber = await extractTrackingNumber(
-                      ebayOrder.fulfillmentStartInstructions?.[0]?.fulfillmentInstructionsType === 'SHIP_TO' 
-                        ? ebayOrder.fulfillmentHrefs 
-                        : null,
-                      accessToken
-                    );
-
-                    // Extract denormalized fields for dashboard
-                    const lineItem = ebayOrder.lineItems?.[0] || {};
-                    const fulfillmentInstr = ebayOrder.fulfillmentStartInstructions?.[0] || {};
-                    const shipTo = fulfillmentInstr.shippingStep?.shipTo || {};
-                    const buyerAddr = `${shipTo.contactAddress?.addressLine1 || ''}, ${shipTo.contactAddress?.city || ''}, ${shipTo.contactAddress?.stateOrProvince || ''}, ${shipTo.contactAddress?.postalCode || ''}, ${shipTo.contactAddress?.countryCode || ''}`.trim();
+                  // OPTIMIZATION: Skip if not actually modified
+                  if (ebayModTime <= dbModTime) {
+                    continue; // No changes, skip this order
+                  }
+                  
+                  // ONLY NOW fetch full order data (includes expensive tracking lookup)
+                  const orderData = await buildOrderData(ebayOrder, seller._id, accessToken);
+                  
+                  // Define fields that should trigger notifications
+                  const notifiableFields = [
+                    'cancelState',
+                    'orderPaymentStatus',
+                    'refunds',
+                    'orderFulfillmentStatus',
+                    'trackingNumber',
+                    'shippingFullName',
+                    'shippingAddressLine1',
+                    'shippingAddressLine2',
+                    'shippingCity',
+                    'shippingState',
+                    'shippingPostalCode',
+                    'shippingCountry'
+                    // NOTE: buyerCheckoutNotes is NOT included - updates DB silently
+                  ];
+                  
+                  // Detect changed fields with smart comparison
+                  const changedFields = [];
+                  for (const key of Object.keys(orderData)) {
+                    if (hasFieldChanged(existingOrder[key], orderData[key], key)) {
+                      changedFields.push(key);
+                    }
+                  }
+                  
+                  // Filter to only notifiable fields (exclude lastModifiedDate)
+                  const notifiableChanges = changedFields.filter(f => 
+                    notifiableFields.includes(f) && f !== 'lastModifiedDate'
+                  );
+                  
+                  // Always save ALL changes to DB (even non-notifiable)
+                  Object.assign(existingOrder, orderData);
+                  await existingOrder.save();
+                  
+                  // Only add to notification list if there are notifiable changes
+                  if (notifiableChanges.length > 0) {
+                    // Check if shipping address changed
+                    const shippingFields = ['shippingFullName', 'shippingAddressLine1', 'shippingCity', 'shippingState', 'shippingPostalCode'];
+                    const shippingChanged = notifiableChanges.some(f => shippingFields.includes(f));
                     
-                    // Extract purchaseMarketplaceId from lineItems
-                    const purchaseMarketplaceId = lineItem.purchaseMarketplaceId || '';
-
-                    // Update order
-                    existingOrder.orderFulfillmentStatus = ebayOrder.orderFulfillmentStatus;
-                    existingOrder.lastModifiedDate = ebayOrder.lastModifiedDate;
-                    existingOrder.pricingSummary = ebayOrder.pricingSummary;
-                    existingOrder.buyer = ebayOrder.buyer;
-                    existingOrder.lineItems = ebayOrder.lineItems;
-                    existingOrder.paymentSummary = ebayOrder.paymentSummary;
-                    existingOrder.fulfillmentStartInstructions = ebayOrder.fulfillmentStartInstructions;
-                    existingOrder.orderPaymentStatus = ebayOrder.orderPaymentStatus;
-                    existingOrder.salesRecordReference = ebayOrder.salesRecordReference;
-                    existingOrder.totalFeeBasisAmount = ebayOrder.totalFeeBasisAmount;
-                    existingOrder.totalMarketplaceFee = ebayOrder.totalMarketplaceFee;
-                    existingOrder.fulfillmentHrefs = ebayOrder.fulfillmentHrefs;
-                    existingOrder.cancelState = cancelState;
-                    existingOrder.refunds = refunds;
-                    existingOrder.trackingNumber = trackingNumber;
-                    existingOrder.purchaseMarketplaceId = purchaseMarketplaceId;
-                    // Update denormalized fields
-                    existingOrder.dateSold = ebayOrder.creationDate;
-                    existingOrder.shipByDate = lineItem.lineItemFulfillmentInstructions?.shipByDate;
-                    existingOrder.estimatedDelivery = lineItem.lineItemFulfillmentInstructions?.maxEstimatedDeliveryDate;
-                    existingOrder.productName = lineItem.title;
-                    existingOrder.itemNumber = lineItem.legacyItemId;
-                    existingOrder.buyerAddress = buyerAddr;
-                    existingOrder.shippingFullName = shipTo.fullName || '';
-                    existingOrder.shippingAddressLine1 = shipTo.contactAddress?.addressLine1 || '';
-                    existingOrder.shippingAddressLine2 = shipTo.contactAddress?.addressLine2 || '';
-                    existingOrder.shippingCity = shipTo.contactAddress?.city || '';
-                    existingOrder.shippingState = shipTo.contactAddress?.stateOrProvince || '';
-                    existingOrder.shippingPostalCode = shipTo.contactAddress?.postalCode || '';
-                    existingOrder.shippingCountry = shipTo.contactAddress?.countryCode || '';
-                    existingOrder.shippingPhone = '0000000000';
-                    existingOrder.quantity = lineItem.quantity;
-                    existingOrder.subtotal = parseFloat(ebayOrder.pricingSummary?.priceSubtotal?.value || 0);
-                    existingOrder.salesTax = parseFloat(lineItem.ebayCollectAndRemitTaxes?.[0]?.amount?.value || 0);
-                    existingOrder.discount = parseFloat(ebayOrder.pricingSummary?.priceDiscount?.value || 0);
-                    existingOrder.shipping = parseFloat(ebayOrder.pricingSummary?.deliveryCost?.value || 0);
-                    existingOrder.transactionFees = parseFloat(ebayOrder.totalMarketplaceFee?.value || 0);
-                    existingOrder.adFee = parseFloat(lineItem.appliedPromotions?.[0]?.discountAmount?.value || 0);
+                    if (shippingChanged) {
+                      console.log(`  🏠 SHIPPING ADDRESS CHANGED: ${ebayOrder.orderId}`);
+                    }
                     
-                    await existingOrder.save();
-                    updatedOrders.push(existingOrder);
-                    phase2UpdateCount++;
-                    console.log(`  🔄 UPDATED (Phase 2): ${ebayOrder.orderId}`);
+                    updatedOrders.push({
+                      orderId: existingOrder.orderId,
+                      changedFields: notifiableChanges
+                    });
+                    console.log(`  🔔 NOTIFY: ${ebayOrder.orderId} - ${notifiableChanges.join(', ')}`);
                   } else {
-                    console.log(`  ⏭️  No changes: ${ebayOrder.orderId}`);
+                    // Changes were made but not notifiable (e.g., buyerCheckoutNotes, dates, etc.)
+                    console.log(`  ✅ UPDATED (silent): ${ebayOrder.orderId} - ${changedFields.join(', ')}`);
                   }
                 }
               }
-              
-              // Check if there are more batches
+
+              // EARLY EXIT
               if (batchOrders.length < batchSize) {
-                hasMoreBatches = false;
+                hasMore = false;
+                console.log(`[${sellerName}] PHASE 2: Early exit`);
               } else {
                 offset += batchSize;
               }
-            } catch (fetchErr) {
-              console.error(`[Seller ${sellerName}] PHASE 2 batch fetch error:`, fetchErr.message);
-              if (fetchErr.response?.data) {
-                console.error(`[Seller ${sellerName}] eBay API error details:`, JSON.stringify(fetchErr.response.data));
-              }
-              if (fetchErr.response?.status) {
-                console.error(`[Seller ${sellerName}] HTTP Status:`, fetchErr.response.status);
-              }
-              hasMoreBatches = false;
+            } catch (phase2Err) {
+              console.error(`[${sellerName}] PHASE 2 error:`, phase2Err.message);
+              hasMore = false;
             }
           }
-          
-          console.log(`[Seller ${sellerName}] PHASE 2 COMPLETE: ${phase2UpdateCount} orders updated`);
         }
 
-        // Populate seller user data for summary
-        await seller.populate('user', 'username email');
+        // ========== UPDATE SELLER METADATA ==========
+        seller.lastPolledAt = new Date(nowUTC);
+        await seller.save();
+        console.log(`[${sellerName}] ✅ Complete: ${newOrders.length} new, ${updatedOrders.length} updated`);
 
-        pollResults.push({
+        return {
           sellerId: seller._id,
-          sellerName: sellerName,
+          sellerName,
           success: true,
           newOrders: newOrders.map(o => o.orderId),
-          updatedOrders: updatedOrders.map(o => o.orderId),
+          updatedOrders, // Now contains { orderId, changedFields }
           totalNew: newOrders.length,
           totalUpdated: updatedOrders.length
-        });
-
-        totalNewOrders += newOrders.length;
-        totalUpdatedOrders += updatedOrders.length;
+        };
 
       } catch (sellerErr) {
-        // Ensure seller.user is populated for error logging
-        if (!seller.user) {
-          await seller.populate('user', 'username email');
-        }
-        const sellerNameForError = seller.user?.username || seller.user?.email || seller._id.toString();
-        console.error(`Error polling seller ${sellerNameForError}:`, sellerErr.message);
-        
-        pollResults.push({
+        console.error(`[${sellerName}] ❌ Error:`, sellerErr.message);
+        return {
           sellerId: seller._id,
-          sellerName: sellerNameForError,
+          sellerName,
           success: false,
           error: sellerErr.message
-        });
+        };
       }
-    }
+    });
+
+    // Wait for all sellers to complete (parallel execution)
+    const results = await Promise.allSettled(pollingPromises);
+    
+    // Process results
+    const pollResults = results.map(result => {
+      if (result.status === 'fulfilled') {
+        return result.value;
+      } else {
+        return {
+          success: false,
+          error: result.reason?.message || 'Unknown error'
+        };
+      }
+    });
+
+    const totalNewOrders = pollResults.reduce((sum, r) => sum + (r.totalNew || 0), 0);
+    const totalUpdatedOrders = pollResults.reduce((sum, r) => sum + (r.totalUpdated || 0), 0);
 
     res.json({
       message: 'Polling complete',
@@ -832,18 +866,486 @@ router.post('/poll-all-sellers', requireAuth, requireRole('fulfillmentadmin', 's
       totalUpdatedOrders
     });
     
-    console.log('Poll all sellers complete:', {
-      totalPolled: sellers.length,
-      totalNewOrders,
-      totalUpdatedOrders,
-      resultsCount: pollResults.length
-    });
+    console.log('\n========== POLLING SUMMARY ==========');
+    console.log(`Total sellers polled: ${sellers.length}`);
+    console.log(`Total new orders: ${totalNewOrders}`);
+    console.log(`Total updated orders: ${totalUpdatedOrders}`);
 
   } catch (err) {
     console.error('Error polling all sellers:', err);
     res.status(500).json({ error: err.message });
   }
 });
+
+// Poll all sellers for NEW ORDERS ONLY (Phase 1)
+router.post('/poll-new-orders', requireAuth, requireRole('fulfillmentadmin', 'superadmin'), async (req, res) => {
+  try {
+    const sellers = await Seller.find({ 'ebayTokens.access_token': { $exists: true, $ne: null } })
+      .populate('user', 'username email');
+    
+    if (sellers.length === 0) {
+      return res.json({ 
+        message: 'No sellers with connected eBay accounts found',
+        pollResults: [],
+        totalPolled: 0,
+        totalNewOrders: 0
+      });
+    }
+
+    const nowUTC = Date.now();
+    console.log(`\n========== POLLING NEW ORDERS FOR ${sellers.length} SELLERS ==========`);
+    console.log(`UTC Time: ${new Date(nowUTC).toISOString()}`);
+
+    const pollingPromises = sellers.map(async (seller) => {
+      const sellerName = seller.user?.username || seller.user?.email || seller._id.toString();
+      
+      try {
+        console.log(`\n[${sellerName}] Checking for new orders...`);
+        
+        // Token refresh
+        const fetchedAt = seller.ebayTokens.fetchedAt ? new Date(seller.ebayTokens.fetchedAt).getTime() : 0;
+        const expiresInMs = (seller.ebayTokens.expires_in || 0) * 1000;
+        let accessToken = seller.ebayTokens.access_token;
+
+        if (fetchedAt && (nowUTC - fetchedAt > expiresInMs - 2 * 60 * 1000)) {
+          console.log(`[${sellerName}] Refreshing token...`);
+          const refreshRes = await axios.post(
+            'https://api.ebay.com/identity/v1/oauth2/token',
+            qs.stringify({
+              grant_type: 'refresh_token',
+              refresh_token: seller.ebayTokens.refresh_token,
+              scope: 'https://api.ebay.com/oauth/api_scope/sell.fulfillment.readonly',
+            }),
+            {
+              headers: {
+                'Content-Type': 'application/x-www-form-urlencoded',
+                Authorization: 'Basic ' + Buffer.from(`${process.env.EBAY_CLIENT_ID}:${process.env.EBAY_CLIENT_SECRET}`).toString('base64'),
+              },
+            }
+          );
+          seller.ebayTokens.access_token = refreshRes.data.access_token;
+          seller.ebayTokens.expires_in = refreshRes.data.expires_in;
+          seller.ebayTokens.fetchedAt = new Date(nowUTC);
+          await seller.save();
+          accessToken = refreshRes.data.access_token;
+        }
+
+        const orderCount = await Order.countDocuments({ seller: seller._id });
+        const latestOrder = await Order.findOne({ seller: seller._id }).sort({ creationDate: -1 });
+        const latestCreationDate = latestOrder ? latestOrder.creationDate : null;
+        const initialSyncDate = seller.initialSyncDate || new Date(Date.UTC(2025, 9, 17, 0, 0, 0, 0));
+        const currentTimeUTC = new Date(nowUTC - 5000);
+
+        const newOrders = [];
+        let newOrdersFilter = null;
+        let newOrdersLimit = 15;
+
+        if (orderCount === 0) {
+          newOrdersFilter = `creationdate:[${initialSyncDate.toISOString()}..${currentTimeUTC.toISOString()}]`;
+          newOrdersLimit = 200;
+          console.log(`[${sellerName}] Initial sync from ${initialSyncDate.toISOString()}`);
+        } else if (latestCreationDate) {
+          const afterLatestMs = new Date(latestCreationDate).getTime() + 1000;
+          const afterLatest = new Date(afterLatestMs);
+          const timeDiffMinutes = (currentTimeUTC.getTime() - afterLatestMs) / (1000 * 60);
+          
+          if (timeDiffMinutes >= 1) {
+            newOrdersFilter = `creationdate:[${afterLatest.toISOString()}..${currentTimeUTC.toISOString()}]`;
+            newOrdersLimit = 200;
+            console.log(`[${sellerName}] Checking new orders after ${afterLatest.toISOString()}`);
+          } else {
+            console.log(`[${sellerName}] Skipped (too recent: ${timeDiffMinutes.toFixed(2)} min)`);
+          }
+        }
+
+        if (newOrdersFilter) {
+          const newOrdersRes = await axios.get('https://api.ebay.com/sell/fulfillment/v1/order', {
+            headers: {
+              Authorization: `Bearer ${accessToken}`,
+              'Content-Type': 'application/json',
+            },
+            params: { filter: newOrdersFilter, limit: newOrdersLimit }
+          });
+
+          const ebayNewOrders = newOrdersRes.data.orders || [];
+          console.log(`[${sellerName}] Found ${ebayNewOrders.length} new orders`);
+
+          for (const ebayOrder of ebayNewOrders) {
+            const existingOrder = await Order.findOne({ orderId: ebayOrder.orderId });
+            
+            if (!existingOrder) {
+              const orderData = await buildOrderData(ebayOrder, seller._id, accessToken);
+              const newOrder = await Order.create(orderData);
+              newOrders.push(newOrder);
+              console.log(`  🆕 NEW: ${ebayOrder.orderId}`);
+            }
+          }
+        }
+
+        console.log(`[${sellerName}] ✅ Complete: ${newOrders.length} new orders`);
+
+        return {
+          sellerId: seller._id,
+          sellerName,
+          success: true,
+          newOrders: newOrders.map(o => o.orderId),
+          totalNew: newOrders.length
+        };
+
+      } catch (sellerErr) {
+        console.error(`[${sellerName}] ❌ Error:`, sellerErr.message);
+        return {
+          sellerId: seller._id,
+          sellerName,
+          success: false,
+          error: sellerErr.message
+        };
+      }
+    });
+
+    const results = await Promise.allSettled(pollingPromises);
+    const pollResults = results.map(result => result.status === 'fulfilled' ? result.value : { success: false, error: result.reason?.message || 'Unknown error' });
+    const totalNewOrders = pollResults.reduce((sum, r) => sum + (r.totalNew || 0), 0);
+
+    res.json({
+      message: 'New orders polling complete',
+      pollResults,
+      totalPolled: sellers.length,
+      totalNewOrders
+    });
+    
+    console.log(`\n========== NEW ORDERS SUMMARY ==========`);
+    console.log(`Total new orders: ${totalNewOrders}`);
+
+  } catch (err) {
+    console.error('Error polling new orders:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Poll all sellers for ORDER UPDATES ONLY (Phase 2)
+router.post('/poll-order-updates', requireAuth, requireRole('fulfillmentadmin', 'superadmin'), async (req, res) => {
+  try {
+    // Helper function to normalize dates for comparison (ignore milliseconds/format)
+    function normalizeDateForComparison(date) {
+      if (!date) return null;
+      if (date instanceof Date) {
+        return Math.floor(date.getTime() / 1000); // Unix timestamp in seconds
+      }
+      if (typeof date === 'string') {
+        return Math.floor(new Date(date).getTime() / 1000);
+      }
+      return null;
+    }
+
+    // Helper function to check if field actually changed
+    function hasFieldChanged(oldValue, newValue, fieldName) {
+      // Skip system fields
+      const systemFields = ['_id', '__v', 'seller', 'updatedAt', 'createdAt'];
+      if (systemFields.includes(fieldName)) return false;
+      
+      // Date fields - compare Unix timestamps (ignore milliseconds)
+      const dateFields = ['creationDate', 'lastModifiedDate', 'dateSold', 'shipByDate', 'estimatedDelivery'];
+      if (dateFields.includes(fieldName)) {
+        const oldTime = normalizeDateForComparison(oldValue);
+        const newTime = normalizeDateForComparison(newValue);
+        return oldTime !== newTime;
+      }
+      
+      // Null/undefined checks
+      if (oldValue === null || oldValue === undefined) {
+        return newValue !== null && newValue !== undefined;
+      }
+      
+      // Objects/Arrays - deep comparison
+      if (typeof newValue === 'object' && newValue !== null) {
+        return JSON.stringify(oldValue) !== JSON.stringify(newValue);
+      }
+      
+      // Primitives - direct comparison
+      return oldValue !== newValue;
+    }
+
+    const sellers = await Seller.find({ 'ebayTokens.access_token': { $exists: true, $ne: null } })
+      .populate('user', 'username email');
+    
+    if (sellers.length === 0) {
+      return res.json({ 
+        message: 'No sellers with connected eBay accounts found',
+        pollResults: [],
+        totalPolled: 0,
+        totalUpdatedOrders: 0
+      });
+    }
+
+    const nowUTC = Date.now();
+    const thirtyDaysAgoMs = 30 * 24 * 60 * 60 * 1000;
+    const thirtyDaysAgo = new Date(nowUTC - thirtyDaysAgoMs);
+
+    console.log(`\n========== POLLING ORDER UPDATES FOR ${sellers.length} SELLERS ==========`);
+    console.log(`UTC Time: ${new Date(nowUTC).toISOString()}`);
+    console.log(`Checking orders from: ${thirtyDaysAgo.toISOString()}`);
+
+    const pollingPromises = sellers.map(async (seller) => {
+      const sellerName = seller.user?.username || seller.user?.email || seller._id.toString();
+      
+      try {
+        console.log(`\n[${sellerName}] Checking for order updates...`);
+        
+        // Token refresh
+        const fetchedAt = seller.ebayTokens.fetchedAt ? new Date(seller.ebayTokens.fetchedAt).getTime() : 0;
+        const expiresInMs = (seller.ebayTokens.expires_in || 0) * 1000;
+        let accessToken = seller.ebayTokens.access_token;
+
+        if (fetchedAt && (nowUTC - fetchedAt > expiresInMs - 2 * 60 * 1000)) {
+          console.log(`[${sellerName}] Refreshing token...`);
+          const refreshRes = await axios.post(
+            'https://api.ebay.com/identity/v1/oauth2/token',
+            qs.stringify({
+              grant_type: 'refresh_token',
+              refresh_token: seller.ebayTokens.refresh_token,
+              scope: 'https://api.ebay.com/oauth/api_scope/sell.fulfillment.readonly',
+            }),
+            {
+              headers: {
+                'Content-Type': 'application/x-www-form-urlencoded',
+                Authorization: 'Basic ' + Buffer.from(`${process.env.EBAY_CLIENT_ID}:${process.env.EBAY_CLIENT_SECRET}`).toString('base64'),
+              },
+            }
+          );
+          seller.ebayTokens.access_token = refreshRes.data.access_token;
+          seller.ebayTokens.expires_in = refreshRes.data.expires_in;
+          seller.ebayTokens.fetchedAt = new Date(nowUTC);
+          await seller.save();
+          accessToken = refreshRes.data.access_token;
+        }
+
+        const lastPolledAt = seller.lastPolledAt || null;
+        const currentTimeUTC = new Date(nowUTC - 5000);
+        const updatedOrders = [];
+
+        const recentOrders = await Order.find({
+          seller: seller._id,
+          creationDate: { $gte: thirtyDaysAgo }
+        }).select('orderId lastModifiedDate creationDate');
+
+        console.log(`[${sellerName}] ${recentOrders.length} orders < 30 days old`);
+
+        if (recentOrders.length > 0) {
+          const checkFromDate = lastPolledAt || thirtyDaysAgo;
+          const modifiedFilter = `lastmodifieddate:[${checkFromDate.toISOString()}..${currentTimeUTC.toISOString()}]`;
+          
+          console.log(`[${sellerName}] Checking modifications since ${checkFromDate.toISOString()}`);
+
+          let offset = 0;
+          const batchSize = 100;
+          let hasMore = true;
+          const recentOrderIdSet = new Set(recentOrders.map(o => o.orderId));
+
+          while (hasMore) {
+            const phase2Res = await axios.get('https://api.ebay.com/sell/fulfillment/v1/order', {
+              headers: {
+                Authorization: `Bearer ${accessToken}`,
+                'Content-Type': 'application/json',
+              },
+              params: {
+                filter: modifiedFilter,
+                limit: batchSize,
+                offset: offset > 0 ? offset : undefined
+              }
+            });
+
+            const batchOrders = phase2Res.data.orders || [];
+            console.log(`[${sellerName}] Got ${batchOrders.length} orders at offset ${offset}`);
+
+            const relevantOrders = batchOrders.filter(o => recentOrderIdSet.has(o.orderId));
+
+            for (const ebayOrder of relevantOrders) {
+              const existingOrder = await Order.findOne({ 
+                orderId: ebayOrder.orderId,
+                seller: seller._id 
+              });
+
+              if (existingOrder) {
+                const ebayModTime = new Date(ebayOrder.lastModifiedDate).getTime();
+                const dbModTime = new Date(existingOrder.lastModifiedDate).getTime();
+                
+                // OPTIMIZATION: Skip if not actually modified
+                if (ebayModTime <= dbModTime) {
+                  continue; // No changes, skip this order
+                }
+                
+                // ONLY NOW fetch full order data (includes expensive tracking lookup)
+                const orderData = await buildOrderData(ebayOrder, seller._id, accessToken);
+                
+                // Define fields that should trigger notifications
+                const notifiableFields = [
+                  'cancelState',
+                  'orderPaymentStatus',
+                  'refunds',
+                  'orderFulfillmentStatus',
+                  'trackingNumber',
+                  'shippingFullName',
+                  'shippingAddressLine1',
+                  'shippingAddressLine2',
+                  'shippingCity',
+                  'shippingState',
+                  'shippingPostalCode',
+                  'shippingCountry'
+                  // NOTE: buyerCheckoutNotes is NOT included - updates DB silently
+                ];
+                
+                // Detect changed fields with smart comparison
+                const changedFields = [];
+                for (const key of Object.keys(orderData)) {
+                  if (hasFieldChanged(existingOrder[key], orderData[key], key)) {
+                    changedFields.push(key);
+                  }
+                }
+                
+                // Filter to only notifiable fields (exclude lastModifiedDate)
+                const notifiableChanges = changedFields.filter(f => 
+                  notifiableFields.includes(f) && f !== 'lastModifiedDate'
+                );
+                
+                // Always save ALL changes to DB (even non-notifiable)
+                Object.assign(existingOrder, orderData);
+                await existingOrder.save();
+                
+                // Only add to notification list if there are notifiable changes
+                if (notifiableChanges.length > 0) {
+                  // Check if shipping address changed
+                  const shippingFields = ['shippingFullName', 'shippingAddressLine1', 'shippingCity', 'shippingState', 'shippingPostalCode'];
+                  const shippingChanged = notifiableChanges.some(f => shippingFields.includes(f));
+                  
+                  if (shippingChanged) {
+                    console.log(`  🏠 SHIPPING ADDRESS CHANGED: ${ebayOrder.orderId}`);
+                  }
+                  
+                  updatedOrders.push({
+                    orderId: existingOrder.orderId,
+                    changedFields: notifiableChanges
+                  });
+                  console.log(`  🔔 NOTIFY: ${ebayOrder.orderId} - ${notifiableChanges.join(', ')}`);
+                } else {
+                  // Changes were made but not notifiable (e.g., buyerCheckoutNotes, dates, etc.)
+                  console.log(`  ✅ UPDATED (silent): ${ebayOrder.orderId} - ${changedFields.join(', ')}`);
+                }
+              }
+            }
+
+            if (batchOrders.length < batchSize) {
+              hasMore = false;
+            } else {
+              offset += batchSize;
+            }
+          }
+        }
+
+        // Update lastPolledAt timestamp
+        seller.lastPolledAt = new Date(nowUTC);
+        await seller.save();
+        
+        console.log(`[${sellerName}] ✅ Complete: ${updatedOrders.length} updated`);
+
+        return {
+          sellerId: seller._id,
+          sellerName,
+          success: true,
+          updatedOrders, // Now contains { orderId, changedFields }
+          totalUpdated: updatedOrders.length
+        };
+
+      } catch (sellerErr) {
+        console.error(`[${sellerName}] ❌ Error:`, sellerErr.message);
+        return {
+          sellerId: seller._id,
+          sellerName,
+          success: false,
+          error: sellerErr.message
+        };
+      }
+    });
+
+    const results = await Promise.allSettled(pollingPromises);
+    const pollResults = results.map(result => result.status === 'fulfilled' ? result.value : { success: false, error: result.reason?.message || 'Unknown error' });
+    const totalUpdatedOrders = pollResults.reduce((sum, r) => sum + (r.totalUpdated || 0), 0);
+
+    res.json({
+      message: 'Order updates polling complete',
+      pollResults,
+      totalPolled: sellers.length,
+      totalUpdatedOrders
+    });
+    
+    console.log(`\n========== ORDER UPDATES SUMMARY ==========`);
+    console.log(`Total updated orders: ${totalUpdatedOrders}`);
+
+  } catch (err) {
+    console.error('Error polling order updates:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Helper function to build order data object for insert/update
+async function buildOrderData(ebayOrder, sellerId, accessToken) {
+  const lineItem = ebayOrder.lineItems?.[0] || {};
+  const fulfillmentInstr = ebayOrder.fulfillmentStartInstructions?.[0] || {};
+  const shipTo = fulfillmentInstr.shippingStep?.shipTo || {};
+  const buyerAddr = `${shipTo.contactAddress?.addressLine1 || ''}, ${shipTo.contactAddress?.city || ''}, ${shipTo.contactAddress?.stateOrProvince || ''}, ${shipTo.contactAddress?.postalCode || ''}, ${shipTo.contactAddress?.countryCode || ''}`.trim();
+  
+  const trackingNumber = await extractTrackingNumber(ebayOrder.fulfillmentHrefs, accessToken);
+  const purchaseMarketplaceId = lineItem.purchaseMarketplaceId || '';
+
+  return {
+    seller: sellerId,
+    orderId: ebayOrder.orderId,
+    legacyOrderId: ebayOrder.legacyOrderId,
+    creationDate: ebayOrder.creationDate,
+    lastModifiedDate: ebayOrder.lastModifiedDate,
+    orderFulfillmentStatus: ebayOrder.orderFulfillmentStatus,
+    orderPaymentStatus: ebayOrder.orderPaymentStatus,
+    sellerId: ebayOrder.sellerId,
+    buyer: ebayOrder.buyer,
+    buyerCheckoutNotes: ebayOrder.buyerCheckoutNotes,
+    pricingSummary: ebayOrder.pricingSummary,
+    cancelStatus: ebayOrder.cancelStatus,
+    paymentSummary: ebayOrder.paymentSummary,
+    fulfillmentStartInstructions: ebayOrder.fulfillmentStartInstructions,
+    lineItems: ebayOrder.lineItems,
+    ebayCollectAndRemitTax: ebayOrder.ebayCollectAndRemitTax,
+    salesRecordReference: ebayOrder.salesRecordReference,
+    totalFeeBasisAmount: ebayOrder.totalFeeBasisAmount,
+    totalMarketplaceFee: ebayOrder.totalMarketplaceFee,
+    fulfillmentHrefs: ebayOrder.fulfillmentHrefs,
+    // Denormalized fields
+    dateSold: ebayOrder.creationDate,
+    shipByDate: lineItem.lineItemFulfillmentInstructions?.shipByDate,
+    estimatedDelivery: lineItem.lineItemFulfillmentInstructions?.maxEstimatedDeliveryDate,
+    productName: lineItem.title,
+    itemNumber: lineItem.legacyItemId,
+    buyerAddress: buyerAddr,
+    shippingFullName: shipTo.fullName || '',
+    shippingAddressLine1: shipTo.contactAddress?.addressLine1 || '',
+    shippingAddressLine2: shipTo.contactAddress?.addressLine2 || '',
+    shippingCity: shipTo.contactAddress?.city || '',
+    shippingState: shipTo.contactAddress?.stateOrProvince || '',
+    shippingPostalCode: shipTo.contactAddress?.postalCode || '',
+    shippingCountry: shipTo.contactAddress?.countryCode || '',
+    shippingPhone: shipTo.primaryPhone?.phoneNumber || '0000000000',
+    quantity: lineItem.quantity,
+    subtotal: parseFloat(ebayOrder.pricingSummary?.priceSubtotal?.value || 0),
+    salesTax: parseFloat(lineItem.ebayCollectAndRemitTaxes?.[0]?.amount?.value || 0),
+    discount: parseFloat(ebayOrder.pricingSummary?.priceDiscount?.value || 0),
+    shipping: parseFloat(ebayOrder.pricingSummary?.deliveryCost?.value || 0),
+    transactionFees: parseFloat(ebayOrder.totalMarketplaceFee?.value || 0),
+    adFee: parseFloat(lineItem.appliedPromotions?.[0]?.discountAmount?.value || 0),
+    cancelState: ebayOrder.cancelStatus?.cancelState || 'NONE_REQUESTED',
+    refunds: ebayOrder.paymentSummary?.refunds || [],
+    trackingNumber,
+    purchaseMarketplaceId
+  };
+}
 
 // Update messaging status for an order
 router.patch('/orders/:orderId/messaging-status', async (req, res) => {

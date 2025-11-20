@@ -69,5 +69,9 @@ const OrderSchema = new mongoose.Schema(
 // Index for faster queries
 OrderSchema.index({ seller: 1, orderId: 1 });
 OrderSchema.index({ seller: 1, creationDate: -1 });
+OrderSchema.index({ seller: 1, lastModifiedDate: -1 });
+OrderSchema.index({ seller: 1, creationDate: -1, lastModifiedDate: -1 }); // Compound index for polling queries
+OrderSchema.index({ dateSold: 1 }); // Index for date range searches
+OrderSchema.index({ cancelState: 1, creationDate: -1 }); // Index for cancelled orders queries
 
 export default mongoose.model('Order', OrderSchema);
