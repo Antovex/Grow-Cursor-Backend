@@ -3,44 +3,29 @@ import mongoose from 'mongoose';
 const MessageSchema = new mongoose.Schema(
   {
     seller: { type: mongoose.Schema.Types.ObjectId, ref: 'Seller', required: true },
-    messageId: { type: String, required: true, unique: true }, // eBay message/inquiry ID
-    orderId: String, // Related order ID (if applicable)
-    legacyOrderId: String,
-    
-    // Buyer information
-    buyerUsername: String,
-    
-    // Message details
-    subject: String,
-    messageText: String,
-    messageType: String, // e.g., "INQUIRY", "QUESTION", "ISSUE"
-    inquiryStatus: String, // e.g., "OPEN", "CLOSED", "PENDING_SELLER_RESPONSE"
-    
-    // Item details (if related to specific item)
+    orderId: String, 
     itemId: String,
     itemTitle: String,
+    buyerUsername: { type: String, required: true },
     
-    // Status tracking
-    isResolved: { type: Boolean, default: false },
-    resolvedAt: Date,
-    resolvedBy: String, // Username who resolved it
+    externalMessageId: { type: String, unique: true, sparse: true },
+    sender: { type: String, enum: ['SELLER', 'BUYER'], required: true },
+    subject: String,
+    body: String,
     
-    // Dates
-    creationDate: Date,
-    responseDate: Date, // When seller must respond by
-    lastMessageDate: Date,
+    // NEW: Array to store image links
+    mediaUrls: [{ type: String }], 
+
+    read: { type: Boolean, default: false },
+    messageType: { type: String, enum: ['ORDER', 'INQUIRY'], default: 'ORDER' },
     
-    // Full eBay response (for reference)
-    rawData: Object
+    messageDate: { type: Date, default: Date.now }
   },
   { timestamps: true }
 );
 
-// Indexes for faster queries
-MessageSchema.index({ seller: 1, creationDate: -1 });
-// Note: messageId already has unique index from schema definition
-MessageSchema.index({ orderId: 1 });
-MessageSchema.index({ isResolved: 1, creationDate: -1 });
-MessageSchema.index({ inquiryStatus: 1, creationDate: -1 });
+MessageSchema.index({ seller: 1, orderId: 1 });
+MessageSchema.index({ seller: 1, buyerUsername: 1 });
+MessageSchema.index({ messageDate: -1 });
 
 export default mongoose.model('Message', MessageSchema);

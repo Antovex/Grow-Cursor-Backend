@@ -2,12 +2,144 @@ import express from 'express';
 import axios from 'axios';
 import qs from 'qs';
 import jwt from 'jsonwebtoken';
+import mongoose from 'mongoose';
 import { requireAuth, requireRole } from '../middleware/auth.js';
 import Seller from '../models/Seller.js';
 import Order from '../models/Order.js';
 import Return from '../models/Return.js';
 import Message from '../models/Message.js';
+import { parseStringPromise } from 'xml2js';
 const router = express.Router();
+
+
+// HELPER: Ensure Seller Token is Valid (Refreshes if < 2 mins left)
+async function ensureValidToken(seller) {
+  const now = Date.now();
+  const fetchedAt = seller.ebayTokens.fetchedAt ? new Date(seller.ebayTokens.fetchedAt).getTime() : 0;
+  const expiresInMs = (seller.ebayTokens.expires_in || 0) * 1000;
+  const bufferTime = 2 * 60 * 1000; // 2 minutes buffer
+
+  // If token is valid, return it
+  if (fetchedAt && (now - fetchedAt < expiresInMs - bufferTime)) {
+    return seller.ebayTokens.access_token;
+  }
+
+  console.log(`[Token Refresh] Refreshing token for ${seller.user?.username || seller._id}`);
+
+  try {
+    const refreshRes = await axios.post(
+      'https://api.ebay.com/identity/v1/oauth2/token',
+      qs.stringify({
+        grant_type: 'refresh_token',
+        refresh_token: seller.ebayTokens.refresh_token,
+        scope: 'https://api.ebay.com/oauth/api_scope https://api.ebay.com/oauth/api_scope/sell.fulfillment'
+      }),
+      {
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          Authorization: 'Basic ' + Buffer.from(`${process.env.EBAY_CLIENT_ID}:${process.env.EBAY_CLIENT_SECRET}`).toString('base64'),
+        },
+      }
+    );
+
+    // Update Seller
+    seller.ebayTokens.access_token = refreshRes.data.access_token;
+    seller.ebayTokens.expires_in = refreshRes.data.expires_in;
+    seller.ebayTokens.fetchedAt = new Date();
+    await seller.save();
+
+    return refreshRes.data.access_token;
+  } catch (err) {
+    console.error(`[Token Refresh] Failed for ${seller._id}:`, err.message);
+    throw new Error('Failed to refresh eBay token');
+  }
+}
+
+// HELPER: Process a single eBay XML Message and save to DB
+async function processEbayMessage(msg, seller) {
+  try {
+    const question = msg.Question?.[0]; 
+    if (!question) return false;
+
+    const msgID = question.MessageID?.[0];
+    const senderID = question.SenderID?.[0];
+    const senderEmail = question.SenderEmail?.[0]; 
+    const body = question.Body?.[0];
+    const subject = question.Subject?.[0];
+    const itemID = msg.Item?.[0]?.ItemID?.[0];
+    const itemTitle = msg.Item?.[0]?.Title?.[0];
+
+    // --- EXTRACT IMAGES (NEW) ---
+    const mediaUrls = [];
+    // Check if MessageMedia exists and is an array
+    if (msg.MessageMedia && Array.isArray(msg.MessageMedia)) {
+      msg.MessageMedia.forEach(media => {
+        if (media.MediaURL && media.MediaURL[0]) {
+          mediaUrls.push(media.MediaURL[0]);
+        }
+      });
+    }
+    // Sometimes it's inside the Question tag as well
+    if (question.MessageMedia && Array.isArray(question.MessageMedia)) {
+        question.MessageMedia.forEach(media => {
+            if (media.MediaURL && media.MediaURL[0]) {
+              mediaUrls.push(media.MediaURL[0]);
+            }
+        });
+    }
+    // ----------------------------
+
+    // --- DATE PARSING ---
+    const rawDate = question.CreationDate?.[0];
+    let messageDate = new Date(); 
+    if (rawDate) {
+      const parsedDate = new Date(rawDate);
+      if (!isNaN(parsedDate.getTime())) messageDate = parsedDate;
+    }
+
+    // 1. Prevent Duplicates
+    const exists = await Message.findOne({ externalMessageId: msgID });
+    if (exists) return false;
+
+    // 2. Find Order
+    let orderId = null;
+    let messageType = 'INQUIRY';
+
+    if (itemID && senderID) {
+      const order = await Order.findOne({ 
+        'lineItems.legacyItemId': itemID, 
+        'buyer.username': senderID 
+      });
+      if (order) {
+        orderId = order.orderId;
+        messageType = 'ORDER';
+      }
+    }
+
+    // 3. Save to DB
+    await Message.create({
+      seller: seller._id,
+      orderId,
+      itemId: itemID,
+      itemTitle: itemTitle,
+      buyerUsername: senderID,
+      externalMessageId: msgID,
+      sender: 'BUYER',
+      subject: subject,
+      body: body,
+      mediaUrls: mediaUrls, // <--- Save Images
+      read: false,
+      messageType,
+      messageDate: messageDate
+    });
+
+    return true;
+  } catch (err) {
+    console.error('Error processing message:', err.message);
+    return false;
+  }
+}
+
 
 // Helper function to extract tracking number from fulfillmentHrefs
 async function extractTrackingNumber(fulfillmentHrefs, accessToken) {
@@ -1679,6 +1811,391 @@ router.get('/stored-returns', async (req, res) => {
   }
 });
 
+
+
+
+
+// 1. HEAVY SYNC: Fetch Inbox (Manual Trigger)
+// 1. HEAVY SYNC: Fetch Inbox (Smart Polling)
+router.post('/sync-inbox', requireAuth, requireRole('fulfillmentadmin', 'superadmin'), async (req, res) => {
+  try {
+    console.log('[Sync Inbox] Starting smart message sync...');
+    const sellers = await Seller.find({ 'ebayTokens.access_token': { $exists: true } });
+    let totalNew = 0;
+
+    for (const seller of sellers) {
+      try {
+        // 1. Ensure Token is Valid
+        const token = await ensureValidToken(seller);
+
+        // 2. Determine Time Window (Smart Polling)
+        const now = new Date();
+        let startTime;
+        
+        if (seller.lastMessagePolledAt) {
+            // INCREMENTAL SYNC: Fetch from last poll time
+            // We subtract 15 minutes overlap to ensure no messages are missed due to server latency
+            startTime = new Date(new Date(seller.lastMessagePolledAt).getTime() - 15 * 60 * 1000);
+            console.log(`[${seller.user}] Incremental sync from: ${startTime.toISOString()}`);
+        } else {
+            // INITIAL SYNC: Fetch last 10 Days
+            startTime = new Date(now.getTime() - 10 * 24 * 60 * 60 * 1000);
+            console.log(`[${seller.user}] First-time sync from: ${startTime.toISOString()} (Last 10 Days)`);
+        }
+        
+        const startTimeStr = startTime.toISOString();
+        const endTimeStr = now.toISOString();
+
+        // 3. XML Request
+        const xmlRequest = `
+          <?xml version="1.0" encoding="utf-8"?>
+          <GetMemberMessagesRequest xmlns="urn:ebay:apis:eBLBaseComponents">
+            <RequesterCredentials><eBayAuthToken>${token}</eBayAuthToken></RequesterCredentials>
+            
+            <MailMessageType>All</MailMessageType>
+            
+            <StartCreationTime>${startTimeStr}</StartCreationTime>
+            <EndCreationTime>${endTimeStr}</EndCreationTime>
+            
+            <Pagination>
+              <EntriesPerPage>200</EntriesPerPage>
+              <PageNumber>1</PageNumber>
+            </Pagination>
+          </GetMemberMessagesRequest>
+        `;
+
+        const response = await axios.post('https://api.ebay.com/ws/api.dll', xmlRequest, {
+          headers: {
+            'X-EBAY-API-SITEID': '0', 
+            'X-EBAY-API-COMPATIBILITY-LEVEL': '1423',
+            'X-EBAY-API-CALL-NAME': 'GetMemberMessages',
+            'Content-Type': 'text/xml'
+          }
+        });
+
+        const result = await parseStringPromise(response.data);
+
+        if (result.GetMemberMessagesResponse.Ack[0] === 'Failure') {
+            const error = result.GetMemberMessagesResponse.Errors?.[0]?.LongMessage?.[0];
+            console.error(`eBay API Failure for seller ${seller._id}:`, error);
+            continue;
+        }
+
+        const messages = result.GetMemberMessagesResponse.MemberMessage?.[0]?.MemberMessageExchange || [];
+        
+        // 4. Process Messages
+        let newForThisSeller = 0;
+        for (const msg of messages) {
+          const isNew = await processEbayMessage(msg, seller);
+          if (isNew) {
+              newForThisSeller++;
+              totalNew++;
+          }
+        }
+        
+        console.log(`[Sync Inbox] Seller ${seller._id}: Fetched ${messages.length}. Saved ${newForThisSeller} new.`);
+
+        // 5. Update Polling Timestamp (Only on success)
+        seller.lastMessagePolledAt = now;
+        await seller.save();
+
+      } catch (err) {
+        console.error(`Sync error for seller ${seller._id}:`, err.message);
+      }
+    }
+
+    res.json({ success: true, totalNew });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+
+
+
+//LIGHT SYNC: Active Thread Poll (Auto Interval)
+// Filters by SenderID to be lightweight
+// 2. LIGHT SYNC: Active Thread Poll
+router.post('/sync-thread', requireAuth, requireRole('fulfillmentadmin', 'superadmin'), async (req, res) => {
+  const { sellerId, buyerUsername, itemId } = req.body;
+  
+  if (!sellerId || !buyerUsername) return res.status(400).json({ error: 'Missing identifiers' });
+
+  try {
+    const seller = await Seller.findById(sellerId);
+    if (!seller) return res.status(404).json({ error: 'Seller not found' });
+
+    // 1. Ensure Token is Valid
+    const token = await ensureValidToken(seller);
+    
+    // 2. Time Filters
+    const now = new Date();
+    const startTime = new Date(now.getTime() - 2 * 24 * 60 * 60 * 1000).toISOString();
+    const endTime = now.toISOString();
+
+    const xmlRequest = `
+      <?xml version="1.0" encoding="utf-8"?>
+      <GetMemberMessagesRequest xmlns="urn:ebay:apis:eBLBaseComponents">
+        <RequesterCredentials><eBayAuthToken>${token}</eBayAuthToken></RequesterCredentials>
+        
+        <MailMessageType>All</MailMessageType>
+        
+        <SenderID>${buyerUsername}</SenderID>
+        
+        <StartCreationTime>${startTime}</StartCreationTime>
+        <EndCreationTime>${endTime}</EndCreationTime>
+        
+        ${itemId ? `<ItemID>${itemId}</ItemID>` : ''}
+        
+        <Pagination><EntriesPerPage>50</EntriesPerPage><PageNumber>1</PageNumber></Pagination>
+      </GetMemberMessagesRequest>
+    `;
+
+    const response = await axios.post('https://api.ebay.com/ws/api.dll', xmlRequest, {
+      headers: {
+        'X-EBAY-API-SITEID': '0',
+        'X-EBAY-API-COMPATIBILITY-LEVEL': '1423',
+        'X-EBAY-API-CALL-NAME': 'GetMemberMessages',
+        'Content-Type': 'text/xml'
+      }
+    });
+
+    const result = await parseStringPromise(response.data);
+    const messages = result.GetMemberMessagesResponse.MemberMessage?.[0]?.MemberMessageExchange || [];
+    
+    let hasNew = false;
+    for (const msg of messages) {
+      const isNew = await processEbayMessage(msg, seller);
+      if (isNew) hasNew = true;
+    }
+
+    res.json({ success: true, newMessagesFound: hasNew });
+  } catch (err) {
+    console.error('Thread sync error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+
+// 3. SEND MESSAGE (Chat Window)
+router.post('/send-message', requireAuth, requireRole('fulfillmentadmin', 'superadmin'), async (req, res) => {
+  const { orderId, buyerUsername, itemId, body, subject } = req.body;
+
+  try {
+    let seller = null;
+    let finalItemId = itemId;
+    let finalBuyer = buyerUsername;
+
+    if (orderId) {
+        const order = await Order.findOne({ orderId }).populate('seller');
+        if (!order) return res.status(404).json({ error: 'Order not found' });
+        seller = order.seller;
+        finalItemId = order.lineItems?.[0]?.legacyItemId;
+        finalBuyer = order.buyer.username;
+    } else {
+        const prevMsg = await Message.findOne({ buyerUsername, itemId }).populate('seller');
+        if (prevMsg) seller = prevMsg.seller;
+    }
+
+    if (!seller) return res.status(400).json({ error: 'Could not determine seller context' });
+    if (!finalItemId) return res.status(400).json({ error: 'ItemID required to send message' });
+
+    // 1. Ensure Token is Valid
+    const token = await ensureValidToken(seller);
+
+    const xmlRequest = `
+      <?xml version="1.0" encoding="utf-8"?>
+      <AddMemberMessageAAQToPartnerRequest xmlns="urn:ebay:apis:eBLBaseComponents">
+        <RequesterCredentials><eBayAuthToken>${token}</eBayAuthToken></RequesterCredentials>
+        <ItemID>${finalItemId}</ItemID>
+        <MemberMessage>
+          <Body>${body.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')}</Body>
+          <Subject>${subject || 'Regarding your item'}</Subject>
+          <QuestionType>General</QuestionType>
+          <RecipientID>${finalBuyer}</RecipientID>
+        </MemberMessage>
+      </AddMemberMessageAAQToPartnerRequest>
+    `;
+
+    const response = await axios.post('https://api.ebay.com/ws/api.dll', xmlRequest, {
+      headers: {
+        'X-EBAY-API-SITEID': '0',
+        'X-EBAY-API-COMPATIBILITY-LEVEL': '1423',
+        'X-EBAY-API-CALL-NAME': 'AddMemberMessageAAQToPartner',
+        'Content-Type': 'text/xml'
+      }
+    });
+
+    const result = await parseStringPromise(response.data);
+    const ack = result.AddMemberMessageAAQToPartnerResponse.Ack[0];
+
+    if (ack === 'Success' || ack === 'Warning') {
+      const newMsg = await Message.create({
+        seller: seller._id,
+        orderId: orderId || null,
+        itemId: finalItemId,
+        buyerUsername: finalBuyer,
+        sender: 'SELLER',
+        subject: subject || 'Reply',
+        body: body,
+        read: true,
+        messageType: orderId ? 'ORDER' : 'INQUIRY',
+        messageDate: new Date()
+      });
+      return res.json({ success: true, message: newMsg });
+    } else {
+      const errMsg = result.AddMemberMessageAAQToPartnerResponse.Errors?.[0]?.LongMessage?.[0] || 'eBay API Error';
+      throw new Error(errMsg);
+    }
+
+  } catch (err) {
+    console.error('Send Message Error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 4. GET THREADS (Sidebar List)
+
+router.get('/chat/threads', requireAuth, async (req, res) => {
+  try {
+    const { sellerId } = req.query;
+
+    // Build the aggregation pipeline
+    const pipeline = [];
+
+    // 1. FILTER BY SELLER (If selected)
+    if (sellerId) {
+      pipeline.push({
+        $match: { seller: new mongoose.Types.ObjectId(sellerId) }
+      });
+    }
+
+    // 2. Sort by date to process latest messages first
+    pipeline.push({ $sort: { messageDate: -1 } });
+
+    // 3. Group by conversation
+    pipeline.push({
+      $group: {
+        _id: { 
+          orderId: "$orderId", 
+          buyer: "$buyerUsername", 
+          item: "$itemId" 
+        },
+        sellerId: { $first: "$seller" },
+        lastMessage: { $first: "$body" },
+        lastDate: { $first: "$messageDate" },
+        sender: { $first: "$sender" },
+        itemTitle: { $first: "$itemTitle" },
+        messageType: { $first: "$messageType" },
+        unreadCount: { 
+          $sum: { $cond: [{ $and: [{ $eq: ["$read", false] }, { $eq: ["$sender", "BUYER"] }] }, 1, 0] }
+        }
+      }
+    });
+
+    // 4. Lookup Order details for Buyer Name
+    pipeline.push({
+      $lookup: {
+        from: 'orders',
+        localField: '_id.orderId',
+        foreignField: 'orderId',
+        as: 'orderDetails'
+      }
+    });
+
+    // 5. Flatten
+    pipeline.push({
+      $project: {
+        orderId: "$_id.orderId",
+        buyerUsername: "$_id.buyer",
+        itemId: "$_id.item",
+        sellerId: 1,
+        lastMessage: 1,
+        lastDate: 1,
+        sender: 1,
+        itemTitle: 1,
+        messageType: 1,
+        unreadCount: 1,
+        buyerName: { $arrayElemAt: ["$orderDetails.buyer.buyerRegistrationAddress.fullName", 0] }
+      }
+    });
+
+    // 6. Final Sort
+    pipeline.push({ $sort: { lastDate: -1 } });
+
+    const threads = await Message.aggregate(pipeline);
+    res.json(threads);
+
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+
+
+
+// 5. GET MESSAGES (Chat Window)
+router.get('/chat/messages', requireAuth, async (req, res) => {
+  const { orderId, buyerUsername, itemId } = req.query;
+  
+  try {
+    let query = {};
+    if (orderId) {
+      query.orderId = orderId;
+    } else if (buyerUsername && itemId) {
+      query.buyerUsername = buyerUsername;
+      query.itemId = itemId;
+    } else {
+      return res.status(400).json({ error: 'Invalid query params' });
+    }
+
+    const messages = await Message.find(query).sort({ messageDate: 1 });
+
+    // Mark as read
+    await Message.updateMany(
+      { ...query, sender: 'BUYER', read: false },
+      { read: true }
+    );
+
+    res.json(messages);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 6. SEARCH ORDER FOR NEW CHAT
+
+router.get('/chat/search-order', requireAuth, async (req, res) => {
+  const { orderId } = req.query;
+  try {
+    const order = await Order.findOne({ orderId }).populate('seller');
+    if (!order) return res.status(404).json({ error: 'Order not found' });
+
+    // Get Full Name
+    const fullName = order.shippingFullName || order.buyer?.buyerRegistrationAddress?.fullName || order.buyer?.username;
+
+    const threadData = {
+      orderId: order.orderId,
+      buyerUsername: order.buyer.username,
+      buyerName: fullName, 
+      itemId: order.lineItems?.[0]?.legacyItemId,
+      itemTitle: order.productName,
+      sellerId: order.seller._id,
+      lastMessage: 'Start a new conversation...',
+      lastDate: new Date(),
+      sender: 'SYSTEM',
+      unreadCount: 0,
+      messageType: 'ORDER',
+      isNew: true 
+    };
+
+    res.json(threadData);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ===== BUYER MESSAGES ENDPOINTS =====
 
 // Fetch buyer messages/inquiries from eBay Post-Order API and store in DB
@@ -1852,6 +2369,8 @@ router.get('/stored-messages', async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
+
 
 // Mark message as resolved
 router.patch('/messages/:messageId/resolve', requireAuth, requireRole('fulfillmentadmin', 'superadmin'), async (req, res) => {
