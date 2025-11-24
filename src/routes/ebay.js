@@ -469,9 +469,9 @@ router.get('/cancelled-orders', async (req, res) => {
 
     console.log(`[Cancelled Orders] Fetching IN_PROGRESS orders from last 30 days (since ${thirtyDaysAgo.toISOString()})`);
 
-    // Query for orders with IN_PROGRESS cancellation AND within 30 days
+    // Query for orders with CANCEL_REQUESTED or IN_PROGRESS cancellation AND within 30 days
     const cancelledOrders = await Order.find({
-      cancelState: 'IN_PROGRESS', // Filter by cancel state
+      cancelState: { $in: ['CANCEL_REQUESTED', 'IN_PROGRESS'] }, // Filter by cancel state
       creationDate: { $gte: thirtyDaysAgo } // Only last 30 days
     })
       .populate('seller', 'username ebayUserId')
@@ -533,7 +533,8 @@ router.get('/stored-orders', async (req, res) => {
     }
 
     if (searchMarketplace && searchMarketplace !== '') {
-      query.purchaseMarketplaceId = searchMarketplace;
+      // Fix for Canada marketplace value
+      query.purchaseMarketplaceId = searchMarketplace === 'EBAY_ENCA' ? 'EBAY_CA' : searchMarketplace;
     }
 
     // Calculate pagination
