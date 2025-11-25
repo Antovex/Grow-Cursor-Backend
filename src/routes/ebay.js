@@ -1528,12 +1528,11 @@ router.patch('/orders/:orderId/item-status', async (req, res) => {
   const { orderId } = req.params;
   const { itemStatus, resolvedFrom } = req.body;
 
-  if (!itemStatus) {
-    return res.status(400).json({ error: 'Missing itemStatus value' });
-  }
+  if (!itemStatus) return res.status(400).json({ error: 'Missing itemStatus' });
+
+  const validStatuses = ['None', 'Out of Stock', 'Delayed Delivery', 'Label Created', 'Other'];
 
   // Validate enum values
-  const validStatuses = ['None', 'Return', 'Replace', 'INR', 'Resolved'];
   if (!validStatuses.includes(itemStatus)) {
     return res.status(400).json({ error: 'Invalid itemStatus value' });
   }
@@ -1568,7 +1567,7 @@ router.patch('/orders/:orderId/item-status', async (req, res) => {
   }
 });
 
-// Update notes for an order
+// Update notes for an order from awaiting shipment page 
 router.patch('/orders/:orderId/notes', async (req, res) => {
   const { orderId } = req.params;
   const { notes } = req.body;
@@ -1594,6 +1593,25 @@ router.patch('/orders/:orderId/notes', async (req, res) => {
       return res.status(404).json({ error: 'Order not found' });
     }
 
+    res.json({ success: true, order });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// --- NEW ROUTE: Update Fulfillment Notes ---
+router.patch('/orders/:orderId/fulfillment-notes', async (req, res) => {
+  const { orderId } = req.params;
+  const { fulfillmentNotes } = req.body;
+
+  try {
+    const order = await Order.findByIdAndUpdate(
+      orderId,
+      { fulfillmentNotes: String(fulfillmentNotes || '') }, // Update the new field
+      { new: true }
+    );
+
+    if (!order) return res.status(404).json({ error: 'Order not found' });
     res.json({ success: true, order });
   } catch (err) {
     res.status(500).json({ error: err.message });

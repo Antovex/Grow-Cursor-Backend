@@ -57,11 +57,12 @@ const OrderSchema = new mongoose.Schema(
     },
     itemStatus: {
       type: String,
-      enum: ['None', 'Return', 'Replace', 'INR', 'Resolved'],
+      enum: ['None', 'Out of Stock', 'Delayed Delivery', 'Label Created', 'Other'],
       default: 'None'
     },
     resolvedFrom: String, // Track which page it was resolved from: 'Return', 'Replace', or 'INR'
-    notes: String // Notes field for internal use
+    notes: String, // Notes field for internal use
+    fulfillmentNotes: String
   },
   { timestamps: true }
 );
