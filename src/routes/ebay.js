@@ -8,6 +8,7 @@ import Seller from '../models/Seller.js';
 import Order from '../models/Order.js';
 import Return from '../models/Return.js';
 import Message from '../models/Message.js';
+import Listing from '../models/Listing.js';
 import { parseStringPromise } from 'xml2js';
 const router = express.Router();
 
@@ -2421,6 +2422,283 @@ router.patch('/messages/:messageId/resolve', requireAuth, requireRole('fulfillme
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
+});
+
+
+// --- HELPER: Robust Description Extractor ---
+function extractCleanDescription(fullHtml) {
+  if (!fullHtml || typeof fullHtml !== 'string') return '';
+
+  // 1. Perfect Match (Title H3 + Description Div)
+  const perfectMatch = fullHtml.match(/(<h3[^>]*>[\s\S]*?<\/h3>[\s\S]*?<div class="product-description">[\s\S]*?<\/div>)/i);
+  if (perfectMatch && perfectMatch[0]) return perfectMatch[0];
+
+  // 2. Just the Description Div
+  const divMatch = fullHtml.match(/(<div class="product-description">[\s\S]*?<\/div>)/i);
+  if (divMatch && divMatch[0]) return divMatch[0];
+
+  // 3. Fallback: Return Full HTML (This ensures you see SOMETHING)
+  return fullHtml;
+}
+
+// 1. POLL ACTIVE LISTINGS (Updated to fetch Description)
+router.post('/sync-listings', requireAuth, async (req, res) => {
+  const { sellerId } = req.body;
+
+  try {
+    const seller = await Seller.findById(sellerId);
+    if(!seller) return res.status(404).json({error: "Seller not found"});
+
+    const token = await ensureValidToken(seller);
+
+    const hardStartDate = new Date('2025-11-20T00:00:00Z');
+    
+    // Check DB count to decide if full sync or incremental
+    const listingCount = await Listing.countDocuments({ seller: sellerId, listingStatus: 'Active' });
+    
+    let startTimeFrom;
+    if (listingCount === 0) {
+        console.log("DB empty. Force full sync.");
+        startTimeFrom = hardStartDate;
+    } else {
+        startTimeFrom = seller.lastListingPolledAt || hardStartDate;
+        if (new Date(startTimeFrom) < hardStartDate) startTimeFrom = hardStartDate;
+    }
+
+    const startTimeTo = new Date(); 
+
+    // CHANGE: Switched from GranularityLevel to DetailLevel:ItemReturnDescription
+    const xmlRequest = `
+      <?xml version="1.0" encoding="utf-8"?>
+      <GetSellerListRequest xmlns="urn:ebay:apis:eBLBaseComponents">
+        <RequesterCredentials><eBayAuthToken>${token}</eBayAuthToken></RequesterCredentials>
+        <ErrorLanguage>en_US</ErrorLanguage>
+        <WarningLevel>High</WarningLevel>
+        <DetailLevel>ItemReturnDescription</DetailLevel> 
+        <StartTimeFrom>${new Date(startTimeFrom).toISOString()}</StartTimeFrom>
+        <StartTimeTo>${startTimeTo.toISOString()}</StartTimeTo>
+        <IncludeWatchCount>true</IncludeWatchCount>
+        <Pagination>
+          <EntriesPerPage>100</EntriesPerPage>
+          <PageNumber>1</PageNumber>
+        </Pagination>
+        <OutputSelector>ItemArray.Item.ItemID</OutputSelector>
+        <OutputSelector>ItemArray.Item.Title</OutputSelector>
+        <OutputSelector>ItemArray.Item.SKU</OutputSelector>
+        <OutputSelector>ItemArray.Item.SellingStatus</OutputSelector>
+        <OutputSelector>ItemArray.Item.ListingStatus</OutputSelector>
+        <OutputSelector>ItemArray.Item.Description</OutputSelector>
+        <OutputSelector>ItemArray.Item.PictureDetails</OutputSelector>
+        <OutputSelector>ItemArray.Item.ItemCompatibilityList</OutputSelector>
+      </GetSellerListRequest>
+    `;
+
+    console.log(`Polling eBay (With Descriptions) from ${startTimeFrom}...`);
+    
+    const response = await axios.post('https://api.ebay.com/ws/api.dll', xmlRequest, {
+      headers: {
+        'X-EBAY-API-SITEID': '100', 
+        'X-EBAY-API-COMPATIBILITY-LEVEL': '1423',
+        'X-EBAY-API-CALL-NAME': 'GetSellerList',
+        'Content-Type': 'text/xml'
+      }
+    });
+
+    const result = await parseStringPromise(response.data);
+    
+    if (result.GetSellerListResponse.Ack[0] === 'Failure') {
+       throw new Error(result.GetSellerListResponse.Errors[0].LongMessage[0]);
+    }
+
+    const items = result.GetSellerListResponse.ItemArray?.[0]?.Item || [];
+    let count = 0;
+
+    for (const item of items) {
+      const status = item.SellingStatus?.[0]?.ListingStatus?.[0];
+      if (status !== 'Active') continue;
+
+      // Extraction
+      const rawHtml = item.Description ? item.Description[0] : '';
+      const cleanHtml = extractCleanDescription(rawHtml);
+
+      // Compatibility
+      let parsedCompatibility = [];
+      if (item.ItemCompatibilityList && item.ItemCompatibilityList[0].Compatibility) {
+        parsedCompatibility = item.ItemCompatibilityList[0].Compatibility.map(comp => ({
+          notes: comp.CompatibilityNotes ? comp.CompatibilityNotes[0] : '',
+          nameValueList: comp.NameValueList.map(nv => ({
+            name: nv.Name[0],
+            value: nv.Value[0]
+          }))
+        }));
+      }
+
+      await Listing.findOneAndUpdate(
+        { itemId: item.ItemID[0] },
+        {
+          seller: seller._id,
+          title: item.Title[0],
+          sku: item.SKU ? item.SKU[0] : '',
+          currentPrice: parseFloat(item.SellingStatus[0].CurrentPrice[0]._),
+          currency: item.SellingStatus[0].CurrentPrice[0].$.currencyID,
+          listingStatus: status,
+          mainImageUrl: item.PictureDetails?.[0]?.PictureURL?.[0] || '',
+          descriptionPreview: cleanHtml, 
+          compatibility: parsedCompatibility,
+          startTime: item.ListingDetails?.[0]?.StartTime?.[0]
+        },
+        { upsert: true }
+      );
+      count++;
+    }
+
+    seller.lastListingPolledAt = startTimeTo;
+    await seller.save();
+
+    res.json({ success: true, message: `Synced ${count} listings with descriptions.` });
+
+  } catch (err) {
+    console.error('Sync Error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 2. GET LISTINGS
+router.get('/listings', requireAuth, async (req, res) => {
+    const { sellerId } = req.query;
+    // Filter by Seller ID matches the "seller" field in your DB
+    const listings = await Listing.find({ seller: sellerId, listingStatus: 'Active' }).sort({ startTime: -1 });
+    res.json(listings);
+});
+
+// 3. REFRESH SINGLE ITEM (GetItem)
+router.post('/refresh-item', requireAuth, async (req, res) => {
+    const { sellerId, itemId } = req.body;
+  
+    try {
+      const seller = await Seller.findById(sellerId);
+      const token = await ensureValidToken(seller);
+  
+      const xmlRequest = `
+        <?xml version="1.0" encoding="utf-8"?>
+        <GetItemRequest xmlns="urn:ebay:apis:eBLBaseComponents">
+          <RequesterCredentials><eBayAuthToken>${token}</eBayAuthToken></RequesterCredentials>
+          <ErrorLanguage>en_US</ErrorLanguage>
+          <WarningLevel>High</WarningLevel>
+          <ItemID>${itemId}</ItemID>
+          <DetailLevel>ItemReturnDescription</DetailLevel>
+          <IncludeItemSpecifics>true</IncludeItemSpecifics>
+        </GetItemRequest>
+      `;
+  
+      const response = await axios.post('https://api.ebay.com/ws/api.dll', xmlRequest, {
+        headers: {
+          'X-EBAY-API-SITEID': '100', 
+          'X-EBAY-API-COMPATIBILITY-LEVEL': '1423',
+          'X-EBAY-API-CALL-NAME': 'GetItem',
+          'Content-Type': 'text/xml'
+        }
+      });
+  
+      const result = await parseStringPromise(response.data);
+      const item = result.GetItemResponse.Item[0];
+  
+      const rawHtml = item.Description ? item.Description[0] : '';
+      const cleanHtml = extractCleanDescription(rawHtml);
+  
+      let parsedCompatibility = [];
+      if (item.ItemCompatibilityList && item.ItemCompatibilityList[0].Compatibility) {
+          parsedCompatibility = item.ItemCompatibilityList[0].Compatibility.map(comp => ({
+              notes: comp.CompatibilityNotes ? comp.CompatibilityNotes[0] : '',
+              nameValueList: comp.NameValueList.map(nv => ({
+                  name: nv.Name[0],
+                  value: nv.Value[0]
+              }))
+          }));
+      }
+  
+      const updatedListing = await Listing.findOneAndUpdate(
+          { itemId: itemId },
+          {
+              seller: seller._id,
+              title: item.Title[0],
+              sku: item.SKU ? item.SKU[0] : '',
+              descriptionPreview: cleanHtml,
+              compatibility: parsedCompatibility,
+              mainImageUrl: item.PictureDetails?.[0]?.PictureURL?.[0] || '',
+          },
+          { new: true }
+      );
+  
+      res.json({ success: true, listing: updatedListing });
+  
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+});
+
+// 4. UPDATE COMPATIBILITY
+router.post('/update-compatibility', requireAuth, async (req, res) => {
+    const { sellerId, itemId, compatibilityList } = req.body;
+    
+    try {
+        const seller = await Seller.findById(sellerId);
+        const token = await ensureValidToken(seller);
+
+        let xmlBodyContent = '';
+        if (!compatibilityList || compatibilityList.length === 0) {
+            xmlBodyContent = `<DeletedField>Item.ItemCompatibilityList</DeletedField>`;
+        } else {
+            let compatXml = '<ItemCompatibilityList>';
+            compatibilityList.forEach(c => {
+                compatXml += '<Compatibility>';
+                if(c.notes) compatXml += `<CompatibilityNotes>${c.notes}</CompatibilityNotes>`;
+                c.nameValueList.forEach(nv => {
+                    compatXml += `<NameValueList><Name>${nv.name}</Name><Value>${nv.value}</Value></NameValueList>`;
+                });
+                compatXml += '</Compatibility>';
+            });
+            compatXml += '</ItemCompatibilityList>';
+            xmlBodyContent = compatXml;
+        }
+
+        const xmlRequest = `
+            <?xml version="1.0" encoding="utf-8"?>
+            <ReviseFixedPriceItemRequest xmlns="urn:ebay:apis:eBLBaseComponents">
+                <RequesterCredentials><eBayAuthToken>${token}</eBayAuthToken></RequesterCredentials>
+                <ErrorLanguage>en_US</ErrorLanguage>
+                <WarningLevel>High</WarningLevel>
+                <Item>
+                    <ItemID>${itemId}</ItemID>
+                    ${xmlBodyContent}
+                </Item>
+            </ReviseFixedPriceItemRequest>
+        `;
+
+        const response = await axios.post('https://api.ebay.com/ws/api.dll', xmlRequest, {
+            headers: {
+              'X-EBAY-API-SITEID': '100', 
+              'X-EBAY-API-COMPATIBILITY-LEVEL': '1423',
+              'X-EBAY-API-CALL-NAME': 'ReviseFixedPriceItem',
+              'Content-Type': 'text/xml'
+            }
+        });
+
+        const result = await parseStringPromise(response.data);
+        const ack = result.ReviseFixedPriceItemResponse.Ack[0];
+
+        if (ack === 'Failure') throw new Error("Update Failed");
+
+        await Listing.findOneAndUpdate(
+            { itemId: itemId },
+            { compatibility: compatibilityList }
+        );
+
+        res.json({ success: true });
+
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
 });
 
 export default router;

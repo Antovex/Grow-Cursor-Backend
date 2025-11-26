@@ -1,0 +1,30 @@
+import mongoose from 'mongoose';
+
+const ListingSchema = new mongoose.Schema({
+  seller: { type: mongoose.Schema.Types.ObjectId, ref: 'Seller', required: true },
+  itemId: { type: String, required: true, unique: true },
+  sku: { type: String },
+  title: { type: String },
+  currentPrice: { type: Number },
+  currency: { type: String },
+  mainImageUrl: { type: String },
+  
+  // We store the clean HTML here
+  descriptionPreview: { type: String }, 
+
+  // Compatibility Data
+  compatibility: [
+    {
+      notes: String,
+      nameValueList: [
+        { name: String, value: String } // e.g., Name: Year, Value: 2024
+      ]
+    }
+  ],
+
+  listingStatus: { type: String }, // Active, Ended
+  startTime: Date,
+  endTime: Date,
+}, { timestamps: true });
+
+export default mongoose.model('Listing', ListingSchema);

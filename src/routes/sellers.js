@@ -6,7 +6,7 @@ import User from '../models/User.js';
 const router = Router();
 
 // List all sellers (for admin dashboard)
-router.get('/all', requireAuth, requireRole('fulfillmentadmin', 'superadmin'), async (req, res) => {
+router.get('/all', requireAuth, requireRole('fulfillmentadmin', 'superadmin', 'compatibilityadmin', 'compatibilityeditor', 'listingadmin'), async (req, res) => {
   const sellers = await Seller.find().populate('user', 'username email');
   res.json(sellers);
 });
