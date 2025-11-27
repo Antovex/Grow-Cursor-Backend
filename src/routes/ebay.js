@@ -2442,7 +2442,6 @@ function extractCleanDescription(fullHtml) {
 }
 
 // 1. POLL ACTIVE LISTINGS (With Pagination Loop)
-// 1. POLL ACTIVE LISTINGS (With Strict "Motors" Filtering)
 router.post('/sync-listings', requireAuth, async (req, res) => {
   const { sellerId } = req.body;
 
@@ -2453,10 +2452,17 @@ router.post('/sync-listings', requireAuth, async (req, res) => {
     const token = await ensureValidToken(seller);
 
     // --- DATE LOGIC ---
-    const hardStartDate = new Date('2025-11-25T00:00:00Z');
+    // Req: Nov 27, 2025 at 5:00 AM IST
+    // IST is UTC+5:30. So subtract 5h 30m.
+    // 5:00 AM - 5:30 = 23:30 PM Previous Day (Nov 26)
+    const hardStartDate = new Date('2025-11-26T23:30:00Z'); 
+
     const listingCount = await Listing.countDocuments({ seller: sellerId, listingStatus: 'Active' });
     
+    // If we have no data, OR last poll was invalid, default to Hard Date
     let startTimeFrom = (listingCount === 0 || !seller.lastListingPolledAt) ? hardStartDate : seller.lastListingPolledAt;
+    
+    // Safety: If last poll date is OLDER than Hard Date, snap to Hard Date
     if (new Date(startTimeFrom) < hardStartDate) startTimeFrom = hardStartDate;
     
     const startTimeTo = new Date(); 
@@ -2465,13 +2471,7 @@ router.post('/sync-listings', requireAuth, async (req, res) => {
     let processedCount = 0;
     let skippedCount = 0;
 
-    // --- FILTER CONFIGURATION ---
-    // We will only save items if their category name contains one of these:
-    const VALID_MOTORS_CATEGORIES = [
-        "eBay Motors", 
-        "Parts & Accessories", 
-        "Automotive Tools & Supplies"
-    ];
+    const VALID_MOTORS_CATEGORIES = ["eBay Motors", "Parts & Accessories", "Automotive Tools", "Tools & Supplies"];
 
     do {
         console.log(`Fetching Page ${page} (Filter: Motors Only)...`);
@@ -2499,13 +2499,14 @@ router.post('/sync-listings', requireAuth, async (req, res) => {
             <OutputSelector>ItemArray.Item.PictureDetails</OutputSelector>
             <OutputSelector>ItemArray.Item.ItemCompatibilityList</OutputSelector>
             <OutputSelector>ItemArray.Item.PrimaryCategory</OutputSelector> 
+            <OutputSelector>ItemArray.Item.ListingDetails</OutputSelector>
             <OutputSelector>PaginationResult</OutputSelector>
           </GetSellerListRequest>
         `;
 
         const response = await axios.post('https://api.ebay.com/ws/api.dll', xmlRequest, {
           headers: {
-            'X-EBAY-API-SITEID': '100', // Still use 100 to get proper Motors metadata
+            'X-EBAY-API-SITEID': '100', 
             'X-EBAY-API-COMPATIBILITY-LEVEL': '1423',
             'X-EBAY-API-CALL-NAME': 'GetSellerList',
             'Content-Type': 'text/xml'
@@ -2525,23 +2526,18 @@ router.post('/sync-listings', requireAuth, async (req, res) => {
           const status = item.SellingStatus?.[0]?.ListingStatus?.[0];
           if (status !== 'Active') continue;
 
-          // --- STRICT MOTORS FILTER ---
-          // Check the Category Name path (e.g. "eBay Motors > Parts & Accessories > ...")
+          // Filter by Category
           const categoryName = item.PrimaryCategory?.[0]?.CategoryName?.[0] || '';
-          
-          // Check if any valid keyword exists in the category name
           const isMotorsItem = VALID_MOTORS_CATEGORIES.some(keyword => categoryName.includes(keyword));
-
           if (!isMotorsItem) {
-              // console.log(`Skipping non-Motors item: ${item.Title[0]} [${categoryName}]`);
               skippedCount++;
               continue; 
           }
 
-          // If we are here, it IS a Motors item. Save it.
           const rawHtml = item.Description ? item.Description[0] : '';
           const cleanHtml = extractCleanDescription(rawHtml);
 
+          // Extract EXISTING Compatibility from eBay
           let parsedCompatibility = [];
           if (item.ItemCompatibilityList && item.ItemCompatibilityList[0].Compatibility) {
             parsedCompatibility = item.ItemCompatibilityList[0].Compatibility.map(comp => ({
@@ -2553,6 +2549,7 @@ router.post('/sync-listings', requireAuth, async (req, res) => {
             }));
           }
 
+          // Upsert to DB (Updates existing if found, Creates new if not)
           await Listing.findOneAndUpdate(
             { itemId: item.ItemID[0] },
             {
@@ -2565,7 +2562,8 @@ router.post('/sync-listings', requireAuth, async (req, res) => {
               mainImageUrl: item.PictureDetails?.[0]?.PictureURL?.[0] || '',
               descriptionPreview: cleanHtml, 
               compatibility: parsedCompatibility,
-              startTime: item.ListingDetails?.[0]?.StartTime?.[0]
+              // Save the START TIME for sorting
+              startTime: item.ListingDetails?.[0]?.StartTime?.[0] 
             },
             { upsert: true }
           );
@@ -2579,16 +2577,15 @@ router.post('/sync-listings', requireAuth, async (req, res) => {
 
     res.json({ 
         success: true, 
-        message: `Synced ${processedCount} Motors listings. (Skipped ${skippedCount} non-Motors items).` 
+        message: `Synced ${processedCount} Motors listings. (Skipped ${skippedCount} others).` 
     });
 
   } catch (err) {
-    console.error('Sync Error:', err);
     res.status(500).json({ error: err.message });
   }
 });
 
-// 2. GET LISTINGS (With Pagination)
+// 2. GET LISTINGS (Sorted Ascending by StartDate)
 router.get('/listings', requireAuth, async (req, res) => {
     const { sellerId, page = 1, limit = 50 } = req.query;
     try {
@@ -2597,8 +2594,10 @@ router.get('/listings', requireAuth, async (req, res) => {
         const skip = (pageNum - 1) * limitNum;
         const totalDocs = await Listing.countDocuments({ seller: sellerId, listingStatus: 'Active' });
         
+        // SORT: 1 = Ascending (Oldest First) | -1 = Descending (Newest First)
         const listings = await Listing.find({ seller: sellerId, listingStatus: 'Active' })
-            .sort({ startTime: -1 }).skip(skip).limit(limitNum);
+            .sort({ startTime: -1 }) 
+            .skip(skip).limit(limitNum);
 
         res.json({ listings, pagination: { total: totalDocs, page: pageNum, pages: Math.ceil(totalDocs / limitNum) } });
     } catch (err) {
