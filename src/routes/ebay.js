@@ -492,10 +492,11 @@ router.get('/cancelled-orders', async (req, res) => {
   }
 });
 
-// New endpoint: Get stored orders from database
+
 // Get stored orders from database with pagination support
 router.get('/stored-orders', async (req, res) => {
-  const { sellerId, page = 1, limit = 50, searchOrderId, searchBuyerName, searchSoldDate, searchMarketplace } = req.query;
+  // 1. UPDATED: Added startDate and endDate to destructuring, removed searchSoldDate
+  const { sellerId, page = 1, limit = 50, searchOrderId, searchBuyerName, searchMarketplace, startDate, endDate } = req.query;
   
   try {
     // Build base query
@@ -516,21 +517,21 @@ router.get('/stored-orders', async (req, res) => {
       query['buyer.buyerRegistrationAddress.fullName'] = { $regex: searchBuyerName, $options: 'i' };
     }
 
-    if (searchSoldDate) {
-      // Parse date as UTC and create range for the entire day (00:00:00 to 23:59:59.999 UTC)
-      const dateMatch = searchSoldDate.match(/^(\d{4})-(\d{2})-(\d{2})$/);
-      if (dateMatch) {
-        const year = parseInt(dateMatch[1], 10);
-        const month = parseInt(dateMatch[2], 10) - 1; // JS months are 0-indexed
-        const day = parseInt(dateMatch[3], 10);
-        
-        const startOfDay = new Date(Date.UTC(year, month, day, 0, 0, 0, 0));
-        const endOfDay = new Date(Date.UTC(year, month, day, 23, 59, 59, 999));
-        
-        query.dateSold = {
-          $gte: startOfDay,
-          $lte: endOfDay
-        };
+    // 2. UPDATED: New Date Range Logic
+    if (startDate || endDate) {
+      query.dateSold = {};
+      
+      if (startDate) {
+        // Greater than or equal to Start Date (starts at 00:00:00)
+        query.dateSold.$gte = new Date(startDate);
+      }
+      
+      if (endDate) {
+        // Less than or equal to End Date
+        // We set the time to 23:59:59.999 to include orders from the very end of that day
+        const end = new Date(endDate);
+        end.setHours(23, 59, 59, 999);
+        query.dateSold.$lte = end;
       }
     }
 
@@ -2077,21 +2078,26 @@ router.post('/send-message', requireAuth, requireRole('fulfillmentadmin', 'super
 
 // 4. GET THREADS (Sidebar List)
 
+// 4. GET THREADS (With Pagination & Search)
 router.get('/chat/threads', requireAuth, async (req, res) => {
   try {
-    const { sellerId } = req.query;
+    const { sellerId, page = 1, limit = 20, search = '' } = req.query;
+    
+    const pageNum = parseInt(page);
+    const limitNum = parseInt(limit);
+    const skip = (pageNum - 1) * limitNum;
 
     // Build the aggregation pipeline
     const pipeline = [];
 
-    // 1. FILTER BY SELLER (If selected)
+    // 1. FILTER BY SELLER
     if (sellerId) {
       pipeline.push({
         $match: { seller: new mongoose.Types.ObjectId(sellerId) }
       });
     }
 
-    // 2. Sort by date to process latest messages first
+    // 2. Sort by date (Process latest messages first)
     pipeline.push({ $sort: { messageDate: -1 } });
 
     // 3. Group by conversation
@@ -2114,7 +2120,7 @@ router.get('/chat/threads', requireAuth, async (req, res) => {
       }
     });
 
-    // 4. Lookup Order details for Buyer Name
+    // 4. LOOKUP ORDER DETAILS (For Buyer Name)
     pipeline.push({
       $lookup: {
         from: 'orders',
@@ -2124,7 +2130,7 @@ router.get('/chat/threads', requireAuth, async (req, res) => {
       }
     });
 
-    // 5. Flatten
+    // 5. FLATTEN & FORMAT
     pipeline.push({
       $project: {
         orderId: "$_id.orderId",
@@ -2141,11 +2147,42 @@ router.get('/chat/threads', requireAuth, async (req, res) => {
       }
     });
 
-    // 6. Final Sort
-    pipeline.push({ $sort: { lastDate: -1 } });
+    // 6. SEARCH FILTER (Applied AFTER grouping so we search distinct threads)
+    if (search && search.trim() !== '') {
+      const regex = new RegExp(search.trim(), 'i'); // Case-insensitive
+      pipeline.push({
+        $match: {
+          $or: [
+            { orderId: regex },
+            { buyerUsername: regex },
+            { buyerName: regex },
+            { itemId: regex }
+          ]
+        }
+      });
+    }
 
-    const threads = await Message.aggregate(pipeline);
-    res.json(threads);
+    // 7. FINAL SORT & PAGINATION
+    pipeline.push({ $sort: { lastDate: -1 } });
+    
+    // Get Total Count (for frontend to know when to stop loading)
+    // We use $facet to get both data and count in one query
+    const facetedPipeline = [
+      ...pipeline,
+      {
+        $facet: {
+          metadata: [{ $count: "total" }],
+          data: [{ $skip: skip }, { $limit: limitNum }]
+        }
+      }
+    ];
+
+    const result = await Message.aggregate(facetedPipeline);
+    
+    const threads = result[0].data;
+    const total = result[0].metadata[0] ? result[0].metadata[0].total : 0;
+
+    res.json({ threads, total, page: pageNum, pages: Math.ceil(total / limitNum) });
 
   } catch (err) {
     console.error(err);
@@ -2586,21 +2623,42 @@ router.post('/sync-listings', requireAuth, async (req, res) => {
   }
 });
 
-// 2. GET LISTINGS (Sorted Ascending by StartDate)
+// 2. GET LISTINGS (With Search & Sort)
 router.get('/listings', requireAuth, async (req, res) => {
-    const { sellerId, page = 1, limit = 50 } = req.query;
+    const { sellerId, page = 1, limit = 50, search } = req.query; // Added 'search'
     try {
         const pageNum = parseInt(page);
         const limitNum = parseInt(limit);
         const skip = (pageNum - 1) * limitNum;
-        const totalDocs = await Listing.countDocuments({ seller: sellerId, listingStatus: 'Active' });
-        
-        // SORT: 1 = Ascending (Oldest First) | -1 = Descending (Newest First)
-        const listings = await Listing.find({ seller: sellerId, listingStatus: 'Active' })
-            .sort({ startTime: -1 }) 
-            .skip(skip).limit(limitNum);
 
-        res.json({ listings, pagination: { total: totalDocs, page: pageNum, pages: Math.ceil(totalDocs / limitNum) } });
+        // Base Query
+        let query = { seller: sellerId, listingStatus: 'Active' };
+
+        // --- SEARCH LOGIC ---
+        if (search && search.trim() !== '') {
+            const searchRegex = { $regex: search.trim(), $options: 'i' }; // 'i' = case insensitive
+            query.$or = [
+                { title: searchRegex },
+                { sku: searchRegex },
+                { itemId: searchRegex } // Allows partial ID matches
+            ];
+        }
+
+        const totalDocs = await Listing.countDocuments(query);
+        
+        const listings = await Listing.find(query)
+            .sort({ startTime: -1 }) 
+            .skip(skip)
+            .limit(limitNum);
+
+        res.json({ 
+            listings, 
+            pagination: { 
+                total: totalDocs, 
+                page: pageNum, 
+                pages: Math.ceil(totalDocs / limitNum) 
+            } 
+        });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
@@ -2686,31 +2744,46 @@ const escapeXml = (unsafe) => {
     });
 };
 
-// 4. UPDATE COMPATIBILITY (Wipe & Rewrite)
+// 4. UPDATE COMPATIBILITY (Using ReplaceAll Strategy)
 router.post('/update-compatibility', requireAuth, async (req, res) => {
     const { sellerId, itemId, compatibilityList } = req.body;
     try {
         const seller = await Seller.findById(sellerId);
         const token = await ensureValidToken(seller);
 
-        let xmlBodyContent = '';
+        let itemInnerContent = `<ItemID>${itemId}</ItemID>`;
+
+        // CASE 1: Clearing all vehicles (Send Empty List with ReplaceAll)
         if (!compatibilityList || compatibilityList.length === 0) {
-            xmlBodyContent = `<DeletedField>Item.ItemCompatibilityList</DeletedField>`;
-        } else {
+            // This tells eBay: "Here is the list. It is empty. Replace everything with this empty list."
+            itemInnerContent += `
+                <ItemCompatibilityList>
+                    <ReplaceAll>true</ReplaceAll>
+                </ItemCompatibilityList>
+            `;
+        } 
+        // CASE 2: Sending a specific list (Overwrite old list)
+        else {
             let compatXml = '<ItemCompatibilityList>';
+            
+            // --- THE FIX: This magic tag forces eBay to wipe old data first ---
+            compatXml += '<ReplaceAll>true</ReplaceAll>'; 
+            // -----------------------------------------------------------------
+
             compatibilityList.forEach(c => {
                 compatXml += '<Compatibility>';
-                // FIX: Escape the Notes
+                // Escape Notes (Fixes "&" error)
                 if(c.notes) compatXml += `<CompatibilityNotes>${escapeXml(c.notes)}</CompatibilityNotes>`;
                 
                 c.nameValueList.forEach(nv => {
-                    // FIX: Escape Name and Value (e.g. "S & L")
+                    // Escape Name and Value (Fixes "Town & Country" error)
                     compatXml += `<NameValueList><Name>${escapeXml(nv.name)}</Name><Value>${escapeXml(nv.value)}</Value></NameValueList>`;
                 });
                 compatXml += '</Compatibility>';
             });
             compatXml += '</ItemCompatibilityList>';
-            xmlBodyContent = compatXml;
+            
+            itemInnerContent += compatXml;
         }
 
         const xmlRequest = `
@@ -2719,10 +2792,11 @@ router.post('/update-compatibility', requireAuth, async (req, res) => {
                 <RequesterCredentials><eBayAuthToken>${token}</eBayAuthToken></RequesterCredentials>
                 <ErrorLanguage>en_US</ErrorLanguage>
                 <WarningLevel>High</WarningLevel>
+                
                 <Item>
-                    <ItemID>${itemId}</ItemID>
-                    ${xmlBodyContent}
+                    ${itemInnerContent}
                 </Item>
+
             </ReviseFixedPriceItemRequest>
         `;
 
@@ -2744,7 +2818,6 @@ router.post('/update-compatibility', requireAuth, async (req, res) => {
         if (ack === 'Warning') {
             const warnings = result.ReviseFixedPriceItemResponse.Errors || [];
             
-            // Filter "Noise" warnings (Best Offer payment rule)
             const meaningfulWarnings = warnings.filter(err => {
                 const msg = err.LongMessage[0];
                 if (msg.includes("If this item sells by a Best Offer")) return false;
