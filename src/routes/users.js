@@ -13,16 +13,35 @@ router.post('/', requireAuth, async (req, res) => {
   if (!username || !password || !newUserRole) {
     return res.status(400).json({ error: 'username, password, newUserRole required' });
   }
-  const allowedRoles = ['productadmin', 'listingadmin', 'lister', 'advancelister', 'compatibilityadmin', 'compatibilityeditor', 'seller', 'fulfillmentadmin', 'hradmin', 'hr', 'operationhead', 'trainee'];
+
+  // --- FIX IS HERE: Added 'hoc' and 'compliancemanager' ---
+  const allowedRoles = [
+    'productadmin', 
+    'listingadmin', 
+    'lister', 
+    'advancelister', 
+    'compatibilityadmin', 
+    'compatibilityeditor', 
+    'seller', 
+    'fulfillmentadmin', 
+    'hradmin', 
+    'hr', 
+    'operationhead', 
+    'trainee',
+    'hoc', 
+    'compliancemanager'
+  ];
+  
   if (!allowedRoles.includes(newUserRole)) return res.status(400).json({ error: 'Invalid newUserRole' });
 
-  // Forbidden base roles
+  // Forbidden base roles (cannot create users)
   if (role === 'lister' || role === 'productadmin' || role === 'compatibilityeditor') {
     return res.status(403).json({ error: 'Forbidden' });
   }
 
   // Only superadmin can create high-level admins (productadmin, listingadmin, compatibilityadmin, fulfillmentadmin)
-  if (['productadmin', 'listingadmin', 'compatibilityadmin', 'seller', 'fulfillmentadmin', 'hradmin', 'operationhead'].includes(newUserRole) && !['superadmin','hradmin','operationhead'].includes(role)) {
+  // Added 'hoc' and 'compliancemanager' to the list of roles that require high privileges
+  if (['productadmin', 'listingadmin', 'compatibilityadmin', 'seller', 'fulfillmentadmin', 'hradmin', 'operationhead', 'hoc', 'compliancemanager'].includes(newUserRole) && !['superadmin','hradmin','operationhead'].includes(role)) {
     return res.status(403).json({ error: 'Only superadmin, hradmin or operationhead can create admin roles or sellers' });
   }
 
@@ -110,5 +129,3 @@ router.get('/check-exists', async (req, res) => {
 });
 
 export default router;
-
-

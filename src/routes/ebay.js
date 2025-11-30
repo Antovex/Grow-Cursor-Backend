@@ -589,59 +589,62 @@ router.get('/cancelled-orders', async (req, res) => {
 });
 
 
-// Get stored orders from database with pagination support
 
+
+// Get stored orders from database with pagination support
 router.get('/stored-orders', async (req, res) => {
-  // 1. UPDATED: Added startDate and endDate to destructuring, removed searchSoldDate
-  const { sellerId, page = 1, limit = 50, searchOrderId, searchBuyerName, searchMarketplace, startDate, endDate } = req.query;
+  const { sellerId, page = 1, limit = 50, searchOrderId, searchBuyerName, searchMarketplace, startDate, endDate, awaitingShipment } = req.query;
   
   try {
-    // Build base query
     let query = {};
     if (sellerId) {
       query.seller = sellerId;
     }
 
+    // --- Awaiting Shipment Filter ---
+    if (awaitingShipment === 'true') {
+        // Condition 1: Must NOT have a tracking number
+        query.$or = [
+            { trackingNumber: { $exists: false } },
+            { trackingNumber: null },
+            { trackingNumber: '' }
+        ];
+        
+        // Condition 2: Must NOT have an active cancellation request
+        // This ensures you don't see orders that the buyer wants to cancel
+        query.cancelState = { $in: ['NONE_REQUESTED', null, ''] }; 
+    }
+
     // Apply search filters
     if (searchOrderId) {
-      query.$or = [
-        { orderId: { $regex: searchOrderId, $options: 'i' } },
-        { legacyOrderId: { $regex: searchOrderId, $options: 'i' } }
-      ];
+      // Strict Order ID search (ignores legacyOrderId)
+      query.orderId = { $regex: searchOrderId, $options: 'i' };
     }
 
     if (searchBuyerName) {
       query['buyer.buyerRegistrationAddress.fullName'] = { $regex: searchBuyerName, $options: 'i' };
     }
 
-    // 2. UPDATED: Timezone-Aware Date Range Logic (PST Support)
+    // Timezone-Aware Date Range Logic
     if (startDate || endDate) {
       query.dateSold = {};
-      
-      // Helper to convert "YYYY-MM-DD" (PST) -> UTC Date Object
-      // PST is UTC-8. So 00:00 PST = 08:00 UTC.
       const PST_OFFSET_HOURS = 8; 
 
       if (startDate) {
-        // User selected "2025-11-29". We want 00:00:00 PST on that day.
-        // 00:00 PST = 08:00 UTC
         const start = new Date(startDate);
         start.setUTCHours(PST_OFFSET_HOURS, 0, 0, 0); 
         query.dateSold.$gte = start;
       }
       
       if (endDate) {
-        // User selected "2025-11-29". We want 23:59:59 PST on that day.
-        // 23:59 PST = 07:59 UTC (Next Day)
         const end = new Date(endDate);
-        end.setDate(end.getDate() + 1); // Move to next day
-        end.setUTCHours(PST_OFFSET_HOURS - 1, 59, 59, 999); // 07:59:59 UTC
+        end.setDate(end.getDate() + 1); 
+        end.setUTCHours(PST_OFFSET_HOURS - 1, 59, 59, 999); 
         query.dateSold.$lte = end;
       }
     }
 
     if (searchMarketplace && searchMarketplace !== '') {
-      // Fix for Canada marketplace value
       query.purchaseMarketplaceId = searchMarketplace === 'EBAY_ENCA' ? 'EBAY_CA' : searchMarketplace;
     }
 
@@ -650,11 +653,9 @@ router.get('/stored-orders', async (req, res) => {
     const limitNum = parseInt(limit, 10);
     const skip = (pageNum - 1) * limitNum;
 
-    // Get total count for pagination metadata
     const totalOrders = await Order.countDocuments(query);
     const totalPages = Math.ceil(totalOrders / limitNum);
 
-    // Fetch orders with pagination
     const orders = await Order.find(query)
       .populate({
         path: 'seller',
@@ -663,7 +664,8 @@ router.get('/stored-orders', async (req, res) => {
           select: 'username email'
         }
       })
-      .sort({ creationDate: -1 })
+      // Sorting: ShipBy Date for awaiting (Oldest First), Creation Date otherwise (Newest First)
+      .sort(awaitingShipment === 'true' ? { shipByDate: 1 } : { creationDate: -1 })
       .skip(skip)
       .limit(limitNum);
     
@@ -684,7 +686,6 @@ router.get('/stored-orders', async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
-
 // Update ad fee general for an order
 router.patch('/orders/:orderId/ad-fee-general', async (req, res) => {
   const { orderId } = req.params;
@@ -738,7 +739,7 @@ router.patch('/orders/:orderId/manual-tracking', async (req, res) => {
 });
 
 // Poll all sellers for new/updated orders with smart detection (PARALLEL + UTC-based)
-router.post('/poll-all-sellers', requireAuth, requireRole('fulfillmentadmin', 'superadmin'), async (req, res) => {
+router.post('/poll-all-sellers', requireAuth, requireRole('fulfillmentadmin', 'superadmin','compliancemanager','hoc'), async (req, res) => {
   try {
     // Helper function to normalize dates for comparison (ignore milliseconds/format)
     function normalizeDateForComparison(date) {
@@ -1125,7 +1126,7 @@ router.post('/poll-all-sellers', requireAuth, requireRole('fulfillmentadmin', 's
 });
 
 // Poll all sellers for NEW ORDERS ONLY (Phase 1)
-router.post('/poll-new-orders', requireAuth, requireRole('fulfillmentadmin', 'superadmin'), async (req, res) => {
+router.post('/poll-new-orders', requireAuth, requireRole('fulfillmentadmin', 'superadmin','compliancemanager','hoc'), async (req, res) => {
   try {
     const sellers = await Seller.find({ 'ebayTokens.access_token': { $exists: true, $ne: null } })
       .populate('user', 'username email');
@@ -1272,7 +1273,7 @@ router.post('/poll-new-orders', requireAuth, requireRole('fulfillmentadmin', 'su
 });
 
 // Poll all sellers for ORDER UPDATES ONLY (Phase 2)
-router.post('/poll-order-updates', requireAuth, requireRole('fulfillmentadmin', 'superadmin'), async (req, res) => {
+router.post('/poll-order-updates', requireAuth, requireRole('fulfillmentadmin', 'superadmin','compliancemanager','hoc'), async (req, res) => {
   try {
     // Helper function to normalize dates for comparison (ignore milliseconds/format)
     function normalizeDateForComparison(date) {
@@ -1733,7 +1734,7 @@ router.patch('/orders/:orderId/fulfillment-notes', async (req, res) => {
 // Fetch return requests from eBay Post-Order API and store in DB
 
 // Fetch return requests from eBay Post-Order API and store in DB
-router.post('/fetch-returns', requireAuth, requireRole('fulfillmentadmin', 'superadmin'), async (req, res) => {
+router.post('/fetch-returns', requireAuth, requireRole('fulfillmentadmin', 'superadmin','hoc', 'compliancemanager'), async (req, res) => {
   try {
     const sellers = await Seller.find({ 'ebayTokens.access_token': { $exists: true } })
       .populate('user', 'username');
@@ -1946,7 +1947,7 @@ router.get('/stored-returns', async (req, res) => {
 
 // 1. HEAVY SYNC: Fetch Inbox (Manual Trigger)
 // 1. HEAVY SYNC: Fetch Inbox (Smart Polling)
-router.post('/sync-inbox', requireAuth, requireRole('fulfillmentadmin', 'superadmin'), async (req, res) => {
+router.post('/sync-inbox', requireAuth, requireRole('fulfillmentadmin', 'superadmin','hoc', 'compliancemanager'), async (req, res) => {
   try {
     console.log('[Sync Inbox] Starting smart message sync...');
     const sellers = await Seller.find({ 'ebayTokens.access_token': { $exists: true } });
@@ -2045,7 +2046,7 @@ router.post('/sync-inbox', requireAuth, requireRole('fulfillmentadmin', 'superad
 //LIGHT SYNC: Active Thread Poll (Auto Interval)
 // Filters by SenderID to be lightweight
 // 2. LIGHT SYNC: Active Thread Poll
-router.post('/sync-thread', requireAuth, requireRole('fulfillmentadmin', 'superadmin'), async (req, res) => {
+router.post('/sync-thread', requireAuth, requireRole('fulfillmentadmin', 'superadmin','hoc', 'compliancemanager'), async (req, res) => {
   const { sellerId, buyerUsername, itemId } = req.body;
   
   if (!sellerId || !buyerUsername) return res.status(400).json({ error: 'Missing identifiers' });
@@ -2107,7 +2108,7 @@ router.post('/sync-thread', requireAuth, requireRole('fulfillmentadmin', 'supera
 
 
 // 3. SEND MESSAGE (Chat Window)
-router.post('/send-message', requireAuth, requireRole('fulfillmentadmin', 'superadmin'), async (req, res) => {
+router.post('/send-message', requireAuth, requireRole('fulfillmentadmin', 'superadmin','hoc', 'compliancemanager'), async (req, res) => {
   const { orderId, buyerUsername, itemId, body, subject } = req.body;
 
   try {
@@ -2365,7 +2366,7 @@ router.get('/chat/search-order', requireAuth, async (req, res) => {
 
 // Fetch buyer messages/inquiries from eBay Post-Order API and store in DB
 // Fetch buyer messages/inquiries from eBay Post-Order API and store in DB
-router.post('/fetch-messages', requireAuth, requireRole('fulfillmentadmin', 'superadmin'), async (req, res) => {
+router.post('/fetch-messages', requireAuth, requireRole('fulfillmentadmin', 'superadmin','hoc', 'compliancemanager'), async (req, res) => {
   try {
     const sellers = await Seller.find({ 'ebayTokens.access_token': { $exists: true } })
       .populate('user', 'username');
@@ -2538,7 +2539,7 @@ router.get('/stored-messages', async (req, res) => {
 
 
 // Mark message as resolved
-router.patch('/messages/:messageId/resolve', requireAuth, requireRole('fulfillmentadmin', 'superadmin'), async (req, res) => {
+router.patch('/messages/:messageId/resolve', requireAuth, requireRole('fulfillmentadmin', 'superadmin','hoc', 'compliancemanager'), async (req, res) => {
   const { messageId } = req.params;
   const { isResolved } = req.body;
 
@@ -3191,6 +3192,31 @@ router.patch('/conversation-management/:id/resolve', requireAuth, async (req, re
       { new: true }
     );
     res.json({ success: true, meta });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+
+
+//Manual fields to upadte for amazon 
+router.patch('/orders/:orderId/manual-fields', requireAuth, async (req, res) => {
+  const { orderId } = req.params;
+  const updates = req.body; 
+
+  const allowedFields = ['amazonAccount', 'arrivingDate', 'beforeTax', 'afterTax', 'azOrderId'];
+  const updateData = {};
+  
+  Object.keys(updates).forEach(key => {
+    if (allowedFields.includes(key)) {
+      updateData[key] = updates[key];
+    }
+  });
+
+  try {
+    const order = await Order.findByIdAndUpdate(orderId, updateData, { new: true });
+    if (!order) return res.status(404).json({ error: 'Order not found' });
+    res.json({ success: true, order });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

@@ -6,7 +6,8 @@ import User from '../models/User.js';
 const router = Router();
 
 // List all sellers (for admin dashboard)
-router.get('/all', requireAuth, requireRole('fulfillmentadmin', 'superadmin', 'compatibilityadmin', 'compatibilityeditor', 'listingadmin'), async (req, res) => {
+// --- FIX IS HERE: Added 'hoc' and 'compliancemanager' ---
+router.get('/all', requireAuth, requireRole('fulfillmentadmin', 'superadmin', 'compatibilityadmin', 'compatibilityeditor', 'listingadmin', 'hoc', 'compliancemanager'), async (req, res) => {
   const sellers = await Seller.find().populate('user', 'username email');
   res.json(sellers);
 });

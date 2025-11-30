@@ -62,7 +62,12 @@ const OrderSchema = new mongoose.Schema(
     },
     resolvedFrom: String, // Track which page it was resolved from: 'Return', 'Replace', or 'INR'
     notes: String, // Notes field for internal use
-    fulfillmentNotes: String
+    fulfillmentNotes: String,
+    amazonAccount: String,
+    arrivingDate: String,
+    beforeTax: Number,
+    afterTax: Number,
+    azOrderId: String,
   },
   { timestamps: true }
 );
