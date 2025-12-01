@@ -2598,18 +2598,29 @@ router.post('/sync-listings', requireAuth, async (req, res) => {
     const token = await ensureValidToken(seller);
 
     // --- DATE LOGIC ---
-    // Req: Nov 27, 2025 at 5:00 AM IST
-    // IST is UTC+5:30. So subtract 5h 30m.
-    // 5:00 AM - 5:30 = 23:30 PM Previous Day (Nov 26)
+    // Req: Nov 27, 2025 at 5:00 AM IST -> Nov 26, 23:30 UTC
     const hardStartDate = new Date('2025-11-26T23:30:00Z'); 
+    const nov11StartDate = new Date('2025-11-11T09:00:00Z');
 
+    // 1. Calculate count (This is correct now!)
     const listingCount = await Listing.countDocuments({ seller: sellerId, listingStatus: 'Active' });
-    
-    // If we have no data, OR last poll was invalid, default to Hard Date
-    let startTimeFrom = (listingCount === 0 || !seller.lastListingPolledAt) ? hardStartDate : seller.lastListingPolledAt;
-    
-    // Safety: If last poll date is OLDER than Hard Date, snap to Hard Date
-    if (new Date(startTimeFrom) < hardStartDate) startTimeFrom = hardStartDate;
+
+    let startTimeFrom;
+
+    if (listingCount === 0) {
+        // CASE A: NEW SELLER (Zero Listings)
+        console.log(`[Sync Listings] New seller detected (0 listings). Starting sync from Nov 11 (PST).`);
+        startTimeFrom = nov11StartDate;
+    } else {
+        // CASE B: EXISTING SELLER
+        // FIX: Use 'hardStartDate' variable name here
+        startTimeFrom = seller.lastListingPolledAt || hardStartDate;
+
+        // Safety: If their last poll was somehow older than the old default
+        if (new Date(startTimeFrom) < hardStartDate) {
+            startTimeFrom = hardStartDate;
+        }
+    }
     
     const startTimeTo = new Date(); 
     let page = 1;
@@ -2929,6 +2940,7 @@ router.post('/update-compatibility', requireAuth, async (req, res) => {
             const meaningfulWarnings = warnings.filter(err => {
                 const msg = err.LongMessage[0];
                 if (msg.includes("If this item sells by a Best Offer")) return false;
+                if (msg.includes("Funds from your sales may be unavailable")) return false; // <--- ADD THIS
                 return true; 
             });
 
