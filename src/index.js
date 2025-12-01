@@ -23,6 +23,8 @@ import sellersRoutes from './routes/sellers.js';
 import employeeProfilesRoutes from './routes/employeeProfiles.js';
 import storeWiseTasksRoutes from './routes/storeWiseTasks.js';
 
+import amazonAccountRoutes from './routes/amazonAccounts.js';
+
 
 dotenv.config();
 
@@ -67,6 +69,7 @@ app.use('/api/ebay', ebayRoutes);
 app.use('/api/sellers', sellersRoutes);
 app.use('/api/employee-profiles', employeeProfilesRoutes);
 app.use('/api/store-wise-tasks', storeWiseTasksRoutes);
+app.use('/api/amazon-accounts', amazonAccountRoutes);
 
 
 const port = process.env.PORT || 5000;
