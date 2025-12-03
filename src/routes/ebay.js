@@ -854,7 +854,8 @@ router.post('/poll-all-sellers', requireAuth, requireRole('fulfillmentadmin', 's
         const latestOrder = await Order.findOne({ seller: seller._id }).sort({ creationDate: -1 });
         const latestCreationDate = latestOrder ? latestOrder.creationDate : null;
         const lastPolledAt = seller.lastPolledAt || null;
-        const initialSyncDate = seller.initialSyncDate || new Date(Date.UTC(2025, 9, 17, 0, 0, 0, 0));
+        // Default initial sync date: Nov 1, 2025 00:00:00 UTC
+        const initialSyncDate = seller.initialSyncDate || new Date(Date.UTC(2025, 10, 1, 0, 0, 0, 0));
 
         console.log(`[${sellerName}] Orders in DB: ${orderCount}, Latest: ${latestCreationDate?.toISOString() || 'NONE'}, LastPolled: ${lastPolledAt?.toISOString() || 'NEVER'}`);
 
@@ -890,18 +891,8 @@ router.post('/poll-all-sellers', requireAuth, requireRole('fulfillmentadmin', 's
         // Fetch new orders if filter is set
         if (newOrdersFilter) {
           try {
-            const newOrdersRes = await axios.get('https://api.ebay.com/sell/fulfillment/v1/order', {
-              headers: {
-                Authorization: `Bearer ${accessToken}`,
-                'Content-Type': 'application/json',
-              },
-              params: {
-                filter: newOrdersFilter,
-                limit: newOrdersLimit
-              }
-            });
-
-            const ebayNewOrders = newOrdersRes.data.orders || [];
+            // Use pagination to fetch ALL orders (handles >200 orders)
+            const ebayNewOrders = await fetchAllOrdersWithPagination(accessToken, newOrdersFilter, sellerName);
             console.log(`[${sellerName}] PHASE 1: Got ${ebayNewOrders.length} new orders from eBay`);
 
             // Insert new orders
@@ -1181,7 +1172,8 @@ router.post('/poll-new-orders', requireAuth, requireRole('fulfillmentadmin', 'su
         const orderCount = await Order.countDocuments({ seller: seller._id });
         const latestOrder = await Order.findOne({ seller: seller._id }).sort({ creationDate: -1 });
         const latestCreationDate = latestOrder ? latestOrder.creationDate : null;
-        const initialSyncDate = seller.initialSyncDate || new Date(Date.UTC(2025, 9, 17, 0, 0, 0, 0));
+        // Default initial sync date: Nov 1, 2025 00:00:00 UTC
+        const initialSyncDate = seller.initialSyncDate || new Date(Date.UTC(2025, 10, 1, 0, 0, 0, 0));
         const currentTimeUTC = new Date(nowUTC - 5000);
 
         const newOrders = [];
@@ -1207,15 +1199,8 @@ router.post('/poll-new-orders', requireAuth, requireRole('fulfillmentadmin', 'su
         }
 
         if (newOrdersFilter) {
-          const newOrdersRes = await axios.get('https://api.ebay.com/sell/fulfillment/v1/order', {
-            headers: {
-              Authorization: `Bearer ${accessToken}`,
-              'Content-Type': 'application/json',
-            },
-            params: { filter: newOrdersFilter, limit: newOrdersLimit }
-          });
-
-          const ebayNewOrders = newOrdersRes.data.orders || [];
+          // Use pagination to fetch ALL orders (handles >200 orders)
+          const ebayNewOrders = await fetchAllOrdersWithPagination(accessToken, newOrdersFilter, sellerName);
           console.log(`[${sellerName}] Found ${ebayNewOrders.length} new orders`);
 
           for (const ebayOrder of ebayNewOrders) {
@@ -1535,6 +1520,64 @@ router.post('/poll-order-updates', requireAuth, requireRole('fulfillmentadmin', 
     res.status(500).json({ error: err.message });
   }
 });
+
+// ============================================
+// Helper function to fetch ALL orders with pagination
+// ============================================
+// This fetches orders in batches of 200 (eBay max) until all orders are retrieved
+async function fetchAllOrdersWithPagination(accessToken, filter, sellerName) {
+  const allOrders = [];
+  let offset = 0;
+  const limit = 200; // eBay max per request
+  let hasMore = true;
+  let totalOrders = 0;
+  
+  console.log(`[${sellerName}] Starting paginated fetch...`);
+  
+  while (hasMore) {
+    try {
+      const params = {
+        filter: filter,
+        limit: limit
+      };
+      
+      // Only add offset if it's greater than 0
+      if (offset > 0) {
+        params.offset = offset;
+      }
+      
+      const response = await axios.get('https://api.ebay.com/sell/fulfillment/v1/order', {
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          'Content-Type': 'application/json',
+        },
+        params
+      });
+      
+      const orders = response.data.orders || [];
+      totalOrders = response.data.total || orders.length;
+      
+      allOrders.push(...orders);
+      
+      console.log(`[${sellerName}] Fetched ${orders.length} orders at offset ${offset} (total so far: ${allOrders.length}/${totalOrders})`);
+      
+      // Check if there are more orders to fetch
+      if (allOrders.length >= totalOrders || orders.length < limit) {
+        hasMore = false;
+      } else {
+        offset += limit;
+        // Small delay to avoid rate limiting
+        await new Promise(resolve => setTimeout(resolve, 300));
+      }
+    } catch (err) {
+      console.error(`[${sellerName}] Pagination error at offset ${offset}:`, err.message);
+      hasMore = false; // Stop on error
+    }
+  }
+  
+  console.log(`[${sellerName}] ✅ Pagination complete: ${allOrders.length} orders`);
+  return allOrders;
+}
 
 // Helper function to build order data object for insert/update
 async function buildOrderData(ebayOrder, sellerId, accessToken) {
