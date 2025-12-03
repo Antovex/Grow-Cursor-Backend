@@ -20,16 +20,82 @@ const router = Router();
 
 let vehicleModelsCache = null;
 let cacheLastUpdated = null;
-const CACHE_TTL = 240 * 60 * 60 * 1000; // 1 hour cache TTL
+const CACHE_TTL = 240 * 60 * 60 * 1000; // 10 days cache TTL
 
-// Helper: Normalize text (remove hyphens, extra spaces, lowercase)
+// Helper: Normalize text (remove hyphens, spaces, lowercase)
 const normalizeText = (text) => {
+  if (!text) return '';
   return text
     .toLowerCase()
-    .replace(/[-_]/g, '') // Remove hyphens and underscores (Ma-z-da → mazda)
-    .replace(/\s+/g, ' ') // Normalize spaces
+    .replace(/[-_\s]+/g, '') // Remove hyphens, underscores, and ALL spaces
     .trim();
 };
+
+// Enhanced matching function that checks both full name and model-only
+// This allows matching "Silverado 1500" even when cache has "Chevrolet Silverado 1500"
+// Also handles cases like "F250" matching "Ford F-250" after normalization
+function findBestMatch(lineNormalized, lineLower, models) {
+  let bestMatch = null;
+  let bestMatchPos = Infinity;
+  let bestMatchLength = 0; // Prefer longer matches to avoid partial matches (e.g., F-2 vs F-250)
+  
+  for (const m of models) {
+    let matchPos = -1;
+    let matchLength = 0;
+    
+    // Strategy 1: Full name normalized match (e.g., "fordf250" for "Ford F-250")
+    // This is the most specific match - use the full normalized length
+    if (m.fullNameNormalized && lineNormalized.includes(m.fullNameNormalized)) {
+      matchPos = lineNormalized.indexOf(m.fullNameNormalized);
+      matchLength = m.fullNameNormalized.length;
+    }
+    // Strategy 2: Model-only normalized match (e.g., "f250" without "ford")
+    // Only for model names > 3 chars to avoid false positives
+    // IMPORTANT: Use fullNameNormalized length for comparison to compete fairly with Strategy 1
+    else if (m.modelNormalized && m.modelNormalized.length > 3 && lineNormalized.includes(m.modelNormalized)) {
+      const modelPos = lineNormalized.indexOf(m.modelNormalized);
+      // Check if make/brand also appears nearby (before the model)
+      const makeNorm = m.makeNormalized || m.brandNormalized || '';
+      if (makeNorm && lineNormalized.includes(makeNorm)) {
+        const makePos = lineNormalized.indexOf(makeNorm);
+        // If make appears before model, use make position and full name length
+        if (makePos < modelPos) {
+          matchPos = makePos;
+          matchLength = m.fullNameNormalized ? m.fullNameNormalized.length : (makeNorm.length + m.modelNormalized.length);
+        } else {
+          matchPos = modelPos;
+          matchLength = m.modelNormalized.length;
+        }
+      } else {
+        // No make found, just use model position
+        matchPos = modelPos;
+        matchLength = m.modelNormalized.length;
+      }
+    }
+    // Strategy 3: Full name lowercase includes (e.g., "ford f-250")
+    else if (m.fullNameLower && lineLower.includes(m.fullNameLower)) {
+      matchPos = lineLower.indexOf(m.fullNameLower);
+      matchLength = m.fullNameLower.length;
+    }
+    // Strategy 4: Model-only lowercase match (e.g., "f-250" or "silverado 1500")
+    // Only for model names > 4 chars to avoid false positives like "car", "van"
+    else if (m.modelLower && m.modelLower.length > 4 && lineLower.includes(m.modelLower)) {
+      matchPos = lineLower.indexOf(m.modelLower);
+      matchLength = m.modelLower.length;
+    }
+    
+    // Track the best match: prefer earlier position, then longer match (more specific)
+    if (matchPos !== -1) {
+      if (matchPos < bestMatchPos || (matchPos === bestMatchPos && matchLength > bestMatchLength)) {
+        bestMatch = m;
+        bestMatchPos = matchPos;
+        bestMatchLength = matchLength;
+      }
+    }
+  }
+  
+  return bestMatch;
+}
 
 // Load and cache vehicle models with pre-computed normalized strings
 async function getVehicleModelsCache(forceRefresh = false) {
@@ -538,21 +604,23 @@ router.post('/sync-device-models', requireAuth, requireRole('superadmin'), async
 });
 
 // POST /api/range-analysis/analyze
-// Analyze text against eBay models database - returns FIRST model per line only
+// Analyze text against eBay models database AND existing Ranges - returns FIRST model per line only
 // Uses CACHED models for faster performance
 // Supports both vehicle models and device models (phones/tablets)
+// If categoryId is provided, also searches existing Ranges for that category
 router.post('/analyze', requireAuth, requireRole('superadmin', 'listingadmin', 'lister', 'advancelister', 'trainee'), async (req, res) => {
   try {
     const startTime = Date.now();
-    const { textToAnalyze, searchType } = req.body;
+    const { textToAnalyze, searchType, categoryId } = req.body;
     // searchType: 'vehicles' (default), 'devices' (phones+tablets), 'cellphones', 'tablets'
+    // categoryId: optional - if provided, also search existing Ranges for this category
 
     if (!textToAnalyze) {
       return res.status(400).json({ error: 'No text provided for analysis.' });
     }
 
     // Determine which models to search
-    let models;
+    let models = [];
     let modelType = searchType || 'vehicles';
     
     if (modelType === 'devices' || modelType === 'cellphones' || modelType === 'tablets') {
@@ -567,26 +635,53 @@ router.post('/analyze', requireAuth, requireRole('superadmin', 'listingadmin', '
       } else {
         models = allDeviceModels; // Both phones and tablets
       }
-      
-      if (models.length === 0) {
-        return res.status(400).json({ 
-          error: 'No device models in database. Please sync device models first.',
-          needsSync: true,
-          syncType: 'devices'
-        });
-      }
     } else {
       // Default: Use vehicle models cache
       models = await getVehicleModelsCache();
       modelType = 'vehicles';
-      
-      if (models.length === 0) {
-        return res.status(400).json({ 
-          error: 'No vehicle models in database. Please sync eBay models first.',
-          needsSync: true,
-          syncType: 'vehicles'
-        });
+    }
+    
+    // ALSO search existing Ranges for the category (if provided)
+    // This allows matching against manually added ranges that may not be in eBay's database
+    let existingRanges = [];
+    if (categoryId) {
+      try {
+        const categoryObjectId = typeof categoryId === 'string' 
+          ? new mongoose.Types.ObjectId(categoryId) 
+          : categoryId;
+        
+        const ranges = await Range.find({ category: categoryObjectId }).select('name').lean();
+        existingRanges = ranges.map(r => ({
+          fullName: r.name,
+          fullNameLower: r.name.toLowerCase(),
+          fullNameNormalized: normalizeText(r.name),
+          isExistingRange: true, // Flag to identify this came from Ranges collection
+          // For device matching compatibility
+          brandLower: '',
+          brandNormalized: '',
+          modelLower: r.name.toLowerCase(),
+          modelNormalized: normalizeText(r.name),
+          // For vehicle matching compatibility
+          makeLower: '',
+          makeNormalized: '',
+        }));
+        console.log(`[Analyze] Also searching ${existingRanges.length} existing ranges for category ${categoryId} (searchType: ${modelType})`);
+      } catch (e) {
+        console.error('[Analyze] Error fetching existing ranges:', e.message);
       }
+    }
+    
+    // Combine eBay models with existing ranges (existing ranges have priority)
+    // Put existing ranges first so they match before generic eBay models
+    const allModels = [...existingRanges, ...models];
+    
+    if (allModels.length === 0) {
+      const syncType = modelType === 'vehicles' ? 'vehicles' : 'devices';
+      return res.status(400).json({ 
+        error: `No ${syncType} models in database. Please sync models first.`,
+        needsSync: true,
+        syncType
+      });
     }
 
     // Split text into lines
@@ -597,57 +692,16 @@ router.post('/analyze', requireAuth, requireRole('superadmin', 'listingadmin', '
       normalized: normalizeText(line)
     })).filter(l => l.text.length > 0);
 
-    // For each line, find the FIRST matching model only
+    // For each line, find the BEST matching model using enhanced matching
     const lineResults = [];
     const modelCounts = new Map(); // Track counts per model
 
     for (const line of lines) {
-      let foundModel = null;
-      let earliestPosition = Infinity;
-
-      // Check each model and find the one that appears earliest in the line
-      for (const m of models) {
-        let position = -1;
-        
-        // Method 1: Full name match (e.g., "Honda Accord" or "iPhone 15 Pro Max")
-        const fullNamePos = line.textLower.indexOf(m.fullNameLower);
-        if (fullNamePos !== -1) {
-          position = fullNamePos;
-        }
-        // Method 2: Normalized full name match
-        else {
-          const normalizedPos = line.normalized.indexOf(m.fullNameNormalized);
-          if (normalizedPos !== -1) {
-            position = normalizedPos;
-          }
-        }
-        
-        // Method 3: For vehicles - Make appears + model with word boundary
-        // For devices - Brand appears + model with word boundary
-        if (position === -1) {
-          const brandKey = modelType === 'vehicles' ? 'makeLower' : 'brandLower';
-          const brandNormKey = modelType === 'vehicles' ? 'makeNormalized' : 'brandNormalized';
-          
-          const brandPos = line.textLower.indexOf(m[brandKey]);
-          const brandNormPos = line.normalized.indexOf(m[brandNormKey]);
-          
-          if ((brandPos !== -1 || brandNormPos !== -1) && m.modelLower) {
-            const modelPattern = m.modelLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-            const modelRegex = new RegExp(`\\b${modelPattern}\\b`, 'i');
-            const modelMatch = line.text.match(modelRegex);
-            
-            if (modelMatch) {
-              position = Math.min(brandPos !== -1 ? brandPos : Infinity, modelMatch.index);
-            }
-          }
-        }
-        
-        // If found and earlier than current best, use this model
-        if (position !== -1 && position < earliestPosition) {
-          earliestPosition = position;
-          foundModel = m;
-        }
-      }
+      // Use the enhanced findBestMatch function that handles:
+      // - Full name matches (e.g., "Ford F-250" → "fordf250")
+      // - Model-only matches (e.g., "Silverado 1500" matches "Chevrolet Silverado 1500")
+      // - Prefers longer matches (e.g., "F-250" wins over "F-2" for "F250")
+      const foundModel = findBestMatch(line.normalized, line.textLower, allModels);
 
       // Record result for this line
       const brandField = modelType === 'vehicles' ? 'make' : 'brand';
@@ -685,14 +739,18 @@ router.post('/analyze', requireAuth, requireRole('superadmin', 'listingadmin', '
     const unmatchedCount = linesWithNoMatch.length;
 
     const processingTime = Date.now() - startTime;
-    console.log(`[Analyze] Processed ${lines.length} lines against ${models.length} ${modelType} models in ${processingTime}ms`);
+    const ebayModelCount = models.length;
+    const existingRangeCount = existingRanges.length;
+    console.log(`[Analyze] Processed ${lines.length} lines against ${ebayModelCount} eBay ${modelType} models + ${existingRangeCount} existing ranges in ${processingTime}ms`);
 
     res.json({ 
       success: true, 
       searchType: modelType,
       foundInDatabase,
       lineResults, // All lines with their detected model (or null)
-      totalModelsInDatabase: models.length,
+      totalModelsInDatabase: allModels.length,
+      ebayModelsCount: ebayModelCount,
+      existingRangesCount: existingRangeCount,
       totalLinesAnalyzed: lines.length,
       totalMatchCount: lines.length - unmatchedCount,
       unmatchedCount,
