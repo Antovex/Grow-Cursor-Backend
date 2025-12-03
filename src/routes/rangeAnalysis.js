@@ -1,7 +1,9 @@
 import { Router } from 'express';
 import axios from 'axios';
 import qs from 'qs';
+import mongoose from 'mongoose';
 import EbayVehicleModel from '../models/EbayVehicleModel.js';
+import EbayDeviceModel from '../models/EbayDeviceModel.js';
 import Seller from '../models/Seller.js';
 import Range from '../models/Range.js';
 import Assignment from '../models/Assignment.js';
@@ -18,7 +20,7 @@ const router = Router();
 
 let vehicleModelsCache = null;
 let cacheLastUpdated = null;
-const CACHE_TTL = 60 * 60 * 1000; // 1 hour cache TTL
+const CACHE_TTL = 240 * 60 * 60 * 1000; // 1 hour cache TTL
 
 // Helper: Normalize text (remove hyphens, extra spaces, lowercase)
 const normalizeText = (text) => {
@@ -58,7 +60,7 @@ async function getVehicleModelsCache(forceRefresh = false) {
   }));
   
   cacheLastUpdated = now;
-  console.log(`[Cache] Loaded ${vehicleModelsCache.length} models in ${Date.now() - startTime}ms`);
+  console.log(`[Cache] Loaded ${vehicleModelsCache.length} models in ${Date.now() - startTime}ms (TTL: 24 hours)`);
   
   return vehicleModelsCache;
 }
@@ -68,6 +70,55 @@ function invalidateVehicleModelsCache() {
   vehicleModelsCache = null;
   cacheLastUpdated = null;
   console.log('[Cache] Vehicle models cache invalidated');
+}
+
+// ============================================
+// CACHING SYSTEM FOR DEVICE MODELS (Cell Phones & Tablets)
+// ============================================
+
+let deviceModelsCache = null;
+let deviceCacheLastUpdated = null;
+
+// Load and cache device models with pre-computed normalized strings
+async function getDeviceModelsCache(forceRefresh = false) {
+  const now = Date.now();
+  
+  // Return cached data if valid
+  if (!forceRefresh && deviceModelsCache && deviceCacheLastUpdated && (now - deviceCacheLastUpdated < CACHE_TTL)) {
+    return deviceModelsCache;
+  }
+  
+  console.log('[Cache] Loading device models into cache...');
+  const startTime = Date.now();
+  
+  // Fetch all device models from database
+  const models = await EbayDeviceModel.find().select('fullName brand model deviceType').lean();
+  
+  // Pre-compute normalized strings for each model
+  deviceModelsCache = models.map(m => ({
+    fullName: m.fullName,
+    brand: m.brand || '',
+    model: m.model || '',
+    deviceType: m.deviceType,
+    fullNameLower: m.fullName.toLowerCase(),
+    fullNameNormalized: normalizeText(m.fullName),
+    brandLower: (m.brand || '').toLowerCase(),
+    brandNormalized: normalizeText(m.brand || ''),
+    modelLower: (m.model || '').toLowerCase(),
+    modelNormalized: normalizeText(m.model || ''),
+  }));
+  
+  deviceCacheLastUpdated = now;
+  console.log(`[Cache] Loaded ${deviceModelsCache.length} device models in ${Date.now() - startTime}ms`);
+  
+  return deviceModelsCache;
+}
+
+// Invalidate device cache (call this after sync)
+function invalidateDeviceModelsCache() {
+  deviceModelsCache = null;
+  deviceCacheLastUpdated = null;
+  console.log('[Cache] Device models cache invalidated');
 }
 
 // ============================================
@@ -257,26 +308,285 @@ router.post('/sync-ebay-models', requireAuth, requireRole('superadmin'), async (
   }
 });
 
+// ============================================
+// DEVICE MODELS SYNC (Cell Phones & Tablets)
+// ============================================
+
+// Helper: Get eBay Application Token (no user auth needed for Taxonomy API)
+async function getEbayApplicationToken() {
+  const response = await axios.post(
+    'https://api.ebay.com/identity/v1/oauth2/token',
+    qs.stringify({
+      grant_type: 'client_credentials',
+      scope: 'https://api.ebay.com/oauth/api_scope'
+    }),
+    {
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        Authorization: 'Basic ' + Buffer.from(`${process.env.EBAY_CLIENT_ID}:${process.env.EBAY_CLIENT_SECRET}`).toString('base64'),
+      },
+    }
+  );
+  return response.data.access_token;
+}
+
+// Helper: Fetch item aspects for a category from eBay Taxonomy API
+async function fetchCategoryAspects(token, categoryId) {
+  const response = await axios.get(
+    `https://api.ebay.com/commerce/taxonomy/v1/category_tree/0/get_item_aspects_for_category`,
+    {
+      params: { category_id: categoryId },
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json',
+      },
+    }
+  );
+  return response.data.aspects || [];
+}
+
+// Helper: Extract brand from model name
+function extractBrandFromModel(modelName) {
+  // Common phone/tablet brands to look for at the start
+  const brands = [
+    'Apple', 'Samsung', 'Google', 'Motorola', 'LG', 'OnePlus', 'Xiaomi', 
+    'Huawei', 'Sony', 'Nokia', 'HTC', 'BlackBerry', 'ASUS', 'Lenovo',
+    'Amazon', 'Microsoft', 'Acer', 'Alcatel', 'ZTE', 'BLU', 'TCL',
+    'Oppo', 'Vivo', 'Realme', 'Honor', 'Nothing', 'Essential', 'Razer',
+    'CAT', 'Kyocera', 'Palm', 'HP', 'Dell', 'Toshiba', 'Panasonic'
+  ];
+  
+  const modelLower = modelName.toLowerCase();
+  for (const brand of brands) {
+    if (modelLower.startsWith(brand.toLowerCase())) {
+      return brand;
+    }
+  }
+  
+  // Try to extract first word as brand if it's capitalized
+  const firstWord = modelName.split(/[\s-]/)[0];
+  if (firstWord && firstWord.length > 1 && firstWord[0] === firstWord[0].toUpperCase()) {
+    return firstWord;
+  }
+  
+  return '';
+}
+
+// GET /api/range-analysis/device-models
+// Get all device models from our database
+router.get('/device-models', requireAuth, async (req, res) => {
+  try {
+    const { deviceType } = req.query; // Optional filter: 'cellphone' or 'tablet'
+    const filter = deviceType ? { deviceType } : {};
+    const models = await EbayDeviceModel.find(filter).sort({ fullName: 1 });
+    res.json({ success: true, count: models.length, models });
+  } catch (error) {
+    console.error('Error fetching device models:', error);
+    res.status(500).json({ error: 'Failed to fetch device models' });
+  }
+});
+
+// POST /api/range-analysis/sync-device-models
+// Fetch cell phone and tablet models from eBay Taxonomy API and store in database
+router.post('/sync-device-models', requireAuth, requireRole('superadmin'), async (req, res) => {
+  try {
+    console.log('[Device Sync] Starting sync for Cell Phones and Tablets...');
+    
+    // 1. Get Application Token (no seller needed!)
+    const token = await getEbayApplicationToken();
+    console.log('[Device Sync] Got eBay application token');
+
+    // Categories to sync
+    const categoriesToSync = [
+      { id: '9355', name: 'Cell Phones & Smartphones', deviceType: 'cellphone' },
+      { id: '171485', name: 'Tablets & eBook Readers', deviceType: 'tablet' },
+    ];
+
+    let totalAdded = 0;
+    let totalSkipped = 0;
+    let totalErrors = 0;
+    const results = [];
+
+    for (const category of categoriesToSync) {
+      console.log(`\n[Device Sync] Processing: ${category.name} (ID: ${category.id})`);
+      
+      try {
+        // 2. Fetch aspects for this category
+        const aspects = await fetchCategoryAspects(token, category.id);
+        console.log(`[Device Sync] Found ${aspects.length} aspects for ${category.name}`);
+
+        // 3. Find the "Model" aspect
+        const modelAspect = aspects.find(a => 
+          a.localizedAspectName === 'Model' || 
+          a.localizedAspectName === 'Compatible Model'
+        );
+
+        if (!modelAspect || !modelAspect.aspectValues || modelAspect.aspectValues.length === 0) {
+          console.log(`[Device Sync] No model values found for ${category.name}`);
+          results.push({ 
+            category: category.name, 
+            status: 'no_models', 
+            count: 0 
+          });
+          continue;
+        }
+
+        const modelValues = modelAspect.aspectValues;
+        console.log(`[Device Sync] Found ${modelValues.length} models for ${category.name}`);
+
+        let added = 0;
+        let skipped = 0;
+        let errors = 0;
+
+        // 4. Save each model to database
+        for (const modelValue of modelValues) {
+          let modelName = modelValue.localizedValue;
+          
+          // Skip if empty
+          if (!modelName || modelName.trim().length === 0) continue;
+          
+          // Clean up "For " prefix (from accessories categories)
+          if (modelName.startsWith('For ')) {
+            modelName = modelName.substring(4);
+          }
+          
+          // Extract brand if possible
+          const brand = extractBrandFromModel(modelName);
+          const model = brand ? modelName.substring(brand.length).trim() : modelName;
+
+          try {
+            await EbayDeviceModel.findOneAndUpdate(
+              { fullName: modelName, ebayCategoryId: category.id },
+              { 
+                fullName: modelName,
+                normalizedName: normalizeText(modelName),
+                brand: brand,
+                model: model,
+                deviceType: category.deviceType,
+                ebayCategoryId: category.id,
+              },
+              { upsert: true, new: true }
+            );
+            added++;
+          } catch (e) {
+            if (e.code === 11000) {
+              skipped++; // Duplicate
+            } else {
+              errors++;
+              console.error(`  Error saving ${modelName}:`, e.message);
+            }
+          }
+        }
+
+        console.log(`[Device Sync] ${category.name}: Added ${added}, Skipped ${skipped}, Errors ${errors}`);
+        
+        results.push({
+          category: category.name,
+          categoryId: category.id,
+          deviceType: category.deviceType,
+          status: 'success',
+          modelsFound: modelValues.length,
+          added,
+          skipped,
+          errors
+        });
+
+        totalAdded += added;
+        totalSkipped += skipped;
+        totalErrors += errors;
+
+      } catch (categoryError) {
+        console.error(`[Device Sync] Error processing ${category.name}:`, categoryError.message);
+        results.push({
+          category: category.name,
+          status: 'error',
+          error: categoryError.message
+        });
+        totalErrors++;
+      }
+    }
+
+    // 5. Get final counts
+    const totalPhones = await EbayDeviceModel.countDocuments({ deviceType: 'cellphone' });
+    const totalTablets = await EbayDeviceModel.countDocuments({ deviceType: 'tablet' });
+    const totalDevices = totalPhones + totalTablets;
+
+    // 6. Invalidate cache so new models are picked up
+    invalidateDeviceModelsCache();
+
+    console.log(`\n[Device Sync] Complete! Added: ${totalAdded}, Skipped: ${totalSkipped}, Errors: ${totalErrors}`);
+    console.log(`[Device Sync] Total in database: ${totalPhones} phones + ${totalTablets} tablets = ${totalDevices} devices`);
+
+    res.json({
+      success: true,
+      message: `Synced ${totalAdded} new device models. ${totalSkipped} already existed. ${totalErrors} errors.`,
+      stats: {
+        added: totalAdded,
+        skipped: totalSkipped,
+        errors: totalErrors,
+        totalPhones,
+        totalTablets,
+        totalDevices
+      },
+      results
+    });
+
+  } catch (error) {
+    console.error('Device Sync Error:', error);
+    res.status(500).json({ error: error.message || 'Failed to sync device models' });
+  }
+});
+
 // POST /api/range-analysis/analyze
-// Analyze text against eBay vehicle models database - returns FIRST model per line only
+// Analyze text against eBay models database - returns FIRST model per line only
 // Uses CACHED models for faster performance
+// Supports both vehicle models and device models (phones/tablets)
 router.post('/analyze', requireAuth, requireRole('superadmin', 'listingadmin', 'lister', 'advancelister', 'trainee'), async (req, res) => {
   try {
     const startTime = Date.now();
-    const { textToAnalyze } = req.body;
+    const { textToAnalyze, searchType } = req.body;
+    // searchType: 'vehicles' (default), 'devices' (phones+tablets), 'cellphones', 'tablets'
 
     if (!textToAnalyze) {
       return res.status(400).json({ error: 'No text provided for analysis.' });
     }
 
-    // Get cached models (pre-normalized!)
-    const models = await getVehicleModelsCache();
+    // Determine which models to search
+    let models;
+    let modelType = searchType || 'vehicles';
     
-    if (models.length === 0) {
-      return res.status(400).json({ 
-        error: 'No vehicle models in database. Please sync eBay models first.',
-        needsSync: true
-      });
+    if (modelType === 'devices' || modelType === 'cellphones' || modelType === 'tablets') {
+      // Use device models cache
+      let allDeviceModels = await getDeviceModelsCache();
+      
+      // Filter by device type if specified
+      if (modelType === 'cellphones') {
+        models = allDeviceModels.filter(m => m.deviceType === 'cellphone');
+      } else if (modelType === 'tablets') {
+        models = allDeviceModels.filter(m => m.deviceType === 'tablet');
+      } else {
+        models = allDeviceModels; // Both phones and tablets
+      }
+      
+      if (models.length === 0) {
+        return res.status(400).json({ 
+          error: 'No device models in database. Please sync device models first.',
+          needsSync: true,
+          syncType: 'devices'
+        });
+      }
+    } else {
+      // Default: Use vehicle models cache
+      models = await getVehicleModelsCache();
+      modelType = 'vehicles';
+      
+      if (models.length === 0) {
+        return res.status(400).json({ 
+          error: 'No vehicle models in database. Please sync eBay models first.',
+          needsSync: true,
+          syncType: 'vehicles'
+        });
+      }
     }
 
     // Split text into lines
@@ -296,34 +606,38 @@ router.post('/analyze', requireAuth, requireRole('superadmin', 'listingadmin', '
       let earliestPosition = Infinity;
 
       // Check each model and find the one that appears earliest in the line
-      // Using pre-computed normalized strings from cache!
       for (const m of models) {
         let position = -1;
         
-        // Method 1: Full name match (e.g., "Honda Accord") - using pre-computed fullNameLower
+        // Method 1: Full name match (e.g., "Honda Accord" or "iPhone 15 Pro Max")
         const fullNamePos = line.textLower.indexOf(m.fullNameLower);
         if (fullNamePos !== -1) {
           position = fullNamePos;
         }
-        // Method 2: Normalized full name match - using pre-computed fullNameNormalized
+        // Method 2: Normalized full name match
         else {
           const normalizedPos = line.normalized.indexOf(m.fullNameNormalized);
           if (normalizedPos !== -1) {
             position = normalizedPos;
           }
         }
-        // Method 3: Make appears + model with word boundary
+        
+        // Method 3: For vehicles - Make appears + model with word boundary
+        // For devices - Brand appears + model with word boundary
         if (position === -1) {
-          const makePos = line.textLower.indexOf(m.makeLower);
-          const makeNormPos = line.normalized.indexOf(m.makeNormalized);
+          const brandKey = modelType === 'vehicles' ? 'makeLower' : 'brandLower';
+          const brandNormKey = modelType === 'vehicles' ? 'makeNormalized' : 'brandNormalized';
           
-          if (makePos !== -1 || makeNormPos !== -1) {
+          const brandPos = line.textLower.indexOf(m[brandKey]);
+          const brandNormPos = line.normalized.indexOf(m[brandNormKey]);
+          
+          if ((brandPos !== -1 || brandNormPos !== -1) && m.modelLower) {
             const modelPattern = m.modelLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
             const modelRegex = new RegExp(`\\b${modelPattern}\\b`, 'i');
             const modelMatch = line.text.match(modelRegex);
             
             if (modelMatch) {
-              position = Math.min(makePos !== -1 ? makePos : Infinity, modelMatch.index);
+              position = Math.min(brandPos !== -1 ? brandPos : Infinity, modelMatch.index);
             }
           }
         }
@@ -336,12 +650,14 @@ router.post('/analyze', requireAuth, requireRole('superadmin', 'listingadmin', '
       }
 
       // Record result for this line
+      const brandField = modelType === 'vehicles' ? 'make' : 'brand';
       lineResults.push({
         lineNumber: line.lineNumber,
         text: line.text.length > 200 ? line.text.substring(0, 200) + '...' : line.text,
         foundModel: foundModel ? foundModel.fullName : null,
-        make: foundModel ? foundModel.make : null,
-        model: foundModel ? foundModel.model : null
+        make: foundModel ? foundModel[brandField] : null,
+        model: foundModel ? foundModel.model : null,
+        deviceType: foundModel?.deviceType || null
       });
 
       // Update count for found model
@@ -369,10 +685,11 @@ router.post('/analyze', requireAuth, requireRole('superadmin', 'listingadmin', '
     const unmatchedCount = linesWithNoMatch.length;
 
     const processingTime = Date.now() - startTime;
-    console.log(`[Analyze] Processed ${lines.length} lines in ${processingTime}ms`);
+    console.log(`[Analyze] Processed ${lines.length} lines against ${models.length} ${modelType} models in ${processingTime}ms`);
 
     res.json({ 
       success: true, 
+      searchType: modelType,
       foundInDatabase,
       lineResults, // All lines with their detected model (or null)
       totalModelsInDatabase: models.length,
@@ -512,6 +829,14 @@ router.post('/save-bulk-ranges', requireAuth, requireRole('superadmin', 'listing
     const { assignmentId, categoryId, modelCounts, unknownQty, remainingLimit } = req.body;
     // modelCounts: [{ modelName: "Honda CR-V", count: 5 }, ...]
     // remainingLimit: max total quantity that can be added (for auto-trim)
+    
+    console.log(`[Bulk Save] Request received:`, {
+      assignmentId,
+      categoryId,
+      modelCountsLength: modelCounts?.length || 0,
+      unknownQty,
+      remainingLimit
+    });
 
     if (!assignmentId) {
       return res.status(400).json({ error: 'assignmentId is required' });
@@ -533,22 +858,27 @@ router.post('/save-bulk-ranges', requireAuth, requireRole('superadmin', 'listing
       return res.status(403).json({ error: 'Forbidden' });
     }
 
-    // 2. Map model names to Range IDs (create if needed)
+    // 2. Convert categoryId to ObjectId if it's a string (important for MongoDB queries)
+    const categoryObjectId = typeof categoryId === 'string' 
+      ? new mongoose.Types.ObjectId(categoryId) 
+      : categoryId;
+    
+    // 3. Map model names to Range IDs (create if needed)
     let rangeUpdates = []; // { rangeId, rangeName, quantity }
 
     for (const item of (modelCounts || [])) {
       const { modelName, count } = item;
       if (!modelName || !count || count <= 0) continue;
 
-      let range = await Range.findOne({ name: modelName, category: categoryId });
+      let range = await Range.findOne({ name: modelName, category: categoryObjectId });
       
       if (!range) {
         try {
-          range = await Range.create({ name: modelName, category: categoryId });
+          range = await Range.create({ name: modelName, category: categoryObjectId });
           console.log(`[Bulk Save] Created new range: ${modelName}`);
         } catch (e) {
           if (e.code === 11000) {
-            range = await Range.findOne({ name: modelName, category: categoryId });
+            range = await Range.findOne({ name: modelName, category: categoryObjectId });
           } else {
             console.error(`[Bulk Save] Error creating range ${modelName}:`, e.message);
             continue;
@@ -558,7 +888,7 @@ router.post('/save-bulk-ranges', requireAuth, requireRole('superadmin', 'listing
 
       if (range) {
         // Validate range belongs to category
-        if (String(range.category) !== String(categoryId)) {
+        if (String(range.category) !== String(categoryObjectId)) {
           console.error(`[Bulk Save] Range ${modelName} doesn't belong to category`);
           continue;
         }
@@ -566,24 +896,41 @@ router.post('/save-bulk-ranges', requireAuth, requireRole('superadmin', 'listing
       }
     }
 
-    // 3. Handle Unknown range if needed
+    // 4. Handle Unknown range if needed
+    console.log(`[Bulk Save] Processing Unknown - unknownQty: ${unknownQty}, type: ${typeof unknownQty}`);
+    
     if (unknownQty && unknownQty > 0) {
-      let unknownRange = await Range.findOne({ name: 'Unknown', category: categoryId });
+      console.log(`[Bulk Save] Adding Unknown range with qty: ${unknownQty} for category: ${categoryId}`);
+      
+      // First, try to find existing Unknown range
+      let unknownRange = await Range.findOne({ name: 'Unknown', category: categoryObjectId });
+      console.log(`[Bulk Save] Initial findOne result:`, unknownRange ? `Found: ${unknownRange._id}` : 'Not found');
       
       if (!unknownRange) {
         try {
-          unknownRange = await Range.create({ name: 'Unknown', category: categoryId });
-          console.log(`[Bulk Save] Created Unknown range for category`);
+          unknownRange = await Range.create({ name: 'Unknown', category: categoryObjectId });
+          console.log(`[Bulk Save] Created Unknown range: ${unknownRange._id}`);
         } catch (e) {
+          console.log(`[Bulk Save] Create error: ${e.code} - ${e.message}`);
           if (e.code === 11000) {
-            unknownRange = await Range.findOne({ name: 'Unknown', category: categoryId });
+            // Race condition - another request created it, try to find again
+            console.log(`[Bulk Save] Duplicate error, searching again...`);
+            unknownRange = await Range.findOne({ name: 'Unknown', category: categoryObjectId });
+            console.log(`[Bulk Save] Second findOne result:`, unknownRange ? `Found: ${unknownRange._id}` : 'Still not found!');
+          } else {
+            console.error(`[Bulk Save] Error creating Unknown range:`, e.message);
           }
         }
       }
       
-      if (unknownRange) {
+      if (unknownRange && unknownRange._id) {
         rangeUpdates.push({ rangeId: unknownRange._id, rangeName: 'Unknown', quantity: unknownQty });
+        console.log(`[Bulk Save] Added Unknown to rangeUpdates, total updates now: ${rangeUpdates.length}`);
+      } else {
+        console.error(`[Bulk Save] Failed to get Unknown range! unknownRange:`, unknownRange);
       }
+    } else {
+      console.log(`[Bulk Save] Skipping Unknown - condition not met (unknownQty: ${unknownQty})`);
     }
 
     // 4. AUTO-TRIM: If total exceeds remainingLimit, trim quantities proportionally
@@ -616,6 +963,8 @@ router.post('/save-bulk-ranges', requireAuth, requireRole('superadmin', 'listing
     }
 
     // 5. Apply ALL range updates to assignment in ONE save
+    console.log(`[Bulk Save] Applying ${rangeUpdates.length} range updates:`, rangeUpdates.map(u => `${u.rangeName}: ${u.quantity}`));
+    
     for (const update of rangeUpdates) {
       const existingIdx = assignment.rangeQuantities.findIndex(
         rq => String(rq.range) === String(update.rangeId)
@@ -624,9 +973,11 @@ router.post('/save-bulk-ranges', requireAuth, requireRole('superadmin', 'listing
       if (existingIdx >= 0) {
         // Add to existing quantity
         assignment.rangeQuantities[existingIdx].quantity += update.quantity;
+        console.log(`[Bulk Save] Updated existing range ${update.rangeName}: +${update.quantity}`);
       } else {
         // Add new
         assignment.rangeQuantities.push({ range: update.rangeId, quantity: update.quantity });
+        console.log(`[Bulk Save] Added new range ${update.rangeName}: ${update.quantity}`);
       }
     }
 
