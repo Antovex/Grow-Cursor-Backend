@@ -224,16 +224,14 @@ async function fetchOrderAdFee(accessToken, orderId, adFeeMap = null) {
 const ENABLE_AUTO_WELCOME = true; // Set to false to disable
 const WELCOME_TEMPLATE = `Hello {BUYER_NAME},
 
-Thank you so much for your recent purchase from our store! 
+Thank you for your recent purchase!
 
-Usually, items ship within 24-48 hours, but due to the ongoing festive season, handling time may take around 48-72 hours.
+Orders usually ship within 24–48 hours, but due to the festive season, handling time may be slightly longer.
+We’ll keep you updated, and once shipped, tracking details will be added to your eBay order page.
 
-Your order will be prepared for processing shortly. If there are any updates along the way, we’ll notify you right away. 
-Once it is ready for shipping, the tracking details will be added directly to your eBay order page so you can easily follow the delivery.
+If you need any help, please don't hesitate to message us.
 
-If you ever need any assistance, please feel free to message us here as we’re always happy to help.
-
-We truly appreciate you choosing our store! We hope you have a wonderful day!`;
+We truly appreciate your support and wish you a wonderful day!`;
 
 // --- HELPER: Send Auto Welcome Message ---
 async function sendAutoWelcomeMessage(seller, order) {
