@@ -64,7 +64,7 @@ router.get('/:id', async (req, res) => {
 // PUBLIC ROUTE - Anyone can submit
 router.post('/', async (req, res) => {
   try {
-    const { title, description, type, priority, createdBy } = req.body;
+    const { title, description, type, priority, createdBy, completeByDate } = req.body;
 
     if (!title || !description || !createdBy) {
       return res.status(400).json({ 
@@ -78,7 +78,8 @@ router.post('/', async (req, res) => {
       type: type || 'idea',
       priority: priority || 'medium',
       createdBy,
-      status: 'open'
+      status: 'open',
+      completeByDate: completeByDate || undefined
     });
 
     res.status(201).json(newIdea);
@@ -92,12 +93,13 @@ router.post('/', async (req, res) => {
 // PUBLIC ROUTE - But you might want to restrict this later
 router.patch('/:id', async (req, res) => {
   try {
-    const { status, priority, assignedTo, resolvedBy } = req.body;
+    const { status, priority, assignedTo, resolvedBy, completeByDate } = req.body;
     
     const updateData = {};
     if (status) updateData.status = status;
     if (priority) updateData.priority = priority;
     if (assignedTo) updateData.assignedTo = assignedTo;
+    if (completeByDate !== undefined) updateData.completeByDate = completeByDate;
     
     if (status === 'completed' && !req.body.resolvedAt) {
       updateData.resolvedAt = new Date();

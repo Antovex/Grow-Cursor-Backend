@@ -32,7 +32,8 @@ const IdeaSchema = new mongoose.Schema(
       }
     ],
     resolvedAt: Date,
-    resolvedBy: String
+    resolvedBy: String,
+    completeByDate: { type: Date, required: false } // New field for target completion date
   },
   { timestamps: true }
 );

@@ -768,7 +768,7 @@ router.get('/cancelled-orders', async (req, res) => {
 
 // Get stored orders from database with pagination support
 router.get('/stored-orders', async (req, res) => {
-  const { sellerId, page = 1, limit = 50, searchOrderId, searchBuyerName, searchMarketplace, startDate, endDate, awaitingShipment } = req.query;
+  const { sellerId, page = 1, limit = 50, searchOrderId, searchBuyerName, searchMarketplace, startDate, endDate, awaitingShipment, hasFulfillmentNotes } = req.query;
   
   try {
     let query = {};
@@ -789,6 +789,11 @@ router.get('/stored-orders', async (req, res) => {
         // IN_PROGRESS means buyer requested cancel but seller hasn't responded yet
         // These still need attention (either ship or cancel)
         query.cancelState = { $in: ['NONE_REQUESTED', 'IN_PROGRESS', null, ''] }; 
+    }
+
+    // --- Has Fulfillment Notes Filter ---
+    if (hasFulfillmentNotes === 'true') {
+      query.fulfillmentNotes = { $exists: true, $nin: ['', null] };
     }
 
     // Apply search filters
@@ -2425,7 +2430,7 @@ router.post('/fetch-returns', requireAuth, requireRole('fulfillmentadmin', 'supe
 // Get stored returns from database
 
 router.get('/stored-returns', async (req, res) => {
-  const { sellerId, status, reason, startDate, endDate, limit = 200 } = req.query;
+  const { sellerId, status, reason, startDate, endDate, page = 1, limit = 50 } = req.query;
   
   try {
     let query = {};
@@ -2445,6 +2450,10 @@ router.get('/stored-returns', async (req, res) => {
       }
     }
 
+    const pageNum = parseInt(page);
+    const limitNum = parseInt(limit);
+    const skip = (pageNum - 1) * limitNum;
+
     const returns = await Return.find(query)
       .populate({
         path: 'seller',
@@ -2455,12 +2464,22 @@ router.get('/stored-returns', async (req, res) => {
         }
       })
       .sort({ creationDate: -1 })
-      .limit(parseInt(limit));
+      .skip(skip)
+      .limit(limitNum);
 
     // Get total count for the query
     const totalCount = await Return.countDocuments(query);
+    const totalPages = Math.ceil(totalCount / limitNum);
 
-    res.json({ returns, totalReturns: returns.length, totalCount });
+    res.json({ 
+      returns, 
+      pagination: {
+        currentPage: pageNum,
+        totalPages,
+        totalReturns: totalCount,
+        limit: limitNum
+      }
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
