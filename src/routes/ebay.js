@@ -83,17 +83,17 @@ async function fetchAllAdFees(accessToken, sinceDate = null) {
   let offset = 0;
   const limit = 200;
   let hasMore = true;
-  
+
   console.log(`[Finances API] Fetching all AD_FEE transactions...`);
-  
+
   try {
     while (hasMore) {
       // Build URL with filter - use proper encoding
       const baseUrl = 'https://apiz.ebay.com/sell/finances/v1/transaction';
       const filterValue = 'transactionType:{NON_SALE_CHARGE}';
-      
+
       console.log(`[Finances API] Calling: ${baseUrl} with filter=${filterValue}, offset=${offset}`);
-      
+
       const response = await axios.get(baseUrl, {
         headers: {
           'Authorization': `Bearer ${accessToken}`,
@@ -109,17 +109,17 @@ async function fetchAllAdFees(accessToken, sinceDate = null) {
 
       const transactions = response.data?.transactions || [];
       console.log(`[Finances API] Fetched ${transactions.length} NON_SALE_CHARGE transactions at offset ${offset}`);
-      
+
       for (const txn of transactions) {
         // Check if this is an AD_FEE transaction
         if (txn.feeType === 'AD_FEE' && txn.references) {
           // Find the ORDER_ID reference
           const orderRef = txn.references.find(ref => ref.referenceType === 'ORDER_ID');
-          
+
           if (orderRef) {
             const orderId = orderRef.referenceId;
             const feeAmount = Math.abs(parseFloat(txn.amount?.value || 0));
-            
+
             // Handle CREDIT (refund) vs DEBIT (charge)
             // DEBIT = charged, CREDIT = refunded
             const existingFee = adFeeMap.get(orderId) || 0;
@@ -133,7 +133,7 @@ async function fetchAllAdFees(accessToken, sinceDate = null) {
           }
         }
       }
-      
+
       // Check if there are more transactions
       if (transactions.length < limit) {
         hasMore = false;
@@ -146,10 +146,10 @@ async function fetchAllAdFees(accessToken, sinceDate = null) {
         }
       }
     }
-    
+
     console.log(`[Finances API] Built ad fee map with ${adFeeMap.size} orders`);
     return { success: true, adFeeMap };
-    
+
   } catch (error) {
     if (error.response?.status === 403) {
       console.log(`[Finances API] Missing sell.finances scope`);
@@ -170,7 +170,7 @@ async function fetchOrderAdFee(accessToken, orderId, adFeeMap = null) {
     const adFee = adFeeMap.get(orderId) || 0;
     return { success: true, adFeeGeneral: adFee };
   }
-  
+
   // Otherwise, we need to search through transactions
   // This is less efficient but works for single lookups
   try {
@@ -197,7 +197,7 @@ async function fetchOrderAdFee(accessToken, orderId, adFeeMap = null) {
         const matchingRef = txn.references.find(
           ref => ref.referenceType === 'ORDER_ID' && ref.referenceId === orderId
         );
-        
+
         if (matchingRef) {
           const feeAmount = Math.abs(parseFloat(txn.amount?.value || 0));
           if (txn.bookingEntry === 'CREDIT') {
@@ -239,10 +239,10 @@ async function sendAutoWelcomeMessage(seller, order) {
   try {
     const buyerUsername = order.buyer?.username;
     const buyerName = order.buyer?.buyerRegistrationAddress?.fullName || buyerUsername;
-    
+
     // 1. Get First Item Details
     const lineItem = order.lineItems?.[0];
-    const itemId = lineItem?.legacyItemId; 
+    const itemId = lineItem?.legacyItemId;
     let itemTitle = lineItem?.title;
 
     // 2. CHECK FOR MULTIPLE ITEMS
@@ -251,7 +251,7 @@ async function sendAutoWelcomeMessage(seller, order) {
       // Append count to title: "iPad Case (+ 1 other)"
       itemTitle = `${itemTitle} (+ ${itemCount - 1} other${itemCount - 1 > 1 ? 's' : ''})`;
     }
-    
+
     if (!buyerUsername || !itemId) return;
 
     // 1. Prepare the Message Body
@@ -314,12 +314,12 @@ async function sendAutoWelcomeMessage(seller, order) {
 // HELPER: Process a single eBay XML Message and save to DB
 async function processEbayMessage(msg, seller) {
   try {
-    const question = msg.Question?.[0]; 
+    const question = msg.Question?.[0];
     if (!question) return false;
 
     const msgID = question.MessageID?.[0];
     const senderID = question.SenderID?.[0];
-    const senderEmail = question.SenderEmail?.[0]; 
+    const senderEmail = question.SenderEmail?.[0];
     const body = question.Body?.[0];
     const subject = question.Subject?.[0];
     const itemID = msg.Item?.[0]?.ItemID?.[0];
@@ -337,17 +337,17 @@ async function processEbayMessage(msg, seller) {
     }
     // Sometimes it's inside the Question tag as well
     if (question.MessageMedia && Array.isArray(question.MessageMedia)) {
-        question.MessageMedia.forEach(media => {
-            if (media.MediaURL && media.MediaURL[0]) {
-              mediaUrls.push(media.MediaURL[0]);
-            }
-        });
+      question.MessageMedia.forEach(media => {
+        if (media.MediaURL && media.MediaURL[0]) {
+          mediaUrls.push(media.MediaURL[0]);
+        }
+      });
     }
     // ----------------------------
 
     // --- DATE PARSING ---
     const rawDate = question.CreationDate?.[0];
-    let messageDate = new Date(); 
+    let messageDate = new Date();
     if (rawDate) {
       const parsedDate = new Date(rawDate);
       if (!isNaN(parsedDate.getTime())) messageDate = parsedDate;
@@ -362,9 +362,9 @@ async function processEbayMessage(msg, seller) {
     let messageType = 'INQUIRY';
 
     if (itemID && senderID) {
-      const order = await Order.findOne({ 
-        'lineItems.legacyItemId': itemID, 
-        'buyer.username': senderID 
+      const order = await Order.findOne({
+        'lineItems.legacyItemId': itemID,
+        'buyer.username': senderID
       });
       if (order) {
         orderId = order.orderId;
@@ -411,9 +411,9 @@ async function extractTrackingNumber(fulfillmentHrefs, accessToken) {
       },
     });
     // Extract tracking number from the fulfillment response
-    const trackingNumber = response.data?.shipmentTrackingNumber || 
-                          response.data?.lineItems?.[0]?.shipmentTrackingNumber ||
-                          null;
+    const trackingNumber = response.data?.shipmentTrackingNumber ||
+      response.data?.lineItems?.[0]?.shipmentTrackingNumber ||
+      null;
     return trackingNumber;
   } catch (err) {
     console.error('Failed to extract tracking number:', err.message);
@@ -426,17 +426,17 @@ router.get('/connect', (req, res) => {
   console.log('========================================');
   console.log('[eBay OAuth] /connect endpoint HIT!');
   console.log('========================================');
-  
+
   const { token } = req.query; // Get JWT from query param
   if (!token) return res.status(400).send('Missing authentication token');
-  
+
   const clientId = process.env.EBAY_CLIENT_ID;
   const ruName = process.env.EBAY_RU_NAME;
-  
+
   // Pass the user's JWT as state parameter so we can identify them in callback
   const state = encodeURIComponent(token);
   const redirectUrl = `https://auth.ebay.com/oauth2/authorize?client_id=${clientId}&redirect_uri=${encodeURIComponent(ruName)}&response_type=code&scope=${encodeURIComponent(EBAY_OAUTH_SCOPES)}&state=${state}`;
-  
+
   console.log('[eBay OAuth] Scopes requested:', EBAY_OAUTH_SCOPES);
   console.log('[eBay OAuth] Full redirect URL:', redirectUrl);
   res.redirect(redirectUrl);
@@ -477,7 +477,7 @@ router.get('/callback', async (req, res) => {
     // Log the full token response for debugging
     console.log(`[eBay OAuth] Full token response keys:`, Object.keys(tokenRes.data));
     console.log(`[eBay OAuth] Seller connected. Scope granted by eBay: ${tokenRes.data.scope}`);
-    
+
     // Check if payment dispute scope was granted
     const grantedScope = tokenRes.data.scope || '';
     if (!grantedScope.includes('sell.payment.dispute')) {
@@ -510,22 +510,22 @@ router.get('/callback', async (req, res) => {
           limit: 15
         },
       });
-      
+
       const ebayOrders = ordersRes.data.orders || [];
-      
+
       // Save initial orders in database
       for (const order of ebayOrders) {
         const lineItem = order.lineItems?.[0] || {};
         const fulfillmentInstr = order.fulfillmentStartInstructions?.[0] || {};
         const shipTo = fulfillmentInstr.shippingStep?.shipTo || {};
         const buyerAddr = `${shipTo.contactAddress?.addressLine1 || ''}, ${shipTo.contactAddress?.city || ''}, ${shipTo.contactAddress?.stateOrProvince || ''}, ${shipTo.contactAddress?.postalCode || ''}, ${shipTo.contactAddress?.countryCode || ''}`.trim();
-        
+
         // Extract tracking number if fulfillmentHrefs exists
         const trackingNumber = await extractTrackingNumber(order.fulfillmentHrefs, tokenRes.data.access_token);
-        
+
         // Extract purchaseMarketplaceId from lineItems
         const purchaseMarketplaceId = lineItem.purchaseMarketplaceId || '';
-        
+
         await Order.findOneAndUpdate(
           { orderId: order.orderId },
           {
@@ -631,22 +631,22 @@ router.get('/orders', async (req, res) => {
         return res.status(401).json({ error: 'Failed to refresh eBay token', details: refreshErr.message });
       }
     }
-    
+
     // Get the last modified date from our database to fetch only new/updated orders
     const orderCount = await Order.countDocuments({ seller: seller._id });
     const lastOrder = await Order.findOne({ seller: seller._id }).sort({ lastModifiedDate: -1 });
     const lastModifiedDate = lastOrder ? lastOrder.lastModifiedDate : null;
-    
+
     // Build eBay API params
     const params = {
       limit: orderCount === 0 ? 15 : 200 // If no orders exist, fetch only 5, else fetch all new/updated
     };
-    
+
     // If we have orders already, only fetch orders modified after the last one
     if (lastModifiedDate) {
       params.filter = `lastmodifieddate:[${new Date(lastModifiedDate).toISOString()}..${new Date().toISOString()}]`;
     }
-    
+
     // Fetch orders from eBay API
     const ordersRes = await axios.get('https://api.ebay.com/sell/fulfillment/v1/order', {
       headers: {
@@ -655,22 +655,22 @@ router.get('/orders', async (req, res) => {
       },
       params
     });
-    
+
     const ebayOrders = ordersRes.data.orders || [];
-    
+
     // Save/update orders in database
     for (const order of ebayOrders) {
       const lineItem = order.lineItems?.[0] || {};
       const fulfillmentInstr = order.fulfillmentStartInstructions?.[0] || {};
       const shipTo = fulfillmentInstr.shippingStep?.shipTo || {};
       const buyerAddr = `${shipTo.contactAddress?.addressLine1 || ''}, ${shipTo.contactAddress?.city || ''}, ${shipTo.contactAddress?.stateOrProvince || ''}, ${shipTo.contactAddress?.postalCode || ''}, ${shipTo.contactAddress?.countryCode || ''}`.trim();
-      
+
       // Extract tracking number if fulfillmentHrefs exists
       const trackingNumber = await extractTrackingNumber(order.fulfillmentHrefs, accessToken);
-      
+
       // Extract purchaseMarketplaceId from lineItems
       const purchaseMarketplaceId = lineItem.purchaseMarketplaceId || '';
-      
+
       await Order.findOneAndUpdate(
         { orderId: order.orderId },
         {
@@ -723,7 +723,7 @@ router.get('/orders', async (req, res) => {
         { upsert: true, new: true }
       );
     }
-    
+
     // Return orders from database
     const dbOrders = await Order.find({ seller: seller._id }).sort({ creationDate: -1 }).limit(200);
     res.json({ orders: dbOrders });
@@ -752,7 +752,7 @@ router.get('/cancelled-orders', async (req, res) => {
 
     console.log(`[Cancelled Orders] Found ${cancelledOrders.length} IN_PROGRESS orders`);
 
-    res.json({ 
+    res.json({
       orders: cancelledOrders,
       totalOrders: cancelledOrders.length,
       filterDate: thirtyDaysAgo.toISOString()
@@ -769,7 +769,7 @@ router.get('/cancelled-orders', async (req, res) => {
 // Get stored orders from database with pagination support
 router.get('/stored-orders', async (req, res) => {
   const { sellerId, page = 1, limit = 50, searchOrderId, searchBuyerName, searchMarketplace, startDate, endDate, awaitingShipment, hasFulfillmentNotes } = req.query;
-  
+
   try {
     let query = {};
     if (sellerId) {
@@ -778,17 +778,17 @@ router.get('/stored-orders', async (req, res) => {
 
     // --- Awaiting Shipment Filter ---
     if (awaitingShipment === 'true') {
-        // Condition 1: Must NOT have a tracking number
-        query.$or = [
-            { trackingNumber: { $exists: false } },
-            { trackingNumber: null },
-            { trackingNumber: '' }
-        ];
-        
-        // Condition 2: Include orders with no cancellation OR with IN_PROGRESS cancellation
-        // IN_PROGRESS means buyer requested cancel but seller hasn't responded yet
-        // These still need attention (either ship or cancel)
-        query.cancelState = { $in: ['NONE_REQUESTED', 'IN_PROGRESS', null, ''] }; 
+      // Condition 1: Must NOT have a tracking number
+      query.$or = [
+        { trackingNumber: { $exists: false } },
+        { trackingNumber: null },
+        { trackingNumber: '' }
+      ];
+
+      // Condition 2: Include orders with no cancellation OR with IN_PROGRESS cancellation
+      // IN_PROGRESS means buyer requested cancel but seller hasn't responded yet
+      // These still need attention (either ship or cancel)
+      query.cancelState = { $in: ['NONE_REQUESTED', 'IN_PROGRESS', null, ''] };
     }
 
     // --- Has Fulfillment Notes Filter ---
@@ -809,18 +809,18 @@ router.get('/stored-orders', async (req, res) => {
     // Timezone-Aware Date Range Logic
     if (startDate || endDate) {
       query.dateSold = {};
-      const PST_OFFSET_HOURS = 8; 
+      const PST_OFFSET_HOURS = 8;
 
       if (startDate) {
         const start = new Date(startDate);
-        start.setUTCHours(PST_OFFSET_HOURS, 0, 0, 0); 
+        start.setUTCHours(PST_OFFSET_HOURS, 0, 0, 0);
         query.dateSold.$gte = start;
       }
-      
+
       if (endDate) {
         const end = new Date(endDate);
-        end.setDate(end.getDate() + 1); 
-        end.setUTCHours(PST_OFFSET_HOURS - 1, 59, 59, 999); 
+        end.setDate(end.getDate() + 1);
+        end.setUTCHours(PST_OFFSET_HOURS - 1, 59, 59, 999);
         query.dateSold.$lte = end;
       }
     }
@@ -849,10 +849,10 @@ router.get('/stored-orders', async (req, res) => {
       .sort(awaitingShipment === 'true' ? { shipByDate: 1 } : { creationDate: -1 })
       .skip(skip)
       .limit(limitNum);
-    
+
     console.log(`[Stored Orders] Query: ${JSON.stringify(query)}, Page: ${pageNum}/${totalPages}, Found ${orders.length}/${totalOrders} orders`);
-    
-    res.json({ 
+
+    res.json({
       orders,
       pagination: {
         currentPage: pageNum,
@@ -871,21 +871,21 @@ router.get('/stored-orders', async (req, res) => {
 // Test endpoint to check Finances API basic connectivity (no filter)
 router.get('/test-finances-basic', requireAuth, requireRole('fulfillmentadmin', 'superadmin'), async (req, res) => {
   const { sellerId } = req.query;
-  
+
   if (!sellerId) {
     return res.status(400).json({ error: 'sellerId query param is required' });
   }
-  
+
   try {
     const seller = await Seller.findById(sellerId);
     if (!seller || !seller.ebayTokens?.access_token) {
       return res.status(400).json({ error: 'Seller not found or not connected to eBay' });
     }
-    
+
     const accessToken = await ensureValidToken(seller);
-    
+
     console.log(`[Test Finances Basic] Testing API without filter...`);
-    
+
     // Try WITHOUT any filter first
     const response = await axios.get(
       `https://apiz.ebay.com/sell/finances/v1/transaction`,
@@ -900,12 +900,12 @@ router.get('/test-finances-basic', requireAuth, requireRole('fulfillmentadmin', 
         }
       }
     );
-    
+
     console.log(`[Test Finances Basic] Success! Found ${response.data?.transactions?.length || 0} transactions`);
-    
+
     // Show first transaction for debugging
     const firstTxn = response.data?.transactions?.[0];
-    
+
     res.json({
       success: true,
       total: response.data?.total || 0,
@@ -913,7 +913,7 @@ router.get('/test-finances-basic', requireAuth, requireRole('fulfillmentadmin', 
       firstTransaction: firstTxn,
       allTransactionTypes: [...new Set((response.data?.transactions || []).map(t => t.transactionType))]
     });
-    
+
   } catch (error) {
     console.error(`[Test Finances Basic] Error:`, error.response?.data || error.message);
     console.error(`[Test Finances Basic] Status:`, error.response?.status);
@@ -929,24 +929,24 @@ router.get('/test-finances-basic', requireAuth, requireRole('fulfillmentadmin', 
 router.get('/test-finances/:orderId', requireAuth, requireRole('fulfillmentadmin', 'superadmin'), async (req, res) => {
   const { orderId } = req.params;
   const { sellerId } = req.query;
-  
+
   if (!sellerId) {
     return res.status(400).json({ error: 'sellerId query param is required' });
   }
-  
+
   try {
     const seller = await Seller.findById(sellerId);
     if (!seller || !seller.ebayTokens?.access_token) {
       return res.status(400).json({ error: 'Seller not found or not connected to eBay' });
     }
-    
+
     const accessToken = await ensureValidToken(seller);
-    
+
     // Make direct API call to see raw response
     const filterValue = `orderId:{${orderId}}`;
     console.log(`[Test Finances] Testing order: ${orderId}`);
     console.log(`[Test Finances] Filter: ${filterValue}`);
-    
+
     const response = await axios.get(
       `https://apiz.ebay.com/sell/finances/v1/transaction`,
       {
@@ -961,16 +961,16 @@ router.get('/test-finances/:orderId', requireAuth, requireRole('fulfillmentadmin
         }
       }
     );
-    
+
     console.log(`[Test Finances] Full response:`, JSON.stringify(response.data, null, 2));
-    
+
     res.json({
       orderId,
       filter: filterValue,
       rawResponse: response.data,
       transactionCount: response.data?.transactions?.length || 0
     });
-    
+
   } catch (error) {
     console.error(`[Test Finances] Error:`, error.response?.data || error.message);
     res.status(error.response?.status || 500).json({
@@ -985,22 +985,22 @@ router.get('/test-finances/:orderId', requireAuth, requireRole('fulfillmentadmin
 router.patch('/orders/:orderId/ad-fee-general', async (req, res) => {
   const { orderId } = req.params;
   const { adFeeGeneral } = req.body;
-  
+
   if (adFeeGeneral === undefined || adFeeGeneral === null) {
     return res.status(400).json({ error: 'Missing adFeeGeneral value' });
   }
-  
+
   try {
     const order = await Order.findByIdAndUpdate(
       orderId,
       { adFeeGeneral: parseFloat(adFeeGeneral) },
       { new: true }
     );
-    
+
     if (!order) {
       return res.status(404).json({ error: 'Order not found' });
     }
-    
+
     res.json({ success: true, order });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1010,18 +1010,18 @@ router.patch('/orders/:orderId/ad-fee-general', async (req, res) => {
 // Get count of orders needing ad fee backfill
 router.get('/backfill-ad-fees/count', requireAuth, requireRole('fulfillmentadmin', 'superadmin'), async (req, res) => {
   const { sellerId, sinceDate } = req.query;
-  
+
   if (!sellerId) {
     return res.status(400).json({ error: 'sellerId is required' });
   }
-  
+
   try {
     let query = { seller: sellerId };
-    
+
     if (sinceDate) {
       query.creationDate = { $gte: new Date(sinceDate) };
     }
-    
+
     // Count orders without adFeeGeneral
     const needsBackfill = await Order.countDocuments({
       ...query,
@@ -1031,14 +1031,14 @@ router.get('/backfill-ad-fees/count', requireAuth, requireRole('fulfillmentadmin
         { adFeeGeneral: 0 }
       ]
     });
-    
+
     const totalOrders = await Order.countDocuments(query);
     const alreadyHasAdFee = totalOrders - needsBackfill;
-    
-    res.json({ 
-      totalOrders, 
-      needsBackfill, 
-      alreadyHasAdFee 
+
+    res.json({
+      totalOrders,
+      needsBackfill,
+      alreadyHasAdFee
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1048,29 +1048,29 @@ router.get('/backfill-ad-fees/count', requireAuth, requireRole('fulfillmentadmin
 // Backfill ad fees from eBay Finances API for orders since a given date
 router.post('/backfill-ad-fees', requireAuth, requireRole('fulfillmentadmin', 'superadmin'), async (req, res) => {
   const { sellerId, sinceDate, skipAlreadySet = true } = req.body;
-  
+
   if (!sellerId) {
     return res.status(400).json({ error: 'sellerId is required' });
   }
-  
+
   try {
     const seller = await Seller.findById(sellerId);
     if (!seller) {
       return res.status(404).json({ error: 'Seller not found' });
     }
-    
+
     if (!seller.ebayTokens || !seller.ebayTokens.access_token) {
       return res.status(400).json({ error: 'Seller not connected to eBay' });
     }
-    
+
     // Ensure we have a valid token
     const accessToken = await ensureValidToken(seller);
-    
+
     // Build query for orders
     let query = { seller: sellerId };
     const effectiveSinceDate = sinceDate ? new Date(sinceDate) : new Date('2025-11-01');
     query.creationDate = { $gte: effectiveSinceDate };
-    
+
     // Optionally skip orders that already have adFeeGeneral set
     if (skipAlreadySet) {
       query.$or = [
@@ -1079,30 +1079,30 @@ router.post('/backfill-ad-fees', requireAuth, requireRole('fulfillmentadmin', 's
         { adFeeGeneral: 0 }
       ];
     }
-    
+
     // Get ALL orders to process (no limit)
     const orders = await Order.find(query).sort({ creationDate: -1 });
-    
+
     console.log(`[Backfill Ad Fees] Found ${orders.length} orders to process for seller ${seller.username || seller._id}`);
-    
+
     if (orders.length === 0) {
       return res.json({
         message: 'No orders found to backfill',
         results: { total: 0, success: 0, failed: 0, skipped: 0, errors: [] }
       });
     }
-    
+
     // STEP 1: Fetch ALL ad fees from eBay in one batch (much more efficient!)
     console.log(`[Backfill Ad Fees] Fetching all ad fees since ${effectiveSinceDate.toISOString()}...`);
     const adFeeResult = await fetchAllAdFees(accessToken, effectiveSinceDate);
-    
+
     if (!adFeeResult.success) {
       return res.status(500).json({ error: `Failed to fetch ad fees: ${adFeeResult.error}` });
     }
-    
+
     const adFeeMap = adFeeResult.adFeeMap;
     console.log(`[Backfill Ad Fees] Found ${adFeeMap.size} ad fee transactions from eBay`);
-    
+
     const results = {
       total: orders.length,
       success: 0,
@@ -1110,35 +1110,35 @@ router.post('/backfill-ad-fees', requireAuth, requireRole('fulfillmentadmin', 's
       skipped: 0,
       errors: []
     };
-    
+
     // STEP 2: Match orders to ad fees and update
     for (let i = 0; i < orders.length; i++) {
       const order = orders[i];
       try {
         const adFee = adFeeMap.get(order.orderId);
-        
+
         if (adFee && adFee > 0) {
           await Order.findByIdAndUpdate(order._id, { adFeeGeneral: adFee });
           results.success++;
-          console.log(`[Backfill ${i+1}/${orders.length}] Order ${order.orderId}: Ad Fee = $${adFee}`);
+          console.log(`[Backfill ${i + 1}/${orders.length}] Order ${order.orderId}: Ad Fee = $${adFee}`);
         } else {
           results.skipped++;
-          console.log(`[Backfill ${i+1}/${orders.length}] Order ${order.orderId}: No ad fee found`);
+          console.log(`[Backfill ${i + 1}/${orders.length}] Order ${order.orderId}: No ad fee found`);
         }
       } catch (orderErr) {
         results.failed++;
         if (results.errors.length < 10) {
           results.errors.push({ orderId: order.orderId, error: orderErr.message });
         }
-        console.log(`[Backfill ${i+1}/${orders.length}] Order ${order.orderId}: Exception - ${orderErr.message}`);
+        console.log(`[Backfill ${i + 1}/${orders.length}] Order ${order.orderId}: Exception - ${orderErr.message}`);
       }
     }
-    
+
     res.json({
       message: `Backfill complete: ${results.success} updated, ${results.skipped} no ad fee, ${results.failed} failed`,
       results
     });
-    
+
   } catch (err) {
     console.error('[Backfill Ad Fees] Error:', err);
     res.status(500).json({ error: err.message });
@@ -1183,7 +1183,7 @@ router.post('/orders/:orderId/upload-tracking', async (req, res) => {
   try {
     // Find the order in our database
     const order = await Order.findById(orderId).populate('seller');
-    
+
     if (!order) {
       return res.status(404).json({ error: 'Order not found' });
     }
@@ -1241,50 +1241,68 @@ router.post('/orders/:orderId/upload-tracking', async (req, res) => {
 
     console.log(`[Upload Tracking] ✅ eBay API accepted tracking upload:`, fulfillmentResponse.data);
 
-    // WAIT 7 SECONDS: Give eBay time to process the tracking upload internally
-    console.log(`[Upload Tracking] Waiting 7 seconds for eBay to process tracking...`);
-    await new Promise(resolve => setTimeout(resolve, 7000)); // 7-second delay
-    
-    // VERIFY: Fetch the order back from eBay to confirm tracking was actually applied
-    console.log(`[Upload Tracking] Verifying tracking was applied...`);
-    
-    const verifyResponse = await axios.get(
-      `https://api.ebay.com/sell/fulfillment/v1/order/${ebayOrderId}`,
-      {
-        headers: {
-          'Authorization': `Bearer ${order.seller.ebayTokens.access_token}`,
-          'Content-Type': 'application/json',
-          'Accept': 'application/json'
+    // 4. CHECK FOR WARNINGS (Early Detection)
+    if (fulfillmentResponse.data?.warnings?.length > 0) {
+      console.warn(`[Upload Tracking] ⚠️ eBay returned warnings:`, JSON.stringify(fulfillmentResponse.data.warnings));
+      // If warning indicates a problem (but not an error), we should proceed with verification CAREFULLY
+    }
+
+    // 5. SMART POLLING VERIFICATION (Speed Upgrade)
+    // Instead of waiting 7 seconds blindly, we check immediately and then retry a few times.
+    console.log(`[Upload Tracking] Verifying tracking was applied (Smart Polling)...`);
+
+    let isVerified = false;
+    let verifiedOrder = null;
+
+    // Polling Schedule: 0s, 1s, 2s, 4s, 7s (Total ~7-8s max wait, but usually instant)
+    const delays = [100, 1000, 1000, 2000, 3000];
+
+    for (const delay of delays) {
+      if (delay > 100) await new Promise(r => setTimeout(r, delay));
+
+      try {
+        const verifyRes = await axios.get(
+          `https://api.ebay.com/sell/fulfillment/v1/order/${ebayOrderId}`,
+          {
+            headers: {
+              'Authorization': `Bearer ${order.seller.ebayTokens.access_token}`,
+              'Content-Type': 'application/json',
+              'Accept': 'application/json'
+            }
+          }
+        );
+
+        const data = verifyRes.data;
+        const hasFulfillmentHrefs = data.fulfillmentHrefs && data.fulfillmentHrefs.length > 0;
+        const isFulfilled = data.orderFulfillmentStatus === 'FULFILLED';
+
+        // Check specifically if OUR tracking number is present
+        // (Sometimes order is fulfilled but with an old tracking number)
+        // We verify if fulfillmentHrefs are present, which implies SOME tracking exists.
+        // Deep verification of the exact number is hard without following the hrefs, 
+        // but status=FULFILLED + hasHrefs is usually strong enough.
+
+        if (isFulfilled && hasFulfillmentHrefs) {
+          verifiedOrder = data;
+          isVerified = true;
+          console.log(`[Upload Tracking] ✅ Verified successfully after ~${delay}ms`);
+          break; // Exit loop immediately on success
         }
+      } catch (err) {
+        console.warn(`[Upload Tracking] Verification attempt failed: ${err.message}`);
       }
-    );
-
-    const verifiedOrder = verifyResponse.data;
-    const hasFulfillmentHrefs = verifiedOrder.fulfillmentHrefs && verifiedOrder.fulfillmentHrefs.length > 0;
-    const isFulfilled = verifiedOrder.orderFulfillmentStatus === 'FULFILLED';
-
-    console.log(`[Upload Tracking] Verification result:`, {
-      orderFulfillmentStatus: verifiedOrder.orderFulfillmentStatus,
-      fulfillmentHrefs: verifiedOrder.fulfillmentHrefs,
-      fulfillmentHrefsLength: verifiedOrder.fulfillmentHrefs?.length || 0,
-      hasFulfillmentHrefs,
-      isFulfilled
-    });
+    }
 
     // STRICT VALIDATION: Only save to DB if eBay confirmed tracking was applied
-    if (!hasFulfillmentHrefs || !isFulfilled) {
-      console.error(`[Upload Tracking] ⚠️ Tracking NOT applied after 7-second wait!`);
-      console.error(`[Upload Tracking] Order status: ${verifiedOrder.orderFulfillmentStatus}`);
-      console.error(`[Upload Tracking] FulfillmentHrefs: ${JSON.stringify(verifiedOrder.fulfillmentHrefs)}`);
-      
+    if (!isVerified || !verifiedOrder) {
+      console.error(`[Upload Tracking] ⚠️ Tracking NOT applied after polling attempts!`);
+
       // REJECT - Do NOT update database
-      return res.status(400).json({ 
-        error: 'Tracking number was rejected by eBay. This tracking number may already be in use for another order, or the format may be invalid.',
+      return res.status(400).json({
+        error: 'Tracking number was rejected by eBay (Verification Failed). This tracking number may already be in use for another order.',
         errorType: 'TRACKING_NOT_APPLIED',
         details: {
-          orderStatus: verifiedOrder.orderFulfillmentStatus,
-          fulfillmentHrefs: verifiedOrder.fulfillmentHrefs,
-          suggestion: 'Please verify:\n- Tracking number is correct\n- Carrier selection matches the tracking format\n- Tracking number is not already used for another order'
+          suggestion: 'Please verify the tracking number is correct and not a duplicate.'
         }
       });
     }
@@ -1300,8 +1318,8 @@ router.post('/orders/:orderId/upload-tracking', async (req, res) => {
 
     console.log(`[Upload Tracking] 💾 Database updated successfully for order ${ebayOrderId}`);
 
-    res.json({ 
-      success: true, 
+    res.json({
+      success: true,
       message: `Tracking uploaded to eBay via ${shippingCarrier}! Order marked as shipped.`,
       order,
       ebayResponse: fulfillmentResponse.data
@@ -1309,15 +1327,15 @@ router.post('/orders/:orderId/upload-tracking', async (req, res) => {
 
   } catch (err) {
     console.error('[Upload Tracking] ❌ Error:', err.response?.data || err.message);
-    
+
     // Provide detailed error message with specific handling for common issues
     let errorMessage = 'Failed to upload tracking to eBay';
     let errorType = 'UPLOAD_ERROR';
-    
+
     if (err.response?.data?.errors) {
       const errors = err.response.data.errors;
       errorMessage = errors.map(e => e.message).join(', ');
-      
+
       // Check for specific error types
       const errorString = JSON.stringify(errors).toLowerCase();
       if (errorString.includes('tracking') || errorString.includes('invalid')) {
@@ -1344,7 +1362,7 @@ router.post('/orders/:orderId/upload-tracking', async (req, res) => {
       statusCode: err.response?.status
     });
 
-    res.status(err.response?.status || 500).json({ 
+    res.status(err.response?.status || 500).json({
       error: errorMessage,
       errorType,
       details: err.response?.data || err.message,
@@ -1354,7 +1372,7 @@ router.post('/orders/:orderId/upload-tracking', async (req, res) => {
 });
 
 // Poll all sellers for new/updated orders with smart detection (PARALLEL + UTC-based)
-router.post('/poll-all-sellers', requireAuth, requireRole('fulfillmentadmin', 'superadmin','compliancemanager','hoc'), async (req, res) => {
+router.post('/poll-all-sellers', requireAuth, requireRole('fulfillmentadmin', 'superadmin', 'compliancemanager', 'hoc'), async (req, res) => {
   try {
     // Helper function to normalize dates for comparison (ignore milliseconds/format)
     function normalizeDateForComparison(date) {
@@ -1373,7 +1391,7 @@ router.post('/poll-all-sellers', requireAuth, requireRole('fulfillmentadmin', 's
       // Skip system fields
       const systemFields = ['_id', '__v', 'seller', 'updatedAt', 'createdAt'];
       if (systemFields.includes(fieldName)) return false;
-      
+
       // Date fields - compare Unix timestamps (ignore milliseconds)
       const dateFields = ['creationDate', 'lastModifiedDate', 'dateSold', 'shipByDate', 'estimatedDelivery'];
       if (dateFields.includes(fieldName)) {
@@ -1381,26 +1399,26 @@ router.post('/poll-all-sellers', requireAuth, requireRole('fulfillmentadmin', 's
         const newTime = normalizeDateForComparison(newValue);
         return oldTime !== newTime;
       }
-      
+
       // Null/undefined checks
       if (oldValue === null || oldValue === undefined) {
         return newValue !== null && newValue !== undefined;
       }
-      
+
       // Objects/Arrays - deep comparison
       if (typeof newValue === 'object' && newValue !== null) {
         return JSON.stringify(oldValue) !== JSON.stringify(newValue);
       }
-      
+
       // Primitives - direct comparison
       return oldValue !== newValue;
     }
 
     const sellers = await Seller.find({ 'ebayTokens.access_token': { $exists: true, $ne: null } })
       .populate('user', 'username email');
-    
+
     if (sellers.length === 0) {
-      return res.json({ 
+      return res.json({
         message: 'No sellers with connected eBay accounts found',
         pollResults: [],
         totalPolled: 0,
@@ -1421,10 +1439,10 @@ router.post('/poll-all-sellers', requireAuth, requireRole('fulfillmentadmin', 's
     // Process all sellers in parallel using Promise.allSettled
     const pollingPromises = sellers.map(async (seller) => {
       const sellerName = seller.user?.username || seller.user?.email || seller._id.toString();
-      
+
       try {
         console.log(`\n[${sellerName}] Starting poll...`);
-        
+
         // ========== TOKEN REFRESH CHECK ==========
         const fetchedAt = seller.ebayTokens.fetchedAt ? new Date(seller.ebayTokens.fetchedAt).getTime() : 0;
         const expiresInMs = (seller.ebayTokens.expires_in || 0) * 1000;
@@ -1493,7 +1511,7 @@ router.post('/poll-all-sellers', requireAuth, requireRole('fulfillmentadmin', 's
           const afterLatestMs = new Date(latestCreationDate).getTime() + 1000; // +1 sec
           const afterLatest = new Date(afterLatestMs);
           const timeDiffMinutes = (currentTimeUTC.getTime() - afterLatestMs) / (1000 * 60);
-          
+
           if (timeDiffMinutes >= 1) {
             newOrdersFilter = `creationdate:[${afterLatest.toISOString()}..${currentTimeUTC.toISOString()}]`;
             newOrdersLimit = 200;
@@ -1513,7 +1531,7 @@ router.post('/poll-all-sellers', requireAuth, requireRole('fulfillmentadmin', 's
             // Insert new orders
             for (const ebayOrder of ebayNewOrders) {
               const existingOrder = await Order.findOne({ orderId: ebayOrder.orderId });
-              
+
               if (!existingOrder) {
                 const orderData = await buildOrderData(ebayOrder, seller._id, accessToken);
                 const newOrder = await Order.create(orderData);
@@ -1524,7 +1542,7 @@ router.post('/poll-all-sellers', requireAuth, requireRole('fulfillmentadmin', 's
                 // Order exists, check if needs update
                 const ebayModTime = new Date(ebayOrder.lastModifiedDate).getTime();
                 const dbModTime = new Date(existingOrder.lastModifiedDate).getTime();
-                
+
                 if (ebayModTime > dbModTime) {
                   const orderData = await buildOrderData(ebayOrder, seller._id, accessToken);
                   Object.assign(existingOrder, orderData);
@@ -1552,7 +1570,7 @@ router.post('/poll-all-sellers', requireAuth, requireRole('fulfillmentadmin', 's
         if (recentOrders.length > 0) {
           const checkFromDate = lastPolledAt || thirtyDaysAgo;
           const modifiedFilter = `lastmodifieddate:[${checkFromDate.toISOString()}..${currentTimeUTC.toISOString()}]`;
-          
+
           console.log(`[${sellerName}] PHASE 2: Checking mods since ${checkFromDate.toISOString()}`);
 
           let offset = 0;
@@ -1581,23 +1599,23 @@ router.post('/poll-all-sellers', requireAuth, requireRole('fulfillmentadmin', 's
               console.log(`[${sellerName}] PHASE 2: ${relevantOrders.length} relevant`);
 
               for (const ebayOrder of relevantOrders) {
-                const existingOrder = await Order.findOne({ 
+                const existingOrder = await Order.findOne({
                   orderId: ebayOrder.orderId,
-                  seller: seller._id 
+                  seller: seller._id
                 });
 
                 if (existingOrder) {
                   const ebayModTime = new Date(ebayOrder.lastModifiedDate).getTime();
                   const dbModTime = new Date(existingOrder.lastModifiedDate).getTime();
-                  
+
                   // OPTIMIZATION: Skip if not actually modified
                   if (ebayModTime <= dbModTime) {
                     continue; // No changes, skip this order
                   }
-                  
+
                   // ONLY NOW fetch full order data (includes expensive tracking lookup)
                   const orderData = await buildOrderData(ebayOrder, seller._id, accessToken);
-                  
+
                   // Define fields that should trigger notifications
                   const notifiableFields = [
                     'cancelState',
@@ -1614,7 +1632,7 @@ router.post('/poll-all-sellers', requireAuth, requireRole('fulfillmentadmin', 's
                     'shippingCountry'
                     // NOTE: buyerCheckoutNotes is NOT included - updates DB silently
                   ];
-                  
+
                   // Detect changed fields with smart comparison
                   const changedFields = [];
                   for (const key of Object.keys(orderData)) {
@@ -1622,26 +1640,26 @@ router.post('/poll-all-sellers', requireAuth, requireRole('fulfillmentadmin', 's
                       changedFields.push(key);
                     }
                   }
-                  
+
                   // Filter to only notifiable fields (exclude lastModifiedDate)
-                  const notifiableChanges = changedFields.filter(f => 
+                  const notifiableChanges = changedFields.filter(f =>
                     notifiableFields.includes(f) && f !== 'lastModifiedDate'
                   );
-                  
+
                   // Always save ALL changes to DB (even non-notifiable)
                   Object.assign(existingOrder, orderData);
                   await existingOrder.save();
-                  
+
                   // Only add to notification list if there are notifiable changes
                   if (notifiableChanges.length > 0) {
                     // Check if shipping address changed
                     const shippingFields = ['shippingFullName', 'shippingAddressLine1', 'shippingCity', 'shippingState', 'shippingPostalCode'];
                     const shippingChanged = notifiableChanges.some(f => shippingFields.includes(f));
-                    
+
                     if (shippingChanged) {
                       console.log(`  🏠 SHIPPING ADDRESS CHANGED: ${ebayOrder.orderId}`);
                     }
-                    
+
                     updatedOrders.push({
                       orderId: existingOrder.orderId,
                       changedFields: notifiableChanges
@@ -1696,7 +1714,7 @@ router.post('/poll-all-sellers', requireAuth, requireRole('fulfillmentadmin', 's
 
     // Wait for all sellers to complete (parallel execution)
     const results = await Promise.allSettled(pollingPromises);
-    
+
     // Process results
     const pollResults = results.map(result => {
       if (result.status === 'fulfilled') {
@@ -1719,7 +1737,7 @@ router.post('/poll-all-sellers', requireAuth, requireRole('fulfillmentadmin', 's
       totalNewOrders,
       totalUpdatedOrders
     });
-    
+
     console.log('\n========== POLLING SUMMARY ==========');
     console.log(`Total sellers polled: ${sellers.length}`);
     console.log(`Total new orders: ${totalNewOrders}`);
@@ -1732,13 +1750,13 @@ router.post('/poll-all-sellers', requireAuth, requireRole('fulfillmentadmin', 's
 });
 
 // Poll all sellers for NEW ORDERS ONLY (Phase 1)
-router.post('/poll-new-orders', requireAuth, requireRole('fulfillmentadmin', 'superadmin','compliancemanager','hoc'), async (req, res) => {
+router.post('/poll-new-orders', requireAuth, requireRole('fulfillmentadmin', 'superadmin', 'compliancemanager', 'hoc'), async (req, res) => {
   try {
     const sellers = await Seller.find({ 'ebayTokens.access_token': { $exists: true, $ne: null } })
       .populate('user', 'username email');
-    
+
     if (sellers.length === 0) {
-      return res.json({ 
+      return res.json({
         message: 'No sellers with connected eBay accounts found',
         pollResults: [],
         totalPolled: 0,
@@ -1752,10 +1770,10 @@ router.post('/poll-new-orders', requireAuth, requireRole('fulfillmentadmin', 'su
 
     const pollingPromises = sellers.map(async (seller) => {
       const sellerName = seller.user?.username || seller.user?.email || seller._id.toString();
-      
+
       try {
         console.log(`\n[${sellerName}] Checking for new orders...`);
-        
+
         // Token refresh
         const fetchedAt = seller.ebayTokens.fetchedAt ? new Date(seller.ebayTokens.fetchedAt).getTime() : 0;
         const expiresInMs = (seller.ebayTokens.expires_in || 0) * 1000;
@@ -1803,7 +1821,7 @@ router.post('/poll-new-orders', requireAuth, requireRole('fulfillmentadmin', 'su
           const afterLatestMs = new Date(latestCreationDate).getTime() + 1000;
           const afterLatest = new Date(afterLatestMs);
           const timeDiffMinutes = (currentTimeUTC.getTime() - afterLatestMs) / (1000 * 60);
-          
+
           if (timeDiffMinutes >= 1) {
             newOrdersFilter = `creationdate:[${afterLatest.toISOString()}..${currentTimeUTC.toISOString()}]`;
             newOrdersLimit = 200;
@@ -1820,14 +1838,14 @@ router.post('/poll-new-orders', requireAuth, requireRole('fulfillmentadmin', 'su
 
           for (const ebayOrder of ebayNewOrders) {
             const existingOrder = await Order.findOne({ orderId: ebayOrder.orderId });
-            
+
             if (!existingOrder) {
               const orderData = await buildOrderData(ebayOrder, seller._id, accessToken);
               const newOrder = await Order.create(orderData);
               newOrders.push(newOrder);
               console.log(`  🆕 NEW: ${ebayOrder.orderId}`);
               await sendAutoWelcomeMessage(seller, newOrder);
-              
+
               // Fetch ad fee from eBay Finances API
               try {
                 const adFeeResult = await fetchOrderAdFee(accessToken, ebayOrder.orderId);
@@ -1873,7 +1891,7 @@ router.post('/poll-new-orders', requireAuth, requireRole('fulfillmentadmin', 'su
       totalPolled: sellers.length,
       totalNewOrders
     });
-    
+
     console.log(`\n========== NEW ORDERS SUMMARY ==========`);
     console.log(`Total new orders: ${totalNewOrders}`);
 
@@ -1884,7 +1902,7 @@ router.post('/poll-new-orders', requireAuth, requireRole('fulfillmentadmin', 'su
 });
 
 // Poll all sellers for ORDER UPDATES ONLY (Phase 2)
-router.post('/poll-order-updates', requireAuth, requireRole('fulfillmentadmin', 'superadmin','compliancemanager','hoc'), async (req, res) => {
+router.post('/poll-order-updates', requireAuth, requireRole('fulfillmentadmin', 'superadmin', 'compliancemanager', 'hoc'), async (req, res) => {
   try {
     // Helper function to normalize dates for comparison (ignore milliseconds/format)
     function normalizeDateForComparison(date) {
@@ -1903,7 +1921,7 @@ router.post('/poll-order-updates', requireAuth, requireRole('fulfillmentadmin', 
       // Skip system fields
       const systemFields = ['_id', '__v', 'seller', 'updatedAt', 'createdAt'];
       if (systemFields.includes(fieldName)) return false;
-      
+
       // Date fields - compare Unix timestamps (ignore milliseconds)
       const dateFields = ['creationDate', 'lastModifiedDate', 'dateSold', 'shipByDate', 'estimatedDelivery'];
       if (dateFields.includes(fieldName)) {
@@ -1911,26 +1929,26 @@ router.post('/poll-order-updates', requireAuth, requireRole('fulfillmentadmin', 
         const newTime = normalizeDateForComparison(newValue);
         return oldTime !== newTime;
       }
-      
+
       // Null/undefined checks
       if (oldValue === null || oldValue === undefined) {
         return newValue !== null && newValue !== undefined;
       }
-      
+
       // Objects/Arrays - deep comparison
       if (typeof newValue === 'object' && newValue !== null) {
         return JSON.stringify(oldValue) !== JSON.stringify(newValue);
       }
-      
+
       // Primitives - direct comparison
       return oldValue !== newValue;
     }
 
     const sellers = await Seller.find({ 'ebayTokens.access_token': { $exists: true, $ne: null } })
       .populate('user', 'username email');
-    
+
     if (sellers.length === 0) {
-      return res.json({ 
+      return res.json({
         message: 'No sellers with connected eBay accounts found',
         pollResults: [],
         totalPolled: 0,
@@ -1948,10 +1966,10 @@ router.post('/poll-order-updates', requireAuth, requireRole('fulfillmentadmin', 
 
     const pollingPromises = sellers.map(async (seller) => {
       const sellerName = seller.user?.username || seller.user?.email || seller._id.toString();
-      
+
       try {
         console.log(`\n[${sellerName}] Checking for order updates...`);
-        
+
         // Token refresh
         const fetchedAt = seller.ebayTokens.fetchedAt ? new Date(seller.ebayTokens.fetchedAt).getTime() : 0;
         const expiresInMs = (seller.ebayTokens.expires_in || 0) * 1000;
@@ -1994,7 +2012,7 @@ router.post('/poll-order-updates', requireAuth, requireRole('fulfillmentadmin', 
         if (recentOrders.length > 0) {
           const checkFromDate = lastPolledAt || thirtyDaysAgo;
           const modifiedFilter = `lastmodifieddate:[${checkFromDate.toISOString()}..${currentTimeUTC.toISOString()}]`;
-          
+
           console.log(`[${sellerName}] Checking modifications since ${checkFromDate.toISOString()}`);
 
           let offset = 0;
@@ -2021,23 +2039,23 @@ router.post('/poll-order-updates', requireAuth, requireRole('fulfillmentadmin', 
             const relevantOrders = batchOrders.filter(o => recentOrderIdSet.has(o.orderId));
 
             for (const ebayOrder of relevantOrders) {
-              const existingOrder = await Order.findOne({ 
+              const existingOrder = await Order.findOne({
                 orderId: ebayOrder.orderId,
-                seller: seller._id 
+                seller: seller._id
               });
 
               if (existingOrder) {
                 const ebayModTime = new Date(ebayOrder.lastModifiedDate).getTime();
                 const dbModTime = new Date(existingOrder.lastModifiedDate).getTime();
-                
+
                 // OPTIMIZATION: Skip if not actually modified
                 if (ebayModTime <= dbModTime) {
                   continue; // No changes, skip this order
                 }
-                
+
                 // ONLY NOW fetch full order data (includes expensive tracking lookup)
                 const orderData = await buildOrderData(ebayOrder, seller._id, accessToken);
-                
+
                 // Define fields that should trigger notifications
                 const notifiableFields = [
                   'cancelState',
@@ -2054,7 +2072,7 @@ router.post('/poll-order-updates', requireAuth, requireRole('fulfillmentadmin', 
                   'shippingCountry'
                   // NOTE: buyerCheckoutNotes is NOT included - updates DB silently
                 ];
-                
+
                 // Detect changed fields with smart comparison
                 const changedFields = [];
                 for (const key of Object.keys(orderData)) {
@@ -2062,16 +2080,16 @@ router.post('/poll-order-updates', requireAuth, requireRole('fulfillmentadmin', 
                     changedFields.push(key);
                   }
                 }
-                
+
                 // Filter to only notifiable fields (exclude lastModifiedDate)
-                const notifiableChanges = changedFields.filter(f => 
+                const notifiableChanges = changedFields.filter(f =>
                   notifiableFields.includes(f) && f !== 'lastModifiedDate'
                 );
-                
+
                 // Always save ALL changes to DB (even non-notifiable)
                 Object.assign(existingOrder, orderData);
                 await existingOrder.save();
-                
+
                 // Fetch ad fee if not already set
                 if (!existingOrder.adFeeGeneral || existingOrder.adFeeGeneral === 0) {
                   try {
@@ -2085,17 +2103,17 @@ router.post('/poll-order-updates', requireAuth, requireRole('fulfillmentadmin', 
                     console.log(`  ⚠️ Ad fee fetch failed for ${ebayOrder.orderId}: ${adFeeErr.message}`);
                   }
                 }
-                
+
                 // Only add to notification list if there are notifiable changes
                 if (notifiableChanges.length > 0) {
                   // Check if shipping address changed
                   const shippingFields = ['shippingFullName', 'shippingAddressLine1', 'shippingCity', 'shippingState', 'shippingPostalCode'];
                   const shippingChanged = notifiableChanges.some(f => shippingFields.includes(f));
-                  
+
                   if (shippingChanged) {
                     console.log(`  🏠 SHIPPING ADDRESS CHANGED: ${ebayOrder.orderId}`);
                   }
-                  
+
                   updatedOrders.push({
                     orderId: existingOrder.orderId,
                     changedFields: notifiableChanges
@@ -2119,7 +2137,7 @@ router.post('/poll-order-updates', requireAuth, requireRole('fulfillmentadmin', 
         // Update lastPolledAt timestamp
         seller.lastPolledAt = new Date(nowUTC);
         await seller.save();
-        
+
         console.log(`[${sellerName}] ✅ Complete: ${updatedOrders.length} updated`);
 
         return {
@@ -2151,7 +2169,7 @@ router.post('/poll-order-updates', requireAuth, requireRole('fulfillmentadmin', 
       totalPolled: sellers.length,
       totalUpdatedOrders
     });
-    
+
     console.log(`\n========== ORDER UPDATES SUMMARY ==========`);
     console.log(`Total updated orders: ${totalUpdatedOrders}`);
 
@@ -2171,21 +2189,21 @@ async function fetchAllOrdersWithPagination(accessToken, filter, sellerName) {
   const limit = 200; // eBay max per request
   let hasMore = true;
   let totalOrders = 0;
-  
+
   console.log(`[${sellerName}] Starting paginated fetch...`);
-  
+
   while (hasMore) {
     try {
       const params = {
         filter: filter,
         limit: limit
       };
-      
+
       // Only add offset if it's greater than 0
       if (offset > 0) {
         params.offset = offset;
       }
-      
+
       const response = await axios.get('https://api.ebay.com/sell/fulfillment/v1/order', {
         headers: {
           Authorization: `Bearer ${accessToken}`,
@@ -2193,14 +2211,14 @@ async function fetchAllOrdersWithPagination(accessToken, filter, sellerName) {
         },
         params
       });
-      
+
       const orders = response.data.orders || [];
       totalOrders = response.data.total || orders.length;
-      
+
       allOrders.push(...orders);
-      
+
       console.log(`[${sellerName}] Fetched ${orders.length} orders at offset ${offset} (total so far: ${allOrders.length}/${totalOrders})`);
-      
+
       // Check if there are more orders to fetch
       if (allOrders.length >= totalOrders || orders.length < limit) {
         hasMore = false;
@@ -2214,7 +2232,7 @@ async function fetchAllOrdersWithPagination(accessToken, filter, sellerName) {
       hasMore = false; // Stop on error
     }
   }
-  
+
   console.log(`[${sellerName}] ✅ Pagination complete: ${allOrders.length} orders`);
   return allOrders;
 }
@@ -2225,7 +2243,7 @@ async function buildOrderData(ebayOrder, sellerId, accessToken) {
   const fulfillmentInstr = ebayOrder.fulfillmentStartInstructions?.[0] || {};
   const shipTo = fulfillmentInstr.shippingStep?.shipTo || {};
   const buyerAddr = `${shipTo.contactAddress?.addressLine1 || ''}, ${shipTo.contactAddress?.city || ''}, ${shipTo.contactAddress?.stateOrProvince || ''}, ${shipTo.contactAddress?.postalCode || ''}, ${shipTo.contactAddress?.countryCode || ''}`.trim();
-  
+
   const trackingNumber = await extractTrackingNumber(ebayOrder.fulfillmentHrefs, accessToken);
   const purchaseMarketplaceId = lineItem.purchaseMarketplaceId || '';
 
@@ -2333,12 +2351,12 @@ router.patch('/orders/:orderId/item-status', async (req, res) => {
 
   try {
     const updateData = { itemStatus };
-    
+
     // If resolving, save the resolvedFrom field
     if (itemStatus === 'Resolved' && resolvedFrom) {
       updateData.resolvedFrom = resolvedFrom;
     }
-    
+
     const order = await Order.findByIdAndUpdate(
       orderId,
       updateData,
@@ -2417,11 +2435,11 @@ router.patch('/orders/:orderId/fulfillment-notes', async (req, res) => {
 // Fetch return requests from eBay Post-Order API and store in DB
 
 // Fetch return requests from eBay Post-Order API and store in DB
-router.post('/fetch-returns', requireAuth, requireRole('fulfillmentadmin', 'superadmin','hoc', 'compliancemanager'), async (req, res) => {
+router.post('/fetch-returns', requireAuth, requireRole('fulfillmentadmin', 'superadmin', 'hoc', 'compliancemanager'), async (req, res) => {
   try {
     const sellers = await Seller.find({ 'ebayTokens.access_token': { $exists: true } })
       .populate('user', 'username');
-    
+
     if (sellers.length === 0) {
       return res.json({ message: 'No sellers with eBay tokens found', totalReturns: 0 });
     }
@@ -2469,7 +2487,7 @@ router.post('/fetch-returns', requireAuth, requireRole('fulfillmentadmin', 'supe
           // Fetch return requests
           const returnUrl = 'https://api.ebay.com/post-order/v2/return/search';
           const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
-          
+
           const returnRes = await axios.get(returnUrl, {
             headers: {
               'Authorization': `IAF ${accessToken}`,
@@ -2510,7 +2528,7 @@ router.post('/fetch-returns', requireAuth, requireRole('fulfillmentadmin', 'supe
               returnQuantity: itemInfo.returnQuantity,
               refundAmount: {
                 // FIX 1: Force String to match Mongoose Schema "String"
-                value: String(sellerRefund.value || 0), 
+                value: String(sellerRefund.value || 0),
                 currency: sellerRefund.currency
               },
               creationDate: creationInfo.creationDate?.value ? new Date(creationInfo.creationDate.value) : null,
@@ -2521,7 +2539,7 @@ router.post('/fetch-returns', requireAuth, requireRole('fulfillmentadmin', 'supe
             };
 
             const existing = await Return.findOne({ returnId: ebayReturn.returnId });
-            
+
             if (existing) {
               // --- HELPER FUNCTIONS FOR COMPARISON ---
               // Convert to seconds (ignore milliseconds)
@@ -2531,39 +2549,39 @@ router.post('/fetch-returns', requireAuth, requireRole('fulfillmentadmin', 'supe
 
               // --- COMPARISON LOGIC ---
               const statusChanged = existing.returnStatus !== returnData.returnStatus;
-              
+
               // FIX 2: Compare as Strings
               const refundChanged = safeStr(existing.refundAmount?.value) !== safeStr(returnData.refundAmount?.value);
-              
+
               // FIX 3: Compare as Unix Timestamps (seconds)
               const responseDateChanged = getUnix(existing.responseDate) !== getUnix(returnData.responseDate);
               const creationDateChanged = getUnix(existing.creationDate) !== getUnix(returnData.creationDate);
 
               if (statusChanged || refundChanged || responseDateChanged || creationDateChanged) {
-                 
-                 // DIAGNOSTIC LOG: This will show you exactly what changed in your terminal
-                 console.log(`[Update Triggered] Return ${ebayReturn.returnId}:`);
-                 if (statusChanged) console.log(`   - Status: ${existing.returnStatus} -> ${returnData.returnStatus}`);
-                 if (refundChanged) console.log(`   - Refund: ${existing.refundAmount?.value} -> ${returnData.refundAmount?.value}`);
-                 if (responseDateChanged) console.log(`   - RespDate: ${existing.responseDate} -> ${returnData.responseDate}`);
-                 if (creationDateChanged) console.log(`   - CreateDate: ${existing.creationDate} -> ${returnData.creationDate}`);
 
-                 // Use .set() to update fields
-                 existing.set(returnData);
-                 await existing.save();
-                 updatedReturns++;
-                 
-                 // Track update details for frontend snackbar
-                 if (!updateDetails) updateDetails = [];
-                 updateDetails.push({
-                   returnId: ebayReturn.returnId,
-                   orderId: returnData.orderId,
-                   changes: {
-                     ...(statusChanged && { status: { from: existing.returnStatus, to: returnData.returnStatus } }),
-                     ...(refundChanged && { refund: { from: existing.refundAmount?.value, to: returnData.refundAmount?.value } })
-                   }
-                 });
-              } 
+                // DIAGNOSTIC LOG: This will show you exactly what changed in your terminal
+                console.log(`[Update Triggered] Return ${ebayReturn.returnId}:`);
+                if (statusChanged) console.log(`   - Status: ${existing.returnStatus} -> ${returnData.returnStatus}`);
+                if (refundChanged) console.log(`   - Refund: ${existing.refundAmount?.value} -> ${returnData.refundAmount?.value}`);
+                if (responseDateChanged) console.log(`   - RespDate: ${existing.responseDate} -> ${returnData.responseDate}`);
+                if (creationDateChanged) console.log(`   - CreateDate: ${existing.creationDate} -> ${returnData.creationDate}`);
+
+                // Use .set() to update fields
+                existing.set(returnData);
+                await existing.save();
+                updatedReturns++;
+
+                // Track update details for frontend snackbar
+                if (!updateDetails) updateDetails = [];
+                updateDetails.push({
+                  returnId: ebayReturn.returnId,
+                  orderId: returnData.orderId,
+                  changes: {
+                    ...(statusChanged && { status: { from: existing.returnStatus, to: returnData.returnStatus } }),
+                    ...(refundChanged && { refund: { from: existing.refundAmount?.value, to: returnData.refundAmount?.value } })
+                  }
+                });
+              }
             } else {
               await Return.create(returnData);
               newReturns++;
@@ -2613,13 +2631,13 @@ router.post('/fetch-returns', requireAuth, requireRole('fulfillmentadmin', 'supe
 
 router.get('/stored-returns', async (req, res) => {
   const { sellerId, status, reason, startDate, endDate, page = 1, limit = 50 } = req.query;
-  
+
   try {
     let query = {};
     if (sellerId) query.seller = sellerId;
     if (status) query.returnStatus = status;
     if (reason) query.returnReason = reason;
-    
+
     // Date range filter on creationDate
     if (startDate || endDate) {
       query.creationDate = {};
@@ -2653,8 +2671,8 @@ router.get('/stored-returns', async (req, res) => {
     const totalCount = await Return.countDocuments(query);
     const totalPages = Math.ceil(totalCount / limitNum);
 
-    res.json({ 
-      returns, 
+    res.json({
+      returns,
       pagination: {
         currentPage: pageNum,
         totalPages,
@@ -2675,7 +2693,7 @@ router.post('/fetch-inr-cases', requireAuth, requireRole('fulfillmentadmin', 'su
   try {
     const sellers = await Seller.find({ 'ebayTokens.access_token': { $exists: true } })
       .populate('user', 'username');
-    
+
     if (sellers.length === 0) {
       return res.json({ message: 'No sellers with eBay tokens found', totalCases: 0 });
     }
@@ -2723,7 +2741,7 @@ router.post('/fetch-inr-cases', requireAuth, requireRole('fulfillmentadmin', 'su
           // Fetch INR cases from Post-Order API
           const inquiryUrl = 'https://api.ebay.com/post-order/v2/inquiry/search';
           const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
-          
+
           const inquiryRes = await axios.get(inquiryUrl, {
             headers: {
               'Authorization': `IAF ${accessToken}`,
@@ -2760,45 +2778,45 @@ router.post('/fetch-inr-cases', requireAuth, requireRole('fulfillmentadmin', 'su
               orderId: ebayCase.orderId || ebayCase.orderNumber,
               buyerUsername: ebayCase.buyerLoginName,
               status: ebayCase.state || ebayCase.status || 'OPEN',
-              
+
               // Dates
               creationDate: ebayCase.creationDate?.value ? new Date(ebayCase.creationDate.value) : null,
-              sellerResponseDueDate: ebayCase.sellerResponseDue?.respondByDate?.value 
+              sellerResponseDueDate: ebayCase.sellerResponseDue?.respondByDate?.value
                 ? new Date(ebayCase.sellerResponseDue.respondByDate.value) : null,
               escalationDate: ebayCase.escalationDate?.value ? new Date(ebayCase.escalationDate.value) : null,
               closedDate: ebayCase.closedDate?.value ? new Date(ebayCase.closedDate.value) : null,
-              
+
               // Item Info
               itemId: ebayCase.itemId,
               itemTitle: ebayCase.itemTitle,
-              
+
               // Amount
               claimAmount: {
                 value: String(ebayCase.claimAmount?.value || 0),
                 currency: ebayCase.claimAmount?.currency || 'USD'
               },
-              
+
               // Resolution
               resolution: ebayCase.resolution || null,
               sellerResponse: ebayCase.sellerResponse || null,
-              
+
               rawData: ebayCase
             };
 
             const existing = await Case.findOne({ caseId: ebayCase.inquiryId });
-            
+
             if (existing) {
               // Compare for changes
               const statusChanged = existing.status !== caseData.status;
-              const dueDateChanged = (existing.sellerResponseDueDate?.getTime() || 0) !== 
+              const dueDateChanged = (existing.sellerResponseDueDate?.getTime() || 0) !==
                 (caseData.sellerResponseDueDate?.getTime() || 0);
-              
+
               if (statusChanged || dueDateChanged) {
                 console.log(`[Update] Case ${ebayCase.inquiryId}: Status ${existing.status} -> ${caseData.status}`);
                 existing.set(caseData);
                 await existing.save();
                 updatedCases++;
-                
+
                 updateDetails.push({
                   caseId: ebayCase.inquiryId,
                   orderId: caseData.orderId,
@@ -2856,7 +2874,7 @@ router.post('/fetch-inr-cases', requireAuth, requireRole('fulfillmentadmin', 'su
 // Get stored INR cases from database
 router.get('/stored-inr-cases', async (req, res) => {
   const { sellerId, status, caseType, limit = 200 } = req.query;
-  
+
   try {
     let query = {};
     if (sellerId) query.seller = sellerId;
@@ -2891,7 +2909,7 @@ router.post('/fetch-payment-disputes', requireAuth, requireRole('fulfillmentadmi
   try {
     const sellers = await Seller.find({ 'ebayTokens.access_token': { $exists: true } })
       .populate('user', 'username');
-    
+
     if (sellers.length === 0) {
       return res.json({ message: 'No sellers with eBay tokens found', totalDisputes: 0 });
     }
@@ -2941,7 +2959,7 @@ router.post('/fetch-payment-disputes', requireAuth, requireRole('fulfillmentadmi
           // IMPORTANT: Requires sell.payment.dispute scope (different from sell.fulfillment)
           // Docs: https://developer.ebay.com/api-docs/sell/fulfillment/resources/payment_dispute/methods/getPaymentDisputeSummaries
           const disputeUrl = 'https://apiz.ebay.com/sell/fulfillment/v1/payment_dispute_summary';
-          
+
           let disputes = [];
           try {
             const disputeRes = await axios.get(disputeUrl, {
@@ -2961,7 +2979,7 @@ router.post('/fetch-payment-disputes', requireAuth, requireRole('fulfillmentadmi
             const errMsg = apiErr.response?.data?.errors?.[0]?.message || apiErr.message;
             const errCode = apiErr.response?.status;
             console.log(`[Fetch Payment Disputes] Seller ${sellerName}: API Error - ${errCode} ${errMsg}`);
-            
+
             // 404 might mean no disputes, 403 means missing scope
             if (errCode === 404) {
               disputes = [];
@@ -2985,46 +3003,46 @@ router.post('/fetch-payment-disputes', requireAuth, requireRole('fulfillmentadmi
               paymentDisputeId: ebayDispute.paymentDisputeId,
               orderId: ebayDispute.orderId,
               buyerUsername: ebayDispute.buyerUsername,
-              
+
               // Status & Reason
               paymentDisputeStatus: ebayDispute.paymentDisputeStatus,
               reason: ebayDispute.reason,
-              
+
               // Dates
               openDate: ebayDispute.openDate ? new Date(ebayDispute.openDate) : null,
               respondByDate: ebayDispute.respondByDate ? new Date(ebayDispute.respondByDate) : null,
               closedDate: ebayDispute.closedDate ? new Date(ebayDispute.closedDate) : null,
-              
+
               // Amounts
               amount: {
                 value: String(ebayDispute.amount?.value || 0),
                 currency: ebayDispute.amount?.currency || 'USD'
               },
-              
+
               // Resolution
               sellerProtectionDecision: ebayDispute.sellerResponse?.sellerProtectionDecision || null,
               resolution: ebayDispute.resolution?.resolutionType || null,
-              
+
               // Evidence
               evidenceDeadline: ebayDispute.evidenceDeadline ? new Date(ebayDispute.evidenceDeadline) : null,
-              
+
               rawData: ebayDispute
             };
 
             const existing = await PaymentDispute.findOne({ paymentDisputeId: ebayDispute.paymentDisputeId });
-            
+
             if (existing) {
               // Compare for changes
               const statusChanged = existing.paymentDisputeStatus !== disputeData.paymentDisputeStatus;
-              const dueDateChanged = (existing.respondByDate?.getTime() || 0) !== 
+              const dueDateChanged = (existing.respondByDate?.getTime() || 0) !==
                 (disputeData.respondByDate?.getTime() || 0);
-              
+
               if (statusChanged || dueDateChanged) {
                 console.log(`[Update] Dispute ${ebayDispute.paymentDisputeId}: Status ${existing.paymentDisputeStatus} -> ${disputeData.paymentDisputeStatus}`);
                 existing.set(disputeData);
                 await existing.save();
                 updatedDisputes++;
-                
+
                 updateDetails.push({
                   paymentDisputeId: ebayDispute.paymentDisputeId,
                   orderId: disputeData.orderId,
@@ -3082,7 +3100,7 @@ router.post('/fetch-payment-disputes', requireAuth, requireRole('fulfillmentadmi
 // Get stored Payment Disputes from database
 router.get('/stored-payment-disputes', async (req, res) => {
   const { sellerId, status, reason, limit = 200 } = req.query;
-  
+
   try {
     let query = {};
     if (sellerId) query.seller = sellerId;
@@ -3113,7 +3131,7 @@ router.get('/stored-payment-disputes', async (req, res) => {
 
 // 1. HEAVY SYNC: Fetch Inbox (Manual Trigger)
 // 1. HEAVY SYNC: Fetch Inbox (Smart Polling)
-router.post('/sync-inbox', requireAuth, requireRole('fulfillmentadmin', 'superadmin','hoc', 'compliancemanager'), async (req, res) => {
+router.post('/sync-inbox', requireAuth, requireRole('fulfillmentadmin', 'superadmin', 'hoc', 'compliancemanager'), async (req, res) => {
   try {
     console.log('[Sync Inbox] Starting smart message sync...');
     const sellers = await Seller.find({ 'ebayTokens.access_token': { $exists: true } }).populate('user', 'username email');
@@ -3129,18 +3147,18 @@ router.post('/sync-inbox', requireAuth, requireRole('fulfillmentadmin', 'superad
         // 2. Determine Time Window (Smart Polling)
         const now = new Date();
         let startTime;
-        
+
         if (seller.lastMessagePolledAt) {
-            // INCREMENTAL SYNC: Fetch from last poll time
-            // We subtract 15 minutes overlap to ensure no messages are missed due to server latency
-            startTime = new Date(new Date(seller.lastMessagePolledAt).getTime() - 15 * 60 * 1000);
-            console.log(`[${sellerName}] Incremental sync from: ${startTime.toISOString()}`);
+          // INCREMENTAL SYNC: Fetch from last poll time
+          // We subtract 15 minutes overlap to ensure no messages are missed due to server latency
+          startTime = new Date(new Date(seller.lastMessagePolledAt).getTime() - 15 * 60 * 1000);
+          console.log(`[${sellerName}] Incremental sync from: ${startTime.toISOString()}`);
         } else {
-            // INITIAL SYNC: Fetch last 12 Days
-            startTime = new Date(now.getTime() - 12 * 24 * 60 * 60 * 1000);
-            console.log(`[${sellerName}] First-time sync from: ${startTime.toISOString()} (Last 10 Days)`);
+          // INITIAL SYNC: Fetch last 12 Days
+          startTime = new Date(now.getTime() - 12 * 24 * 60 * 60 * 1000);
+          console.log(`[${sellerName}] First-time sync from: ${startTime.toISOString()} (Last 10 Days)`);
         }
-        
+
         const startTimeStr = startTime.toISOString();
         const endTimeStr = now.toISOString();
 
@@ -3164,7 +3182,7 @@ router.post('/sync-inbox', requireAuth, requireRole('fulfillmentadmin', 'superad
 
         const response = await axios.post('https://api.ebay.com/ws/api.dll', xmlRequest, {
           headers: {
-            'X-EBAY-API-SITEID': '0', 
+            'X-EBAY-API-SITEID': '0',
             'X-EBAY-API-COMPATIBILITY-LEVEL': '1423',
             'X-EBAY-API-CALL-NAME': 'GetMemberMessages',
             'Content-Type': 'text/xml'
@@ -3174,24 +3192,24 @@ router.post('/sync-inbox', requireAuth, requireRole('fulfillmentadmin', 'superad
         const result = await parseStringPromise(response.data);
 
         if (result.GetMemberMessagesResponse.Ack[0] === 'Failure') {
-            const error = result.GetMemberMessagesResponse.Errors?.[0]?.LongMessage?.[0];
-            console.error(`eBay API Failure for seller ${seller._id}:`, error);
-            syncResults.push({ sellerName, newMessages: 0, error: error });
-            continue;
+          const error = result.GetMemberMessagesResponse.Errors?.[0]?.LongMessage?.[0];
+          console.error(`eBay API Failure for seller ${seller._id}:`, error);
+          syncResults.push({ sellerName, newMessages: 0, error: error });
+          continue;
         }
 
         const messages = result.GetMemberMessagesResponse.MemberMessage?.[0]?.MemberMessageExchange || [];
-        
+
         // 4. Process Messages
         let newForThisSeller = 0;
         for (const msg of messages) {
           const isNew = await processEbayMessage(msg, seller);
           if (isNew) {
-              newForThisSeller++;
-              totalNew++;
+            newForThisSeller++;
+            totalNew++;
           }
         }
-        
+
         console.log(`[Sync Inbox] Seller ${sellerName}: Fetched ${messages.length}. Saved ${newForThisSeller} new.`);
         syncResults.push({ sellerName, newMessages: newForThisSeller, fetched: messages.length });
 
@@ -3217,9 +3235,9 @@ router.post('/sync-inbox', requireAuth, requireRole('fulfillmentadmin', 'superad
 //LIGHT SYNC: Active Thread Poll (Auto Interval)
 // Filters by SenderID to be lightweight
 // 2. LIGHT SYNC: Active Thread Poll
-router.post('/sync-thread', requireAuth, requireRole('fulfillmentadmin', 'superadmin','hoc', 'compliancemanager'), async (req, res) => {
+router.post('/sync-thread', requireAuth, requireRole('fulfillmentadmin', 'superadmin', 'hoc', 'compliancemanager'), async (req, res) => {
   const { sellerId, buyerUsername, itemId } = req.body;
-  
+
   if (!sellerId || !buyerUsername) return res.status(400).json({ error: 'Missing identifiers' });
 
   try {
@@ -3228,7 +3246,7 @@ router.post('/sync-thread', requireAuth, requireRole('fulfillmentadmin', 'supera
 
     // 1. Ensure Token is Valid
     const token = await ensureValidToken(seller);
-    
+
     // 2. Time Filters
     const now = new Date();
     const startTime = new Date(now.getTime() - 2 * 24 * 60 * 60 * 1000).toISOString();
@@ -3263,7 +3281,7 @@ router.post('/sync-thread', requireAuth, requireRole('fulfillmentadmin', 'supera
 
     const result = await parseStringPromise(response.data);
     const messages = result.GetMemberMessagesResponse.MemberMessage?.[0]?.MemberMessageExchange || [];
-    
+
     let hasNew = false;
     for (const msg of messages) {
       const isNew = await processEbayMessage(msg, seller);
@@ -3279,7 +3297,7 @@ router.post('/sync-thread', requireAuth, requireRole('fulfillmentadmin', 'supera
 
 
 // 3. SEND MESSAGE (Chat Window)
-router.post('/send-message', requireAuth, requireRole('fulfillmentadmin', 'superadmin','hoc', 'compliancemanager'), async (req, res) => {
+router.post('/send-message', requireAuth, requireRole('fulfillmentadmin', 'superadmin', 'hoc', 'compliancemanager'), async (req, res) => {
   const { orderId, buyerUsername, itemId, body, subject } = req.body;
 
   try {
@@ -3288,14 +3306,14 @@ router.post('/send-message', requireAuth, requireRole('fulfillmentadmin', 'super
     let finalBuyer = buyerUsername;
 
     if (orderId) {
-        const order = await Order.findOne({ orderId }).populate('seller');
-        if (!order) return res.status(404).json({ error: 'Order not found' });
-        seller = order.seller;
-        finalItemId = order.lineItems?.[0]?.legacyItemId;
-        finalBuyer = order.buyer.username;
+      const order = await Order.findOne({ orderId }).populate('seller');
+      if (!order) return res.status(404).json({ error: 'Order not found' });
+      seller = order.seller;
+      finalItemId = order.lineItems?.[0]?.legacyItemId;
+      finalBuyer = order.buyer.username;
     } else {
-        const prevMsg = await Message.findOne({ buyerUsername, itemId }).populate('seller');
-        if (prevMsg) seller = prevMsg.seller;
+      const prevMsg = await Message.findOne({ buyerUsername, itemId }).populate('seller');
+      if (prevMsg) seller = prevMsg.seller;
     }
 
     if (!seller) return res.status(400).json({ error: 'Could not determine seller context' });
@@ -3361,7 +3379,7 @@ router.post('/send-message', requireAuth, requireRole('fulfillmentadmin', 'super
 router.get('/chat/threads', requireAuth, async (req, res) => {
   try {
     const { sellerId, page = 1, limit = 20, search = '' } = req.query;
-    
+
     const pageNum = parseInt(page);
     const limitNum = parseInt(limit);
     const skip = (pageNum - 1) * limitNum;
@@ -3382,10 +3400,10 @@ router.get('/chat/threads', requireAuth, async (req, res) => {
     // 3. Group by conversation
     pipeline.push({
       $group: {
-        _id: { 
-          orderId: "$orderId", 
-          buyer: "$buyerUsername", 
-          item: "$itemId" 
+        _id: {
+          orderId: "$orderId",
+          buyer: "$buyerUsername",
+          item: "$itemId"
         },
         sellerId: { $first: "$seller" },
         lastMessage: { $first: "$body" },
@@ -3393,7 +3411,7 @@ router.get('/chat/threads', requireAuth, async (req, res) => {
         sender: { $first: "$sender" },
         itemTitle: { $first: "$itemTitle" },
         messageType: { $first: "$messageType" },
-        unreadCount: { 
+        unreadCount: {
           $sum: { $cond: [{ $and: [{ $eq: ["$read", false] }, { $eq: ["$sender", "BUYER"] }] }, 1, 0] }
         }
       }
@@ -3443,7 +3461,7 @@ router.get('/chat/threads', requireAuth, async (req, res) => {
 
     // 7. FINAL SORT & PAGINATION
     pipeline.push({ $sort: { lastDate: -1 } });
-    
+
     // Get Total Count (for frontend to know when to stop loading)
     // We use $facet to get both data and count in one query
     const facetedPipeline = [
@@ -3457,7 +3475,7 @@ router.get('/chat/threads', requireAuth, async (req, res) => {
     ];
 
     const result = await Message.aggregate(facetedPipeline);
-    
+
     const threads = result[0].data;
     const total = result[0].metadata[0] ? result[0].metadata[0].total : 0;
 
@@ -3475,7 +3493,7 @@ router.get('/chat/threads', requireAuth, async (req, res) => {
 // 5. GET MESSAGES (Chat Window)
 router.get('/chat/messages', requireAuth, async (req, res) => {
   const { orderId, buyerUsername, itemId } = req.query;
-  
+
   try {
     let query = {};
     if (orderId) {
@@ -3515,7 +3533,7 @@ router.get('/chat/search-order', requireAuth, async (req, res) => {
     const threadData = {
       orderId: order.orderId,
       buyerUsername: order.buyer.username,
-      buyerName: fullName, 
+      buyerName: fullName,
       itemId: order.lineItems?.[0]?.legacyItemId,
       itemTitle: order.productName,
       sellerId: order.seller._id,
@@ -3524,7 +3542,7 @@ router.get('/chat/search-order', requireAuth, async (req, res) => {
       sender: 'SYSTEM',
       unreadCount: 0,
       messageType: 'ORDER',
-      isNew: true 
+      isNew: true
     };
 
     res.json(threadData);
@@ -3537,11 +3555,11 @@ router.get('/chat/search-order', requireAuth, async (req, res) => {
 
 // Fetch buyer messages/inquiries from eBay Post-Order API and store in DB
 // Fetch buyer messages/inquiries from eBay Post-Order API and store in DB
-router.post('/fetch-messages', requireAuth, requireRole('fulfillmentadmin', 'superadmin','hoc', 'compliancemanager'), async (req, res) => {
+router.post('/fetch-messages', requireAuth, requireRole('fulfillmentadmin', 'superadmin', 'hoc', 'compliancemanager'), async (req, res) => {
   try {
     const sellers = await Seller.find({ 'ebayTokens.access_token': { $exists: true } })
       .populate('user', 'username');
-    
+
     if (sellers.length === 0) {
       return res.json({ message: 'No sellers with eBay tokens found', totalMessages: 0 });
     }
@@ -3589,7 +3607,7 @@ router.post('/fetch-messages', requireAuth, requireRole('fulfillmentadmin', 'sup
           // Fetch inquiries
           const inquiryUrl = 'https://api.ebay.com/post-order/v2/inquiry/search';
           const ninetyDaysAgo = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000).toISOString();
-          
+
           const inquiryRes = await axios.get(inquiryUrl, {
             headers: {
               'Authorization': `IAF ${accessToken}`,
@@ -3621,7 +3639,7 @@ router.post('/fetch-messages', requireAuth, requireRole('fulfillmentadmin', 'sup
               messageType: 'INQUIRY',
               inquiryStatus: inquiry.state || inquiry.status, // API uses 'state' usually
               itemId: inquiry.itemId,
-              itemTitle: inquiry.itemTitle, 
+              itemTitle: inquiry.itemTitle,
               isResolved: ['CLOSED', 'SELLER_CLOSED'].includes(inquiry.state),
               // FIX: Dates are objects { value: "..." }
               creationDate: inquiry.creationDate?.value ? new Date(inquiry.creationDate.value) : null,
@@ -3683,7 +3701,7 @@ router.post('/fetch-messages', requireAuth, requireRole('fulfillmentadmin', 'sup
 // Get stored messages from database
 router.get('/stored-messages', async (req, res) => {
   const { sellerId, isResolved, limit = 100 } = req.query;
-  
+
   try {
     let query = {};
     if (sellerId) {
@@ -3698,7 +3716,7 @@ router.get('/stored-messages', async (req, res) => {
       .sort({ creationDate: -1 })
       .limit(parseInt(limit));
 
-    res.json({ 
+    res.json({
       messages,
       totalMessages: messages.length
     });
@@ -3710,7 +3728,7 @@ router.get('/stored-messages', async (req, res) => {
 
 
 // Mark message as resolved
-router.patch('/messages/:messageId/resolve', requireAuth, requireRole('fulfillmentadmin', 'superadmin','hoc', 'compliancemanager'), async (req, res) => {
+router.patch('/messages/:messageId/resolve', requireAuth, requireRole('fulfillmentadmin', 'superadmin', 'hoc', 'compliancemanager'), async (req, res) => {
   const { messageId } = req.params;
   const { isResolved } = req.body;
 
@@ -3732,7 +3750,7 @@ router.patch('/messages/:messageId/resolve', requireAuth, requireRole('fulfillme
       message.resolvedAt = null;
       message.resolvedBy = null;
     }
-    
+
     await message.save();
 
     res.json({ success: true, message });
@@ -3764,13 +3782,13 @@ router.post('/sync-listings', requireAuth, async (req, res) => {
 
   try {
     const seller = await Seller.findById(sellerId);
-    if(!seller) return res.status(404).json({error: "Seller not found"});
+    if (!seller) return res.status(404).json({ error: "Seller not found" });
 
     const token = await ensureValidToken(seller);
 
     // --- DATE LOGIC ---
     // Req: Nov 27, 2025 at 5:00 AM IST -> Nov 26, 23:30 UTC
-    const hardStartDate = new Date('2025-11-26T23:30:00Z'); 
+    const hardStartDate = new Date('2025-11-26T23:30:00Z');
     const nov11StartDate = new Date('2025-11-11T09:00:00Z');
 
     // 1. Calculate count (This is correct now!)
@@ -3779,21 +3797,21 @@ router.post('/sync-listings', requireAuth, async (req, res) => {
     let startTimeFrom;
 
     if (listingCount === 0) {
-        // CASE A: NEW SELLER (Zero Listings)
-        console.log(`[Sync Listings] New seller detected (0 listings). Starting sync from Nov 11 (PST).`);
-        startTimeFrom = nov11StartDate;
+      // CASE A: NEW SELLER (Zero Listings)
+      console.log(`[Sync Listings] New seller detected (0 listings). Starting sync from Nov 11 (PST).`);
+      startTimeFrom = nov11StartDate;
     } else {
-        // CASE B: EXISTING SELLER
-        // FIX: Use 'hardStartDate' variable name here
-        startTimeFrom = seller.lastListingPolledAt || hardStartDate;
+      // CASE B: EXISTING SELLER
+      // FIX: Use 'hardStartDate' variable name here
+      startTimeFrom = seller.lastListingPolledAt || hardStartDate;
 
-        // Safety: If their last poll was somehow older than the old default
-        if (new Date(startTimeFrom) < hardStartDate) {
-            startTimeFrom = hardStartDate;
-        }
+      // Safety: If their last poll was somehow older than the old default
+      if (new Date(startTimeFrom) < hardStartDate) {
+        startTimeFrom = hardStartDate;
+      }
     }
-    
-    const startTimeTo = new Date(); 
+
+    const startTimeTo = new Date();
     let page = 1;
     let totalPages = 1;
     let processedCount = 0;
@@ -3802,9 +3820,9 @@ router.post('/sync-listings', requireAuth, async (req, res) => {
     const VALID_MOTORS_CATEGORIES = ["eBay Motors", "Parts & Accessories", "Automotive Tools", "Tools & Supplies"];
 
     do {
-        console.log(`Fetching Page ${page} (Filter: Motors Only)...`);
+      console.log(`Fetching Page ${page} (Filter: Motors Only)...`);
 
-        const xmlRequest = `
+      const xmlRequest = `
           <?xml version="1.0" encoding="utf-8"?>
           <GetSellerListRequest xmlns="urn:ebay:apis:eBLBaseComponents">
             <RequesterCredentials><eBayAuthToken>${token}</eBayAuthToken></RequesterCredentials>
@@ -3832,80 +3850,80 @@ router.post('/sync-listings', requireAuth, async (req, res) => {
           </GetSellerListRequest>
         `;
 
-        const response = await axios.post('https://api.ebay.com/ws/api.dll', xmlRequest, {
-          headers: {
-            'X-EBAY-API-SITEID': '100', 
-            'X-EBAY-API-COMPATIBILITY-LEVEL': '1423',
-            'X-EBAY-API-CALL-NAME': 'GetSellerList',
-            'Content-Type': 'text/xml'
-          }
-        });
+      const response = await axios.post('https://api.ebay.com/ws/api.dll', xmlRequest, {
+        headers: {
+          'X-EBAY-API-SITEID': '100',
+          'X-EBAY-API-COMPATIBILITY-LEVEL': '1423',
+          'X-EBAY-API-CALL-NAME': 'GetSellerList',
+          'Content-Type': 'text/xml'
+        }
+      });
 
-        const result = await parseStringPromise(response.data);
-        if (result.GetSellerListResponse.Ack[0] === 'Failure') {
-            throw new Error(result.GetSellerListResponse.Errors[0].LongMessage[0]);
+      const result = await parseStringPromise(response.data);
+      if (result.GetSellerListResponse.Ack[0] === 'Failure') {
+        throw new Error(result.GetSellerListResponse.Errors[0].LongMessage[0]);
+      }
+
+      const pagination = result.GetSellerListResponse.PaginationResult[0];
+      totalPages = parseInt(pagination.TotalNumberOfPages[0]);
+      const items = result.GetSellerListResponse.ItemArray?.[0]?.Item || [];
+
+      for (const item of items) {
+        const status = item.SellingStatus?.[0]?.ListingStatus?.[0];
+        if (status !== 'Active') continue;
+
+        // Filter by Category
+        const categoryName = item.PrimaryCategory?.[0]?.CategoryName?.[0] || '';
+        const isMotorsItem = VALID_MOTORS_CATEGORIES.some(keyword => categoryName.includes(keyword));
+        if (!isMotorsItem) {
+          skippedCount++;
+          continue;
         }
 
-        const pagination = result.GetSellerListResponse.PaginationResult[0];
-        totalPages = parseInt(pagination.TotalNumberOfPages[0]);
-        const items = result.GetSellerListResponse.ItemArray?.[0]?.Item || [];
+        const rawHtml = item.Description ? item.Description[0] : '';
+        const cleanHtml = extractCleanDescription(rawHtml);
 
-        for (const item of items) {
-          const status = item.SellingStatus?.[0]?.ListingStatus?.[0];
-          if (status !== 'Active') continue;
-
-          // Filter by Category
-          const categoryName = item.PrimaryCategory?.[0]?.CategoryName?.[0] || '';
-          const isMotorsItem = VALID_MOTORS_CATEGORIES.some(keyword => categoryName.includes(keyword));
-          if (!isMotorsItem) {
-              skippedCount++;
-              continue; 
-          }
-
-          const rawHtml = item.Description ? item.Description[0] : '';
-          const cleanHtml = extractCleanDescription(rawHtml);
-
-          // Extract EXISTING Compatibility from eBay
-          let parsedCompatibility = [];
-          if (item.ItemCompatibilityList && item.ItemCompatibilityList[0].Compatibility) {
-            parsedCompatibility = item.ItemCompatibilityList[0].Compatibility.map(comp => ({
-              notes: comp.CompatibilityNotes ? comp.CompatibilityNotes[0] : '',
-              nameValueList: comp.NameValueList.map(nv => ({
-                name: nv.Name[0],
-                value: nv.Value[0]
-              }))
-            }));
-          }
-
-          // Upsert to DB (Updates existing if found, Creates new if not)
-          await Listing.findOneAndUpdate(
-            { itemId: item.ItemID[0] },
-            {
-              seller: seller._id,
-              title: item.Title[0],
-              sku: item.SKU ? item.SKU[0] : '',
-              currentPrice: parseFloat(item.SellingStatus[0].CurrentPrice[0]._),
-              currency: item.SellingStatus[0].CurrentPrice[0].$.currencyID,
-              listingStatus: status,
-              mainImageUrl: item.PictureDetails?.[0]?.PictureURL?.[0] || '',
-              descriptionPreview: cleanHtml, 
-              compatibility: parsedCompatibility,
-              // Save the START TIME for sorting
-              startTime: item.ListingDetails?.[0]?.StartTime?.[0] 
-            },
-            { upsert: true }
-          );
-          processedCount++;
+        // Extract EXISTING Compatibility from eBay
+        let parsedCompatibility = [];
+        if (item.ItemCompatibilityList && item.ItemCompatibilityList[0].Compatibility) {
+          parsedCompatibility = item.ItemCompatibilityList[0].Compatibility.map(comp => ({
+            notes: comp.CompatibilityNotes ? comp.CompatibilityNotes[0] : '',
+            nameValueList: comp.NameValueList.map(nv => ({
+              name: nv.Name[0],
+              value: nv.Value[0]
+            }))
+          }));
         }
-        page++;
+
+        // Upsert to DB (Updates existing if found, Creates new if not)
+        await Listing.findOneAndUpdate(
+          { itemId: item.ItemID[0] },
+          {
+            seller: seller._id,
+            title: item.Title[0],
+            sku: item.SKU ? item.SKU[0] : '',
+            currentPrice: parseFloat(item.SellingStatus[0].CurrentPrice[0]._),
+            currency: item.SellingStatus[0].CurrentPrice[0].$.currencyID,
+            listingStatus: status,
+            mainImageUrl: item.PictureDetails?.[0]?.PictureURL?.[0] || '',
+            descriptionPreview: cleanHtml,
+            compatibility: parsedCompatibility,
+            // Save the START TIME for sorting
+            startTime: item.ListingDetails?.[0]?.StartTime?.[0]
+          },
+          { upsert: true }
+        );
+        processedCount++;
+      }
+      page++;
     } while (page <= totalPages);
 
     seller.lastListingPolledAt = startTimeTo;
     await seller.save();
 
-    res.json({ 
-        success: true, 
-        message: `Synced ${processedCount} Motors listings. (Skipped ${skippedCount} others).` 
+    res.json({
+      success: true,
+      message: `Synced ${processedCount} Motors listings. (Skipped ${skippedCount} others).`
     });
 
   } catch (err) {
@@ -3915,54 +3933,54 @@ router.post('/sync-listings', requireAuth, async (req, res) => {
 
 // 2. GET LISTINGS (With Search & Sort)
 router.get('/listings', requireAuth, async (req, res) => {
-    const { sellerId, page = 1, limit = 50, search } = req.query; // Added 'search'
-    try {
-        const pageNum = parseInt(page);
-        const limitNum = parseInt(limit);
-        const skip = (pageNum - 1) * limitNum;
+  const { sellerId, page = 1, limit = 50, search } = req.query; // Added 'search'
+  try {
+    const pageNum = parseInt(page);
+    const limitNum = parseInt(limit);
+    const skip = (pageNum - 1) * limitNum;
 
-        // Base Query
-        let query = { seller: sellerId, listingStatus: 'Active' };
+    // Base Query
+    let query = { seller: sellerId, listingStatus: 'Active' };
 
-        // --- SEARCH LOGIC ---
-        if (search && search.trim() !== '') {
-            const searchRegex = { $regex: search.trim(), $options: 'i' }; // 'i' = case insensitive
-            query.$or = [
-                { title: searchRegex },
-                { sku: searchRegex },
-                { itemId: searchRegex } // Allows partial ID matches
-            ];
-        }
-
-        const totalDocs = await Listing.countDocuments(query);
-        
-        const listings = await Listing.find(query)
-            .sort({ startTime: -1 }) 
-            .skip(skip)
-            .limit(limitNum);
-
-        res.json({ 
-            listings, 
-            pagination: { 
-                total: totalDocs, 
-                page: pageNum, 
-                pages: Math.ceil(totalDocs / limitNum) 
-            } 
-        });
-    } catch (err) {
-        res.status(500).json({ error: err.message });
+    // --- SEARCH LOGIC ---
+    if (search && search.trim() !== '') {
+      const searchRegex = { $regex: search.trim(), $options: 'i' }; // 'i' = case insensitive
+      query.$or = [
+        { title: searchRegex },
+        { sku: searchRegex },
+        { itemId: searchRegex } // Allows partial ID matches
+      ];
     }
+
+    const totalDocs = await Listing.countDocuments(query);
+
+    const listings = await Listing.find(query)
+      .sort({ startTime: -1 })
+      .skip(skip)
+      .limit(limitNum);
+
+    res.json({
+      listings,
+      pagination: {
+        total: totalDocs,
+        page: pageNum,
+        pages: Math.ceil(totalDocs / limitNum)
+      }
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // 3. REFRESH SINGLE ITEM (GetItem)
 router.post('/refresh-item', requireAuth, async (req, res) => {
-    const { sellerId, itemId } = req.body;
-  
-    try {
-      const seller = await Seller.findById(sellerId);
-      const token = await ensureValidToken(seller);
-  
-      const xmlRequest = `
+  const { sellerId, itemId } = req.body;
+
+  try {
+    const seller = await Seller.findById(sellerId);
+    const token = await ensureValidToken(seller);
+
+    const xmlRequest = `
         <?xml version="1.0" encoding="utf-8"?>
         <GetItemRequest xmlns="urn:ebay:apis:eBLBaseComponents">
           <RequesterCredentials><eBayAuthToken>${token}</eBayAuthToken></RequesterCredentials>
@@ -3973,110 +3991,110 @@ router.post('/refresh-item', requireAuth, async (req, res) => {
           <IncludeItemSpecifics>true</IncludeItemSpecifics>
         </GetItemRequest>
       `;
-  
-      const response = await axios.post('https://api.ebay.com/ws/api.dll', xmlRequest, {
-        headers: {
-          'X-EBAY-API-SITEID': '100', 
-          'X-EBAY-API-COMPATIBILITY-LEVEL': '1423',
-          'X-EBAY-API-CALL-NAME': 'GetItem',
-          'Content-Type': 'text/xml'
-        }
-      });
-  
-      const result = await parseStringPromise(response.data);
-      const item = result.GetItemResponse.Item[0];
-  
-      const rawHtml = item.Description ? item.Description[0] : '';
-      const cleanHtml = extractCleanDescription(rawHtml);
-  
-      let parsedCompatibility = [];
-      if (item.ItemCompatibilityList && item.ItemCompatibilityList[0].Compatibility) {
-          parsedCompatibility = item.ItemCompatibilityList[0].Compatibility.map(comp => ({
-              notes: comp.CompatibilityNotes ? comp.CompatibilityNotes[0] : '',
-              nameValueList: comp.NameValueList.map(nv => ({
-                  name: nv.Name[0],
-                  value: nv.Value[0]
-              }))
-          }));
+
+    const response = await axios.post('https://api.ebay.com/ws/api.dll', xmlRequest, {
+      headers: {
+        'X-EBAY-API-SITEID': '100',
+        'X-EBAY-API-COMPATIBILITY-LEVEL': '1423',
+        'X-EBAY-API-CALL-NAME': 'GetItem',
+        'Content-Type': 'text/xml'
       }
-  
-      const updatedListing = await Listing.findOneAndUpdate(
-          { itemId: itemId },
-          {
-              seller: seller._id,
-              title: item.Title[0],
-              sku: item.SKU ? item.SKU[0] : '',
-              descriptionPreview: cleanHtml,
-              compatibility: parsedCompatibility,
-              mainImageUrl: item.PictureDetails?.[0]?.PictureURL?.[0] || '',
-          },
-          { new: true, upsert: true }
-      );
-  
-      res.json({ success: true, listing: updatedListing });
-  
-    } catch (err) {
-      res.status(500).json({ error: err.message });
+    });
+
+    const result = await parseStringPromise(response.data);
+    const item = result.GetItemResponse.Item[0];
+
+    const rawHtml = item.Description ? item.Description[0] : '';
+    const cleanHtml = extractCleanDescription(rawHtml);
+
+    let parsedCompatibility = [];
+    if (item.ItemCompatibilityList && item.ItemCompatibilityList[0].Compatibility) {
+      parsedCompatibility = item.ItemCompatibilityList[0].Compatibility.map(comp => ({
+        notes: comp.CompatibilityNotes ? comp.CompatibilityNotes[0] : '',
+        nameValueList: comp.NameValueList.map(nv => ({
+          name: nv.Name[0],
+          value: nv.Value[0]
+        }))
+      }));
     }
+
+    const updatedListing = await Listing.findOneAndUpdate(
+      { itemId: itemId },
+      {
+        seller: seller._id,
+        title: item.Title[0],
+        sku: item.SKU ? item.SKU[0] : '',
+        descriptionPreview: cleanHtml,
+        compatibility: parsedCompatibility,
+        mainImageUrl: item.PictureDetails?.[0]?.PictureURL?.[0] || '',
+      },
+      { new: true, upsert: true }
+    );
+
+    res.json({ success: true, listing: updatedListing });
+
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // Helper to clean text for XML (turns "&" into "&amp;")
 const escapeXml = (unsafe) => {
-    if (!unsafe) return '';
-    return String(unsafe).replace(/[<>&'"]/g, (c) => {
-        switch (c) {
-            case '<': return '&lt;';
-            case '>': return '&gt;';
-            case '&': return '&amp;';
-            case '\'': return '&apos;';
-            case '"': return '&quot;';
-        }
-    });
+  if (!unsafe) return '';
+  return String(unsafe).replace(/[<>&'"]/g, (c) => {
+    switch (c) {
+      case '<': return '&lt;';
+      case '>': return '&gt;';
+      case '&': return '&amp;';
+      case '\'': return '&apos;';
+      case '"': return '&quot;';
+    }
+  });
 };
 
 // 4. UPDATE COMPATIBILITY (Using ReplaceAll Strategy)
 router.post('/update-compatibility', requireAuth, async (req, res) => {
-    const { sellerId, itemId, compatibilityList } = req.body;
-    try {
-        const seller = await Seller.findById(sellerId);
-        const token = await ensureValidToken(seller);
+  const { sellerId, itemId, compatibilityList } = req.body;
+  try {
+    const seller = await Seller.findById(sellerId);
+    const token = await ensureValidToken(seller);
 
-        let itemInnerContent = `<ItemID>${itemId}</ItemID>`;
+    let itemInnerContent = `<ItemID>${itemId}</ItemID>`;
 
-        // CASE 1: Clearing all vehicles (Send Empty List with ReplaceAll)
-        if (!compatibilityList || compatibilityList.length === 0) {
-            // This tells eBay: "Here is the list. It is empty. Replace everything with this empty list."
-            itemInnerContent += `
+    // CASE 1: Clearing all vehicles (Send Empty List with ReplaceAll)
+    if (!compatibilityList || compatibilityList.length === 0) {
+      // This tells eBay: "Here is the list. It is empty. Replace everything with this empty list."
+      itemInnerContent += `
                 <ItemCompatibilityList>
                     <ReplaceAll>true</ReplaceAll>
                 </ItemCompatibilityList>
             `;
-        } 
-        // CASE 2: Sending a specific list (Overwrite old list)
-        else {
-            let compatXml = '<ItemCompatibilityList>';
-            
-            // --- THE FIX: This magic tag forces eBay to wipe old data first ---
-            compatXml += '<ReplaceAll>true</ReplaceAll>'; 
-            // -----------------------------------------------------------------
+    }
+    // CASE 2: Sending a specific list (Overwrite old list)
+    else {
+      let compatXml = '<ItemCompatibilityList>';
 
-            compatibilityList.forEach(c => {
-                compatXml += '<Compatibility>';
-                // Escape Notes (Fixes "&" error)
-                if(c.notes) compatXml += `<CompatibilityNotes>${escapeXml(c.notes)}</CompatibilityNotes>`;
-                
-                c.nameValueList.forEach(nv => {
-                    // Escape Name and Value (Fixes "Town & Country" error)
-                    compatXml += `<NameValueList><Name>${escapeXml(nv.name)}</Name><Value>${escapeXml(nv.value)}</Value></NameValueList>`;
-                });
-                compatXml += '</Compatibility>';
-            });
-            compatXml += '</ItemCompatibilityList>';
-            
-            itemInnerContent += compatXml;
-        }
+      // --- THE FIX: This magic tag forces eBay to wipe old data first ---
+      compatXml += '<ReplaceAll>true</ReplaceAll>';
+      // -----------------------------------------------------------------
 
-        const xmlRequest = `
+      compatibilityList.forEach(c => {
+        compatXml += '<Compatibility>';
+        // Escape Notes (Fixes "&" error)
+        if (c.notes) compatXml += `<CompatibilityNotes>${escapeXml(c.notes)}</CompatibilityNotes>`;
+
+        c.nameValueList.forEach(nv => {
+          // Escape Name and Value (Fixes "Town & Country" error)
+          compatXml += `<NameValueList><Name>${escapeXml(nv.name)}</Name><Value>${escapeXml(nv.value)}</Value></NameValueList>`;
+        });
+        compatXml += '</Compatibility>';
+      });
+      compatXml += '</ItemCompatibilityList>';
+
+      itemInnerContent += compatXml;
+    }
+
+    const xmlRequest = `
             <?xml version="1.0" encoding="utf-8"?>
             <ReviseFixedPriceItemRequest xmlns="urn:ebay:apis:eBLBaseComponents">
                 <RequesterCredentials><eBayAuthToken>${token}</eBayAuthToken></RequesterCredentials>
@@ -4090,124 +4108,124 @@ router.post('/update-compatibility', requireAuth, async (req, res) => {
             </ReviseFixedPriceItemRequest>
         `;
 
-        const response = await axios.post('https://api.ebay.com/ws/api.dll', xmlRequest, {
-            headers: { 'X-EBAY-API-SITEID': '100', 'X-EBAY-API-COMPATIBILITY-LEVEL': '1423', 'X-EBAY-API-CALL-NAME': 'ReviseFixedPriceItem', 'Content-Type': 'text/xml' }
-        });
+    const response = await axios.post('https://api.ebay.com/ws/api.dll', xmlRequest, {
+      headers: { 'X-EBAY-API-SITEID': '100', 'X-EBAY-API-COMPATIBILITY-LEVEL': '1423', 'X-EBAY-API-CALL-NAME': 'ReviseFixedPriceItem', 'Content-Type': 'text/xml' }
+    });
 
-        const result = await parseStringPromise(response.data);
-        const ack = result.ReviseFixedPriceItemResponse.Ack[0];
+    const result = await parseStringPromise(response.data);
+    const ack = result.ReviseFixedPriceItemResponse.Ack[0];
 
-        // 1. Handle Failures
-        if (ack === 'Failure') {
-            const errors = result.ReviseFixedPriceItemResponse.Errors || [];
-            throw new Error(`eBay Failed: ${errors.map(e => e.LongMessage[0]).join('; ')}`);
-        }
-        
-        // 2. Handle Warnings
-        let warningMessage = null;
-        if (ack === 'Warning') {
-            const warnings = result.ReviseFixedPriceItemResponse.Errors || [];
-            
-            const meaningfulWarnings = warnings.filter(err => {
-                const msg = err.LongMessage[0];
-                if (msg.includes("If this item sells by a Best Offer")) return false;
-                if (msg.includes("Funds from your sales may be unavailable")) return false; // <--- ADD THIS
-                return true; 
-            });
-
-            if (meaningfulWarnings.length > 0) {
-                warningMessage = meaningfulWarnings.map(e => e.LongMessage[0]).join('; ');
-                console.warn(`eBay Update Warning: ${warningMessage}`);
-            }
-        }
-        
-        // 3. Update DB
-        await Listing.findOneAndUpdate(
-            { itemId: itemId },
-            { compatibility: compatibilityList }
-        );
-
-        res.json({ success: true, warning: warningMessage });
-
-    } catch (err) {
-        res.status(500).json({ error: err.message });
+    // 1. Handle Failures
+    if (ack === 'Failure') {
+      const errors = result.ReviseFixedPriceItemResponse.Errors || [];
+      throw new Error(`eBay Failed: ${errors.map(e => e.LongMessage[0]).join('; ')}`);
     }
+
+    // 2. Handle Warnings
+    let warningMessage = null;
+    if (ack === 'Warning') {
+      const warnings = result.ReviseFixedPriceItemResponse.Errors || [];
+
+      const meaningfulWarnings = warnings.filter(err => {
+        const msg = err.LongMessage[0];
+        if (msg.includes("If this item sells by a Best Offer")) return false;
+        if (msg.includes("Funds from your sales may be unavailable")) return false; // <--- ADD THIS
+        return true;
+      });
+
+      if (meaningfulWarnings.length > 0) {
+        warningMessage = meaningfulWarnings.map(e => e.LongMessage[0]).join('; ');
+        console.warn(`eBay Update Warning: ${warningMessage}`);
+      }
+    }
+
+    // 3. Update DB
+    await Listing.findOneAndUpdate(
+      { itemId: itemId },
+      { compatibility: compatibilityList }
+    );
+
+    res.json({ success: true, warning: warningMessage });
+
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 
 
 // 5. GET COMPATIBILITY METADATA (REST API Version)
 router.post('/compatibility/values', requireAuth, async (req, res) => {
-    const { sellerId, propertyName, constraints } = req.body; 
-    
-    try {
-        // 1. GENERATE CACHE KEY
-        // Unique key based on all constraints (e.g. "Year_Make_Nissan_Model_370Z")
-        let cacheKey = propertyName;
-        if (constraints && constraints.length > 0) {
-            const sortedParams = constraints
-                .map(c => `${c.name}_${c.value}`)
-                .sort()
-                .join('_');
-            cacheKey = `${propertyName}_${sortedParams}`;
-        }
+  const { sellerId, propertyName, constraints } = req.body;
 
-        // 2. CHECK DB CACHE
-        const cachedData = await FitmentCache.findOne({ cacheKey });
-        if (cachedData) {
-            return res.json({ values: cachedData.values });
-        }
-
-        // 3. FETCH FROM EBAY (REST Taxonomy API)
-        const seller = await Seller.findById(sellerId);
-        const token = await ensureValidToken(seller);
-
-        // Build Filter String for REST API
-        // FIX: Process ALL constraints, not just the first one.
-        // Format: "Make:Nissan,Model:370Z"
-        let filterParam = '';
-        if (constraints && constraints.length > 0) {
-            const filters = constraints.map(c => {
-                // Remove quotes and escape commas within the value itself
-                const cleanValue = String(c.value).replace(/,/g, '\\,');
-                return `${c.name}:${cleanValue}`;
-            });
-            filterParam = filters.join(',');
-        }
-
-        console.log(`[Fitment] Fetching ${propertyName} from eBay (Cat: 33559)... Filter: ${filterParam}`);
-
-        const response = await axios.get(
-            `https://api.ebay.com/commerce/taxonomy/v1/category_tree/100/get_compatibility_property_values`, 
-            {
-                headers: {
-                    'Authorization': `Bearer ${token}`,
-                    'Content-Type': 'application/json',
-                    'X-EBAY-C-MARKETPLACE-ID': 'EBAY_US' 
-                },
-                params: {
-                    category_id: '33559', 
-                    compatibility_property: propertyName,
-                    filter: filterParam || undefined
-                }
-            }
-        );
-
-        // Extract Values
-        const rawValues = response.data.compatibilityPropertyValues || [];
-        const values = rawValues.map(item => item.value);
-
-        // 4. SAVE TO DB
-        if (values.length > 0) {
-            await FitmentCache.create({ cacheKey, values });
-        }
-
-        res.json({ values });
-
-    } catch (err) {
-        console.error("Metadata Fetch Error:", JSON.stringify(err.response?.data || err.message, null, 2));
-        res.json({ values: [] });
+  try {
+    // 1. GENERATE CACHE KEY
+    // Unique key based on all constraints (e.g. "Year_Make_Nissan_Model_370Z")
+    let cacheKey = propertyName;
+    if (constraints && constraints.length > 0) {
+      const sortedParams = constraints
+        .map(c => `${c.name}_${c.value}`)
+        .sort()
+        .join('_');
+      cacheKey = `${propertyName}_${sortedParams}`;
     }
+
+    // 2. CHECK DB CACHE
+    const cachedData = await FitmentCache.findOne({ cacheKey });
+    if (cachedData) {
+      return res.json({ values: cachedData.values });
+    }
+
+    // 3. FETCH FROM EBAY (REST Taxonomy API)
+    const seller = await Seller.findById(sellerId);
+    const token = await ensureValidToken(seller);
+
+    // Build Filter String for REST API
+    // FIX: Process ALL constraints, not just the first one.
+    // Format: "Make:Nissan,Model:370Z"
+    let filterParam = '';
+    if (constraints && constraints.length > 0) {
+      const filters = constraints.map(c => {
+        // Remove quotes and escape commas within the value itself
+        const cleanValue = String(c.value).replace(/,/g, '\\,');
+        return `${c.name}:${cleanValue}`;
+      });
+      filterParam = filters.join(',');
+    }
+
+    console.log(`[Fitment] Fetching ${propertyName} from eBay (Cat: 33559)... Filter: ${filterParam}`);
+
+    const response = await axios.get(
+      `https://api.ebay.com/commerce/taxonomy/v1/category_tree/100/get_compatibility_property_values`,
+      {
+        headers: {
+          'Authorization': `Bearer ${token}`,
+          'Content-Type': 'application/json',
+          'X-EBAY-C-MARKETPLACE-ID': 'EBAY_US'
+        },
+        params: {
+          category_id: '33559',
+          compatibility_property: propertyName,
+          filter: filterParam || undefined
+        }
+      }
+    );
+
+    // Extract Values
+    const rawValues = response.data.compatibilityPropertyValues || [];
+    const values = rawValues.map(item => item.value);
+
+    // 4. SAVE TO DB
+    if (values.length > 0) {
+      await FitmentCache.create({ cacheKey, values });
+    }
+
+    res.json({ values });
+
+  } catch (err) {
+    console.error("Metadata Fetch Error:", JSON.stringify(err.response?.data || err.message, null, 2));
+    res.json({ values: [] });
+  }
 });
 
 
@@ -4223,7 +4241,7 @@ router.post('/conversation-meta', requireAuth, async (req, res) => {
 
   try {
     let query = { seller: sellerId };
-    
+
     if (orderId) {
       query.orderId = orderId;
     } else {
@@ -4241,11 +4259,11 @@ router.post('/conversation-meta', requireAuth, async (req, res) => {
         itemId,
         category,
         caseStatus,
-        
+
         // --- THE LOGIC FIX ---
         // If the seller clicks "Save" in the chat window, we assume they are working on it.
         // So we force it back to 'Open' and clear the resolution data.
-        status: 'Open', 
+        status: 'Open',
         resolvedAt: null,
         resolvedBy: null
       },
@@ -4283,7 +4301,7 @@ router.get('/conversation-meta/single', requireAuth, async (req, res) => {
 // --- NEW ROUTE 3: GET MANAGEMENT LIST (Called from ConversationManagementPage) ---
 // 
 router.get('/conversation-management/list', requireAuth, async (req, res) => {
-  const { status } = req.query; 
+  const { status } = req.query;
 
   try {
     let query = {};
@@ -4296,10 +4314,10 @@ router.get('/conversation-management/list', requireAuth, async (req, res) => {
       // 1. LOOKUP SELLER (ConversationMeta -> Seller)
       {
         $lookup: {
-            from: 'sellers',
-            localField: 'seller',
-            foreignField: '_id',
-            as: 'sellerDoc'
+          from: 'sellers',
+          localField: 'seller',
+          foreignField: '_id',
+          as: 'sellerDoc'
         }
       },
       // Unwind allows us to access the fields inside sellerDoc directly
@@ -4308,10 +4326,10 @@ router.get('/conversation-management/list', requireAuth, async (req, res) => {
       // 2. LOOKUP USER (Seller -> User) - THIS WAS MISSING
       {
         $lookup: {
-            from: 'users', // The collection name for 'User' model is usually lowercase plural 'users'
-            localField: 'sellerDoc.user',
-            foreignField: '_id',
-            as: 'userDoc'
+          from: 'users', // The collection name for 'User' model is usually lowercase plural 'users'
+          localField: 'sellerDoc.user',
+          foreignField: '_id',
+          as: 'userDoc'
         }
       },
       { $unwind: { path: '$userDoc', preserveNullAndEmptyArrays: true } },
@@ -4330,9 +4348,9 @@ router.get('/conversation-management/list', requireAuth, async (req, res) => {
       {
         $project: {
           _id: 1,
-          sellerId: '$sellerDoc._id', 
+          sellerId: '$sellerDoc._id',
           // NOW WE PULL USERNAME FROM THE USER DOC
-          sellerName: { $ifNull: ['$userDoc.username', 'Unknown'] }, 
+          sellerName: { $ifNull: ['$userDoc.username', 'Unknown'] },
           buyerUsername: 1,
           orderId: 1,
           itemId: 1,
@@ -4341,11 +4359,11 @@ router.get('/conversation-management/list', requireAuth, async (req, res) => {
           status: 1,
           notes: 1,
           updatedAt: 1,
-          buyerName: { 
+          buyerName: {
             $ifNull: [
-              { $arrayElemAt: ["$orderInfo.buyer.buyerRegistrationAddress.fullName", 0] }, 
+              { $arrayElemAt: ["$orderInfo.buyer.buyerRegistrationAddress.fullName", 0] },
               "$buyerUsername"
-            ] 
+            ]
           }
         }
       }
@@ -4385,11 +4403,11 @@ router.patch('/conversation-management/:id/resolve', requireAuth, async (req, re
 //Manual fields to upadte for amazon 
 router.patch('/orders/:orderId/manual-fields', requireAuth, async (req, res) => {
   const { orderId } = req.params;
-  const updates = req.body; 
+  const updates = req.body;
 
   const allowedFields = ['amazonAccount', 'arrivingDate', 'beforeTax', 'estimatedTax', 'azOrderId'];
   const updateData = {};
-  
+
   Object.keys(updates).forEach(key => {
     if (allowedFields.includes(key)) {
       updateData[key] = updates[key];
