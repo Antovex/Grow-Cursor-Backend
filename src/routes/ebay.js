@@ -1171,6 +1171,188 @@ router.patch('/orders/:orderId/manual-tracking', async (req, res) => {
   }
 });
 
+// Upload tracking number to eBay and mark order as shipped
+router.post('/orders/:orderId/upload-tracking', async (req, res) => {
+  const { orderId } = req.params;
+  const { trackingNumber, shippingCarrier = 'USPS' } = req.body;
+
+  if (!trackingNumber || !trackingNumber.trim()) {
+    return res.status(400).json({ error: 'Missing tracking number' });
+  }
+
+  try {
+    // Find the order in our database
+    const order = await Order.findById(orderId).populate('seller');
+    
+    if (!order) {
+      return res.status(404).json({ error: 'Order not found' });
+    }
+
+    if (!order.seller) {
+      return res.status(400).json({ error: 'Seller not found for this order' });
+    }
+
+    // Ensure seller has valid eBay token
+    await ensureValidToken(order.seller);
+
+    if (!order.seller.ebayTokens?.access_token) {
+      return res.status(400).json({ error: 'Seller does not have valid eBay access token' });
+    }
+
+    // Get the eBay orderId (not our MongoDB _id)
+    const ebayOrderId = order.orderId || order.legacyOrderId;
+    if (!ebayOrderId) {
+      return res.status(400).json({ error: 'Order missing eBay order ID' });
+    }
+
+    // Get the line item ID (eBay requires this for fulfillment)
+    const lineItemId = order.lineItems?.[0]?.lineItemId;
+    if (!lineItemId) {
+      return res.status(400).json({ error: 'Order missing line item ID' });
+    }
+
+    // Prepare the fulfillment payload
+    const fulfillmentPayload = {
+      lineItems: [
+        {
+          lineItemId: lineItemId,
+          quantity: order.lineItems[0].quantity || 1
+        }
+      ],
+      shippedDate: new Date().toISOString(),
+      shippingCarrierCode: shippingCarrier.toUpperCase(),
+      trackingNumber: trackingNumber.trim()
+    };
+
+    console.log(`[Upload Tracking] Uploading tracking for order ${ebayOrderId}:`, fulfillmentPayload);
+
+    // Upload tracking to eBay Fulfillment API
+    const fulfillmentResponse = await axios.post(
+      `https://api.ebay.com/sell/fulfillment/v1/order/${ebayOrderId}/shipping_fulfillment`,
+      fulfillmentPayload,
+      {
+        headers: {
+          'Authorization': `Bearer ${order.seller.ebayTokens.access_token}`,
+          'Content-Type': 'application/json',
+          'Accept': 'application/json'
+        }
+      }
+    );
+
+    console.log(`[Upload Tracking] ✅ eBay API accepted tracking upload:`, fulfillmentResponse.data);
+
+    // WAIT 7 SECONDS: Give eBay time to process the tracking upload internally
+    console.log(`[Upload Tracking] Waiting 7 seconds for eBay to process tracking...`);
+    await new Promise(resolve => setTimeout(resolve, 7000)); // 7-second delay
+    
+    // VERIFY: Fetch the order back from eBay to confirm tracking was actually applied
+    console.log(`[Upload Tracking] Verifying tracking was applied...`);
+    
+    const verifyResponse = await axios.get(
+      `https://api.ebay.com/sell/fulfillment/v1/order/${ebayOrderId}`,
+      {
+        headers: {
+          'Authorization': `Bearer ${order.seller.ebayTokens.access_token}`,
+          'Content-Type': 'application/json',
+          'Accept': 'application/json'
+        }
+      }
+    );
+
+    const verifiedOrder = verifyResponse.data;
+    const hasFulfillmentHrefs = verifiedOrder.fulfillmentHrefs && verifiedOrder.fulfillmentHrefs.length > 0;
+    const isFulfilled = verifiedOrder.orderFulfillmentStatus === 'FULFILLED';
+
+    console.log(`[Upload Tracking] Verification result:`, {
+      orderFulfillmentStatus: verifiedOrder.orderFulfillmentStatus,
+      fulfillmentHrefs: verifiedOrder.fulfillmentHrefs,
+      fulfillmentHrefsLength: verifiedOrder.fulfillmentHrefs?.length || 0,
+      hasFulfillmentHrefs,
+      isFulfilled
+    });
+
+    // STRICT VALIDATION: Only save to DB if eBay confirmed tracking was applied
+    if (!hasFulfillmentHrefs || !isFulfilled) {
+      console.error(`[Upload Tracking] ⚠️ Tracking NOT applied after 7-second wait!`);
+      console.error(`[Upload Tracking] Order status: ${verifiedOrder.orderFulfillmentStatus}`);
+      console.error(`[Upload Tracking] FulfillmentHrefs: ${JSON.stringify(verifiedOrder.fulfillmentHrefs)}`);
+      
+      // REJECT - Do NOT update database
+      return res.status(400).json({ 
+        error: 'Tracking number was rejected by eBay. This tracking number may already be in use for another order, or the format may be invalid.',
+        errorType: 'TRACKING_NOT_APPLIED',
+        details: {
+          orderStatus: verifiedOrder.orderFulfillmentStatus,
+          fulfillmentHrefs: verifiedOrder.fulfillmentHrefs,
+          suggestion: 'Please verify:\n- Tracking number is correct\n- Carrier selection matches the tracking format\n- Tracking number is not already used for another order'
+        }
+      });
+    }
+
+    console.log(`[Upload Tracking] ✅ VERIFIED: Tracking successfully applied to eBay order`);
+
+    // UPDATE DATABASE: Only save when eBay confirms success
+    order.trackingNumber = trackingNumber.trim();
+    order.manualTrackingNumber = trackingNumber.trim();
+    order.orderFulfillmentStatus = 'FULFILLED';
+    order.lastModifiedDate = new Date().toISOString();
+    await order.save();
+
+    console.log(`[Upload Tracking] 💾 Database updated successfully for order ${ebayOrderId}`);
+
+    res.json({ 
+      success: true, 
+      message: `Tracking uploaded to eBay via ${shippingCarrier}! Order marked as shipped.`,
+      order,
+      ebayResponse: fulfillmentResponse.data
+    });
+
+  } catch (err) {
+    console.error('[Upload Tracking] ❌ Error:', err.response?.data || err.message);
+    
+    // Provide detailed error message with specific handling for common issues
+    let errorMessage = 'Failed to upload tracking to eBay';
+    let errorType = 'UPLOAD_ERROR';
+    
+    if (err.response?.data?.errors) {
+      const errors = err.response.data.errors;
+      errorMessage = errors.map(e => e.message).join(', ');
+      
+      // Check for specific error types
+      const errorString = JSON.stringify(errors).toLowerCase();
+      if (errorString.includes('tracking') || errorString.includes('invalid')) {
+        errorType = 'INVALID_TRACKING';
+        errorMessage = '❌ ' + errorMessage + '\n\nPlease verify:\n- Tracking number format is correct\n- Carrier selection matches the tracking number\n- Tracking number is not already used for another order';
+      } else if (errorString.includes('already') || errorString.includes('fulfilled')) {
+        errorType = 'ALREADY_FULFILLED';
+        errorMessage = 'This order is already marked as fulfilled on eBay';
+      } else if (errorString.includes('authorization') || errorString.includes('token')) {
+        errorType = 'AUTH_ERROR';
+        errorMessage = 'eBay authorization error. Please reconnect your eBay account';
+      }
+    } else if (err.response?.data?.message) {
+      errorMessage = err.response.data.message;
+    } else if (err.message) {
+      errorMessage = err.message;
+    }
+
+    // Log detailed error for debugging
+    console.error('[Upload Tracking] Error Details:', {
+      errorType,
+      errorMessage,
+      ebayResponse: err.response?.data,
+      statusCode: err.response?.status
+    });
+
+    res.status(err.response?.status || 500).json({ 
+      error: errorMessage,
+      errorType,
+      details: err.response?.data || err.message,
+      statusCode: err.response?.status
+    });
+  }
+});
+
 // Poll all sellers for new/updated orders with smart detection (PARALLEL + UTC-based)
 router.post('/poll-all-sellers', requireAuth, requireRole('fulfillmentadmin', 'superadmin','compliancemanager','hoc'), async (req, res) => {
   try {
