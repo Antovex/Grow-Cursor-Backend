@@ -14,6 +14,7 @@ import Listing from '../models/Listing.js';
 import FitmentCache from '../models/FitmentCache.js';
 import ConversationMeta from '../models/ConversationMeta.js';
 import { parseStringPromise } from 'xml2js';
+import imageCache from '../lib/imageCache.js';
 const router = express.Router();
 
 // ============================================
@@ -29,6 +30,12 @@ const EBAY_OAUTH_SCOPES = [
   'https://api.ebay.com/oauth/api_scope/sell.inventory',
   'https://api.ebay.com/oauth/api_scope/commerce.identity.readonly'
 ].join(' ');
+
+// ============================================
+// IMAGE CACHE INITIALIZATION
+// ============================================
+// Start automatic cleanup of expired cache entries (runs every 10 minutes)
+imageCache.startAutoCleanup();
 
 // HELPER: Ensure Seller Token is Valid (Refreshes if < 2 mins left)
 async function ensureValidToken(seller) {
@@ -357,11 +364,14 @@ async function processEbayMessage(msg, seller) {
     const exists = await Message.findOne({ externalMessageId: msgID });
     if (exists) return false;
 
-    // 2. Find Order
+    // 2. Determine Message Type (ORDER, INQUIRY, or DIRECT)
     let orderId = null;
-    let messageType = 'INQUIRY';
+    let messageType = 'INQUIRY'; // Default
+    let finalItemId = itemID;
+    let finalItemTitle = itemTitle;
 
     if (itemID && senderID) {
+      // HAS ITEM: Check if it's an order or inquiry
       const order = await Order.findOne({
         'lineItems.legacyItemId': itemID,
         'buyer.username': senderID
@@ -369,21 +379,31 @@ async function processEbayMessage(msg, seller) {
       if (order) {
         orderId = order.orderId;
         messageType = 'ORDER';
+        console.log(`[Message] ORDER message for item ${itemID} from ${senderID}`);
+      } else {
+        messageType = 'INQUIRY';
+        console.log(`[Message] INQUIRY about item ${itemID} from ${senderID}`);
       }
+    } else if (!itemID && senderID) {
+      // NO ITEM: Direct message to seller account
+      messageType = 'DIRECT';
+      finalItemId = 'DIRECT_MESSAGE';
+      finalItemTitle = 'Direct Message (No Item)';
+      console.log(`[Message] DIRECT message from ${senderID}: ${subject}`);
     }
 
     // 3. Save to DB
     await Message.create({
       seller: seller._id,
       orderId,
-      itemId: itemID,
-      itemTitle: itemTitle,
+      itemId: finalItemId,
+      itemTitle: finalItemTitle,
       buyerUsername: senderID,
       externalMessageId: msgID,
       sender: 'BUYER',
       subject: subject,
       body: body,
-      mediaUrls: mediaUrls, // <--- Save Images
+      mediaUrls: mediaUrls,
       read: false,
       messageType,
       messageDate: messageDate
@@ -3304,51 +3324,124 @@ router.post('/send-message', requireAuth, requireRole('fulfillmentadmin', 'super
     let seller = null;
     let finalItemId = itemId;
     let finalBuyer = buyerUsername;
+    let isTransaction = false;
+    let isDirect = false;
+    let parentMessageId = null;
 
+    // Check if this is a DIRECT message (no item)
+    if (itemId === 'DIRECT_MESSAGE' || !itemId) {
+      isDirect = true;
+    }
+
+    // Determine if this is a transaction (ORDER), inquiry (INQUIRY), or direct (DIRECT)
     if (orderId) {
       const order = await Order.findOne({ orderId }).populate('seller');
       if (!order) return res.status(404).json({ error: 'Order not found' });
       seller = order.seller;
       finalItemId = order.lineItems?.[0]?.legacyItemId;
       finalBuyer = order.buyer.username;
+      isTransaction = true; // This is a real transaction
     } else {
-      const prevMsg = await Message.findOne({ buyerUsername, itemId }).populate('seller');
-      if (prevMsg) seller = prevMsg.seller;
+      // Get the most recent message from this buyer
+      const query = isDirect 
+        ? { buyerUsername, itemId: 'DIRECT_MESSAGE', sender: 'BUYER' }
+        : { buyerUsername, itemId, sender: 'BUYER' };
+      
+      const prevMsg = await Message.findOne(query)
+        .sort({ messageDate: -1 })
+        .populate('seller');
+      
+      if (prevMsg) {
+        seller = prevMsg.seller;
+        parentMessageId = prevMsg.externalMessageId; // eBay's message ID
+        
+        // Check if this inquiry is related to an order
+        if (prevMsg.orderId) {
+          isTransaction = true;
+        } else if (prevMsg.messageType === 'DIRECT') {
+          isDirect = true;
+        } else {
+          isTransaction = false; // Pre-sale inquiry
+        }
+      }
     }
 
     if (!seller) return res.status(400).json({ error: 'Could not determine seller context' });
-    if (!finalItemId) return res.status(400).json({ error: 'ItemID required to send message' });
 
-    // 1. Ensure Token is Valid
+    // DIRECT messages: Cannot reply via API (eBay limitation)
+    if (isDirect) {
+      return res.status(400).json({ 
+        error: 'Cannot reply to direct messages via API. These are account-level messages that must be replied to through eBay\'s messaging center.',
+        hint: 'Direct messages (without item context) cannot be replied to programmatically.'
+      });
+    }
+
+    if (!finalItemId || finalItemId === 'DIRECT_MESSAGE') {
+      return res.status(400).json({ error: 'ItemID required to send message' });
+    }
+
+    // For inquiries (RTQ), we need the parent message ID
+    if (!isTransaction && !parentMessageId) {
+      return res.status(400).json({ error: 'Cannot reply to inquiry: Original message ID not found' });
+    }
+
+    // Ensure Token is Valid
     const token = await ensureValidToken(seller);
 
-    const xmlRequest = `
-      <?xml version="1.0" encoding="utf-8"?>
-      <AddMemberMessageAAQToPartnerRequest xmlns="urn:ebay:apis:eBLBaseComponents">
-        <RequesterCredentials><eBayAuthToken>${token}</eBayAuthToken></RequesterCredentials>
-        <ItemID>${finalItemId}</ItemID>
-        <MemberMessage>
-          <Body>${body.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')}</Body>
-          <Subject>${subject || 'Regarding your item'}</Subject>
-          <QuestionType>General</QuestionType>
-          <RecipientID>${finalBuyer}</RecipientID>
-        </MemberMessage>
-      </AddMemberMessageAAQToPartnerRequest>
-    `;
+    let xmlRequest;
+    let callName;
+
+    // CASE 1: Transaction Message (Use AddMemberMessageAAQToPartner)
+    if (isTransaction) {
+      callName = 'AddMemberMessageAAQToPartner';
+      xmlRequest = `
+        <?xml version="1.0" encoding="utf-8"?>
+        <AddMemberMessageAAQToPartnerRequest xmlns="urn:ebay:apis:eBLBaseComponents">
+          <RequesterCredentials><eBayAuthToken>${token}</eBayAuthToken></RequesterCredentials>
+          <ItemID>${finalItemId}</ItemID>
+          <MemberMessage>
+            <Body>${body.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')}</Body>
+            <Subject>${subject || 'Regarding your order'}</Subject>
+            <QuestionType>General</QuestionType>
+            <RecipientID>${finalBuyer}</RecipientID>
+          </MemberMessage>
+        </AddMemberMessageAAQToPartnerRequest>
+      `;
+    } 
+    // CASE 2: Inquiry Message (Use AddMemberMessageRTQ - Respond To Question)
+    else {
+      callName = 'AddMemberMessageRTQ';
+      xmlRequest = `
+        <?xml version="1.0" encoding="utf-8"?>
+        <AddMemberMessageRTQRequest xmlns="urn:ebay:apis:eBLBaseComponents">
+          <RequesterCredentials><eBayAuthToken>${token}</eBayAuthToken></RequesterCredentials>
+          <ItemID>${finalItemId}</ItemID>
+          <MemberMessage>
+            <Body>${body.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')}</Body>
+            <ParentMessageID>${parentMessageId}</ParentMessageID>
+            <RecipientID>${finalBuyer}</RecipientID>
+          </MemberMessage>
+        </AddMemberMessageRTQRequest>
+      `;
+    }
+
+    console.log(`[Send Message] Using ${callName} for ${isTransaction ? 'transaction' : 'inquiry'} (Item: ${finalItemId}, Buyer: ${finalBuyer})`);
 
     const response = await axios.post('https://api.ebay.com/ws/api.dll', xmlRequest, {
       headers: {
         'X-EBAY-API-SITEID': '0',
         'X-EBAY-API-COMPATIBILITY-LEVEL': '1423',
-        'X-EBAY-API-CALL-NAME': 'AddMemberMessageAAQToPartner',
+        'X-EBAY-API-CALL-NAME': callName,
         'Content-Type': 'text/xml'
       }
     });
 
     const result = await parseStringPromise(response.data);
-    const ack = result.AddMemberMessageAAQToPartnerResponse.Ack[0];
+    const responseKey = `${callName}Response`;
+    const ack = result[responseKey].Ack[0];
 
     if (ack === 'Success' || ack === 'Warning') {
+      // Save to database
       const newMsg = await Message.create({
         seller: seller._id,
         orderId: orderId || null,
@@ -3358,12 +3451,14 @@ router.post('/send-message', requireAuth, requireRole('fulfillmentadmin', 'super
         subject: subject || 'Reply',
         body: body,
         read: true,
-        messageType: orderId ? 'ORDER' : 'INQUIRY',
+        messageType: isTransaction ? 'ORDER' : 'INQUIRY',
         messageDate: new Date()
       });
+      
+      console.log(`[Send Message] ✅ Message sent successfully using ${callName}`);
       return res.json({ success: true, message: newMsg });
     } else {
-      const errMsg = result.AddMemberMessageAAQToPartnerResponse.Errors?.[0]?.LongMessage?.[0] || 'eBay API Error';
+      const errMsg = result[responseKey].Errors?.[0]?.LongMessage?.[0] || 'eBay API Error';
       throw new Error(errMsg);
     }
 
@@ -4420,6 +4515,150 @@ router.patch('/orders/:orderId/manual-fields', requireAuth, async (req, res) => 
     res.json({ success: true, order });
   } catch (err) {
     res.status(500).json({ error: err.message });
+  }
+});
+
+// Get item images from eBay Trading API (with caching)
+router.get('/item-images/:itemId', requireAuth, async (req, res) => {
+  try {
+    const { itemId } = req.params;
+    const { sellerId, thumbnail } = req.query; // Add thumbnail parameter
+
+    if (!sellerId) {
+      return res.status(400).json({ error: 'Seller ID is required' });
+    }
+
+    // ============================================
+    // STEP 1: CREATE CACHE KEY
+    // ============================================
+    const cacheKey = `${itemId}_${sellerId}_${thumbnail || 'full'}`;
+
+    // ============================================
+    // STEP 2: CHECK CACHE FIRST
+    // ============================================
+    const cachedData = imageCache.get(cacheKey);
+    if (cachedData) {
+      console.log(`[ImageCache] ✅ HIT: ${cacheKey}`);
+      res.set({
+        'X-Cache': 'HIT',
+        'Cache-Control': 'public, max-age=3600' // Browser cache: 1 hour
+      });
+      return res.json(cachedData);
+    }
+
+    console.log(`[ImageCache] ❌ MISS: ${cacheKey} - Fetching from eBay...`);
+
+    // ============================================
+    // STEP 3: CACHE MISS - FETCH FROM EBAY
+    // ============================================
+    // Get seller with valid token
+    const seller = await Seller.findById(sellerId).populate('user');
+    if (!seller) {
+      return res.status(404).json({ error: 'Seller not found' });
+    }
+
+    await ensureValidToken(seller);
+
+    // Use Trading API to get item details (GetItem call)
+    const xmlBody = `<?xml version="1.0" encoding="utf-8"?>
+<GetItemRequest xmlns="urn:ebay:apis:eBLBaseComponents">
+  <RequesterCredentials>
+    <eBayAuthToken>${seller.ebayTokens.access_token}</eBayAuthToken>
+  </RequesterCredentials>
+  <ItemID>${itemId}</ItemID>
+  <DetailLevel>ReturnAll</DetailLevel>
+</GetItemRequest>`;
+
+    const response = await fetch('https://api.ebay.com/ws/api.dll', {
+      method: 'POST',
+      headers: {
+        'X-EBAY-API-COMPATIBILITY-LEVEL': '967',
+        'X-EBAY-API-CALL-NAME': 'GetItem',
+        'X-EBAY-API-SITEID': '0',
+        'Content-Type': 'text/xml'
+      },
+      body: xmlBody
+    });
+
+    const xmlText = await response.text();
+    
+    // Parse XML to extract image URLs
+    const pictureURLRegex = /<PictureURL>(.*?)<\/PictureURL>/g;
+    const images = [];
+    let match;
+    
+    while ((match = pictureURLRegex.exec(xmlText)) !== null) {
+      images.push(match[1]);
+    }
+
+    if (images.length === 0) {
+      // Try to get gallery URL as fallback
+      const galleryMatch = xmlText.match(/<GalleryURL>(.*?)<\/GalleryURL>/);
+      if (galleryMatch) {
+        images.push(galleryMatch[1]);
+      }
+    }
+
+    // ============================================
+    // STEP 4: PREPARE RESPONSE DATA
+    // ============================================
+    const responseData = thumbnail === 'true' && images.length > 0
+      ? { images: [images[0]], total: images.length }
+      : { images, total: images.length };
+
+    // ============================================
+    // STEP 5: STORE IN CACHE (1 hour TTL)
+    // ============================================
+    imageCache.set(cacheKey, responseData);
+    console.log(`[ImageCache] 💾 STORED: ${cacheKey} (${images.length} images)`);
+
+    // ============================================
+    // STEP 6: SET HTTP CACHE HEADERS
+    // ============================================
+    res.set({
+      'X-Cache': 'MISS',
+      'Cache-Control': 'public, max-age=3600' // Browser cache: 1 hour
+    });
+
+    res.json(responseData);
+  } catch (error) {
+    console.error('Error fetching item images:', error);
+    res.status(500).json({ error: 'Failed to fetch item images' });
+  }
+});
+
+// ============================================
+// CACHE MANAGEMENT ENDPOINTS
+// ============================================
+
+// Get cache statistics (Admin only)
+router.get('/cache/stats', requireAuth, requireRole('superadmin', 'fulfillmentadmin'), (req, res) => {
+  try {
+    const stats = imageCache.getStats();
+    const sizeInfo = imageCache.getSizeInfo();
+    
+    res.json({
+      ...stats,
+      storage: sizeInfo,
+      message: 'Cache statistics retrieved successfully'
+    });
+  } catch (error) {
+    console.error('Error getting cache stats:', error);
+    res.status(500).json({ error: 'Failed to get cache statistics' });
+  }
+});
+
+// Clear cache (Admin only)
+router.post('/cache/clear', requireAuth, requireRole('superadmin'), (req, res) => {
+  try {
+    imageCache.clear();
+    res.json({ 
+      success: true, 
+      message: 'Image cache cleared successfully' 
+    });
+  } catch (error) {
+    console.error('Error clearing cache:', error);
+    res.status(500).json({ error: 'Failed to clear cache' });
   }
 });
 

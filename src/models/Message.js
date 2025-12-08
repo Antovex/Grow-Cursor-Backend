@@ -17,7 +17,7 @@ const MessageSchema = new mongoose.Schema(
     mediaUrls: [{ type: String }], 
 
     read: { type: Boolean, default: false },
-    messageType: { type: String, enum: ['ORDER', 'INQUIRY'], default: 'ORDER' },
+    messageType: { type: String, enum: ['ORDER', 'INQUIRY', 'DIRECT'], default: 'ORDER' },
     
     messageDate: { type: Date, default: Date.now }
   },
