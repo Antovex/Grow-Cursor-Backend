@@ -1393,6 +1393,195 @@ router.post('/orders/:orderId/upload-tracking', async (req, res) => {
   }
 });
 
+// Upload multiple tracking numbers to eBay (for orders with multiple different items)
+router.post('/orders/:orderId/upload-tracking-multiple', async (req, res) => {
+  const { orderId } = req.params;
+  const { trackingData, shippingCarrier = 'USPS' } = req.body;
+  // trackingData format: [{ itemId: '12345', trackingNumber: 'ABC123', carrier: 'USPS' }, ...]
+
+  if (!trackingData || !Array.isArray(trackingData) || trackingData.length === 0) {
+    return res.status(400).json({ error: 'Missing tracking data array' });
+  }
+
+  // Validate all tracking numbers are provided
+  const missingTracking = trackingData.some(item => !item.trackingNumber?.trim());
+  if (missingTracking) {
+    return res.status(400).json({ error: 'All items must have tracking numbers' });
+  }
+
+  try {
+    // Find the order in our database
+    const order = await Order.findById(orderId).populate('seller');
+
+    if (!order) {
+      return res.status(404).json({ error: 'Order not found' });
+    }
+
+    if (!order.seller) {
+      return res.status(400).json({ error: 'Seller not found for this order' });
+    }
+
+    // Ensure seller has valid eBay token
+    await ensureValidToken(order.seller);
+
+    if (!order.seller.ebayTokens?.access_token) {
+      return res.status(400).json({ error: 'Seller does not have valid eBay access token' });
+    }
+
+    // Get the eBay orderId
+    const ebayOrderId = order.orderId || order.legacyOrderId;
+    if (!ebayOrderId) {
+      return res.status(400).json({ error: 'Order missing eBay order ID' });
+    }
+
+    console.log(`[Upload Multiple Tracking] Processing ${trackingData.length} tracking numbers for order ${ebayOrderId}`);
+
+    // Group line items by tracking number
+    // eBay allows one fulfillment per tracking number, so we create separate fulfillments
+    const fulfillmentResults = [];
+    const errors = [];
+
+    for (let i = 0; i < trackingData.length; i++) {
+      const { itemId, trackingNumber, carrier } = trackingData[i];
+      
+      // Find matching line item(s) with this itemId
+      const matchingLineItems = order.lineItems.filter(li => li.legacyItemId === itemId);
+      
+      if (matchingLineItems.length === 0) {
+        errors.push(`Item ${itemId} not found in order`);
+        continue;
+      }
+
+      // Create fulfillment payload for this tracking number
+      const fulfillmentPayload = {
+        lineItems: matchingLineItems.map(li => ({
+          lineItemId: li.lineItemId,
+          quantity: li.quantity || 1
+        })),
+        shippedDate: new Date().toISOString(),
+        shippingCarrierCode: (carrier || shippingCarrier).toUpperCase(),
+        trackingNumber: trackingNumber.trim()
+      };
+
+      console.log(`[Upload Multiple Tracking] Uploading tracking #${i + 1}:`, fulfillmentPayload);
+
+      try {
+        // Upload to eBay
+        const fulfillmentResponse = await axios.post(
+          `https://api.ebay.com/sell/fulfillment/v1/order/${ebayOrderId}/shipping_fulfillment`,
+          fulfillmentPayload,
+          {
+            headers: {
+              'Authorization': `Bearer ${order.seller.ebayTokens.access_token}`,
+              'Content-Type': 'application/json',
+              'Accept': 'application/json'
+            }
+          }
+        );
+
+        console.log(`[Upload Multiple Tracking] ✅ Tracking #${i + 1} accepted by eBay`);
+        fulfillmentResults.push({
+          itemId,
+          trackingNumber: trackingNumber.trim(),
+          status: 'success',
+          response: fulfillmentResponse.data
+        });
+
+      } catch (err) {
+        console.error(`[Upload Multiple Tracking] ❌ Error uploading tracking #${i + 1}:`, err.response?.data || err.message);
+        
+        const errorMsg = err.response?.data?.errors?.map(e => e.message).join(', ') || err.message;
+        errors.push(`Item ${itemId}: ${errorMsg}`);
+        
+        fulfillmentResults.push({
+          itemId,
+          trackingNumber: trackingNumber.trim(),
+          status: 'error',
+          error: errorMsg
+        });
+      }
+    }
+
+    // If ALL uploads failed, return error
+    if (errors.length === trackingData.length) {
+      return res.status(400).json({
+        error: 'All tracking uploads failed',
+        details: errors,
+        results: fulfillmentResults
+      });
+    }
+
+    // Verify fulfillment status after uploads
+    console.log(`[Upload Multiple Tracking] Verifying order status...`);
+    await new Promise(r => setTimeout(r, 2000)); // Wait 2 seconds for eBay to process
+
+    try {
+      const verifyRes = await axios.get(
+        `https://api.ebay.com/sell/fulfillment/v1/order/${ebayOrderId}`,
+        {
+          headers: {
+            'Authorization': `Bearer ${order.seller.ebayTokens.access_token}`,
+            'Content-Type': 'application/json',
+            'Accept': 'application/json'
+          }
+        }
+      );
+
+      const verifiedOrder = verifyRes.data;
+      const isFulfilled = verifiedOrder.orderFulfillmentStatus === 'FULFILLED';
+
+      // Update database with first tracking number (for display purposes)
+      // Store all tracking numbers in a comma-separated format or JSON
+      const allTrackingNumbers = trackingData.map(t => t.trackingNumber.trim()).join(', ');
+      
+      order.trackingNumber = allTrackingNumbers;
+      order.manualTrackingNumber = allTrackingNumbers;
+      order.orderFulfillmentStatus = isFulfilled ? 'FULFILLED' : order.orderFulfillmentStatus;
+      order.lastModifiedDate = new Date().toISOString();
+      await order.save();
+
+      console.log(`[Upload Multiple Tracking] 💾 Database updated with ${trackingData.length} tracking numbers`);
+
+      res.json({
+        success: true,
+        message: `${fulfillmentResults.filter(r => r.status === 'success').length} tracking numbers uploaded successfully`,
+        partialSuccess: errors.length > 0,
+        results: fulfillmentResults,
+        errors: errors.length > 0 ? errors : undefined,
+        order
+      });
+
+    } catch (verifyErr) {
+      console.warn(`[Upload Multiple Tracking] ⚠️ Verification failed:`, verifyErr.message);
+      
+      // Still update DB even if verification fails (tracking was uploaded)
+      const allTrackingNumbers = trackingData.map(t => t.trackingNumber.trim()).join(', ');
+      order.trackingNumber = allTrackingNumbers;
+      order.manualTrackingNumber = allTrackingNumbers;
+      await order.save();
+
+      res.json({
+        success: true,
+        message: `${fulfillmentResults.filter(r => r.status === 'success').length} tracking numbers uploaded (verification pending)`,
+        partialSuccess: errors.length > 0,
+        results: fulfillmentResults,
+        errors: errors.length > 0 ? errors : undefined,
+        verificationWarning: 'Could not verify order status immediately',
+        order
+      });
+    }
+
+  } catch (err) {
+    console.error('[Upload Multiple Tracking] ❌ Fatal Error:', err.response?.data || err.message);
+
+    res.status(err.response?.status || 500).json({
+      error: 'Failed to upload tracking numbers',
+      details: err.response?.data || err.message,
+      statusCode: err.response?.status
+    });
+  }
+});
+
 // Poll all sellers for new/updated orders with smart detection (PARALLEL + UTC-based)
 router.post('/poll-all-sellers', requireAuth, requireRole('fulfillmentadmin', 'superadmin', 'compliancemanager', 'hoc'), async (req, res) => {
   try {
