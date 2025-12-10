@@ -68,6 +68,8 @@ const OrderSchema = new mongoose.Schema(
     beforeTax: Number,
     estimatedTax: Number,
     azOrderId: String,
+    amazonRefund: Number,
+    cardName: String, // Reference to credit card name
   },
   { timestamps: true }
 );

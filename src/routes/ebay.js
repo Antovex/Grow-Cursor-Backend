@@ -40,7 +40,7 @@ const EBAY_OAUTH_SCOPES = [
 imageCache.startAutoCleanup();
 
 // HELPER: Ensure Seller Token is Valid (Refreshes if < 2 mins left)
-async function ensureValidToken(seller) {
+async function ensureValidToken(seller, retries = 3) {
   const now = Date.now();
   const fetchedAt = seller.ebayTokens.fetchedAt ? new Date(seller.ebayTokens.fetchedAt).getTime() : 0;
   const expiresInMs = (seller.ebayTokens.expires_in || 0) * 1000;
@@ -53,32 +53,49 @@ async function ensureValidToken(seller) {
 
   console.log(`[Token Refresh] Refreshing token for ${seller.user?.username || seller._id}`);
 
-  try {
-    const refreshRes = await axios.post(
-      'https://api.ebay.com/identity/v1/oauth2/token',
-      qs.stringify({
-        grant_type: 'refresh_token',
-        refresh_token: seller.ebayTokens.refresh_token,
-        scope: EBAY_OAUTH_SCOPES // Using centralized scopes constant
-      }),
-      {
-        headers: {
-          'Content-Type': 'application/x-www-form-urlencoded',
-          Authorization: 'Basic ' + Buffer.from(`${process.env.EBAY_CLIENT_ID}:${process.env.EBAY_CLIENT_SECRET}`).toString('base64'),
-        },
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      const refreshRes = await axios.post(
+        'https://api.ebay.com/identity/v1/oauth2/token',
+        qs.stringify({
+          grant_type: 'refresh_token',
+          refresh_token: seller.ebayTokens.refresh_token,
+          scope: EBAY_OAUTH_SCOPES // Using centralized scopes constant
+        }),
+        {
+          headers: {
+            'Content-Type': 'application/x-www-form-urlencoded',
+            Authorization: 'Basic ' + Buffer.from(`${process.env.EBAY_CLIENT_ID}:${process.env.EBAY_CLIENT_SECRET}`).toString('base64'),
+          },
+          timeout: 10000 // 10 second timeout
+        }
+      );
+
+      // Update Seller
+      seller.ebayTokens.access_token = refreshRes.data.access_token;
+      seller.ebayTokens.expires_in = refreshRes.data.expires_in;
+      seller.ebayTokens.fetchedAt = new Date();
+      await seller.save();
+
+      if (attempt > 1) {
+        console.log(`[Token Refresh] ✅ Succeeded on attempt ${attempt} for ${seller.user?.username || seller._id}`);
       }
-    );
 
-    // Update Seller
-    seller.ebayTokens.access_token = refreshRes.data.access_token;
-    seller.ebayTokens.expires_in = refreshRes.data.expires_in;
-    seller.ebayTokens.fetchedAt = new Date();
-    await seller.save();
-
-    return refreshRes.data.access_token;
-  } catch (err) {
-    console.error(`[Token Refresh] Failed for ${seller._id}:`, err.message);
-    throw new Error('Failed to refresh eBay token');
+      return refreshRes.data.access_token;
+    } catch (err) {
+      const status = err.response?.status;
+      const isRetryable = status === 503 || status === 429 || err.code === 'ECONNRESET' || err.code === 'ETIMEDOUT';
+      
+      if (isRetryable && attempt < retries) {
+        const waitTime = Math.min(1000 * Math.pow(2, attempt - 1), 5000); // Exponential backoff: 1s, 2s, 4s (max 5s)
+        console.log(`[Token Refresh] ⚠️ Attempt ${attempt} failed with ${status || err.code}, retrying in ${waitTime}ms...`);
+        await new Promise(resolve => setTimeout(resolve, waitTime));
+        continue;
+      }
+      
+      console.error(`[Token Refresh] ❌ Failed for ${seller._id} after ${attempt} attempts:`, err.message);
+      throw new Error(`Failed to refresh eBay token: ${err.response?.status || err.message}`);
+    }
   }
 }
 
@@ -2112,6 +2129,138 @@ router.post('/poll-new-orders', requireAuth, requireRole('fulfillmentadmin', 'su
   }
 });
 
+// ONE-TIME RESYNC: Re-fetch orders from Dec 1, 2025 8AM UTC with USD conversion
+router.post('/resync-from-dec1', requireAuth, requireRole('fulfillmentadmin', 'superadmin'), async (req, res) => {
+  try {
+    const sellers = await Seller.find({ 'ebayTokens.access_token': { $exists: true, $ne: null } })
+      .populate('user', 'username email');
+
+    if (!sellers || sellers.length === 0) {
+      return res.status(404).json({ error: 'No sellers found with eBay tokens' });
+    }
+
+    console.log(`\n========== RESYNC FROM DEC 1, 2025 FOR ${sellers.length} SELLERS ==========`);
+
+    const resyncStartDate = new Date('2025-12-01T08:00:00.000Z');
+    const currentTimeUTC = new Date();
+    
+    const results = {
+      totalOrders: 0,
+      newOrders: 0,
+      updatedOrders: 0,
+      errors: [],
+      sellerResults: []
+    };
+
+    for (const seller of sellers) {
+      const sellerName = seller.user?.username || seller.businessName || seller._id;
+      
+      try {
+        console.log(`\n[${sellerName}] Starting resync from Dec 1, 2025...`);
+        
+        const accessToken = await ensureValidToken(seller);
+        
+        // Fetch orders from Dec 1, 2025 8AM UTC to now
+        const filter = `creationdate:[${resyncStartDate.toISOString()}..${currentTimeUTC.toISOString()}]`;
+        console.log(`[${sellerName}] Filter: ${filter}`);
+        
+        const ebayOrders = await fetchAllOrdersWithPagination(accessToken, filter, sellerName);
+        console.log(`[${sellerName}] Fetched ${ebayOrders.length} orders from eBay`);
+        
+        let newCount = 0;
+        let updateCount = 0;
+        
+        for (const ebayOrder of ebayOrders) {
+          try {
+            // Build order data with USD conversion
+            const orderData = await buildOrderData(ebayOrder, seller._id, accessToken);
+            
+            // Check if order exists in DB
+            const existingOrder = await Order.findOne({ orderId: ebayOrder.orderId });
+            
+            if (existingOrder) {
+              // Update existing order, preserve Amazon details
+              await Order.updateOne(
+                { orderId: ebayOrder.orderId },
+                {
+                  $set: {
+                    // Update eBay data
+                    lastModifiedDate: orderData.lastModifiedDate,
+                    orderFulfillmentStatus: orderData.orderFulfillmentStatus,
+                    orderPaymentStatus: orderData.orderPaymentStatus,
+                    pricingSummary: orderData.pricingSummary,
+                    cancelStatus: orderData.cancelStatus,
+                    paymentSummary: orderData.paymentSummary,
+                    lineItems: orderData.lineItems,
+                    fulfillmentHrefs: orderData.fulfillmentHrefs,
+                    // Update USD fields
+                    subtotalUSD: orderData.subtotalUSD,
+                    salesTaxUSD: orderData.salesTaxUSD,
+                    discountUSD: orderData.discountUSD,
+                    shippingUSD: orderData.shippingUSD,
+                    transactionFeesUSD: orderData.transactionFeesUSD,
+                    refundTotalUSD: orderData.refundTotalUSD,
+                    // Update denormalized fields
+                    subtotal: orderData.subtotal,
+                    salesTax: orderData.salesTax,
+                    discount: orderData.discount,
+                    shipping: orderData.shipping,
+                    transactionFees: orderData.transactionFees,
+                    cancelState: orderData.cancelState,
+                    refunds: orderData.refunds,
+                    trackingNumber: orderData.trackingNumber || existingOrder.trackingNumber
+                    // Amazon fields NOT updated (amazonAccount, beforeTax, etc.)
+                  }
+                }
+              );
+              updateCount++;
+            } else {
+              // Create new order
+              await Order.create(orderData);
+              newCount++;
+            }
+          } catch (err) {
+            console.error(`[${sellerName}] Error processing order ${ebayOrder.orderId}:`, err.message);
+            results.errors.push({ seller: sellerName, orderId: ebayOrder.orderId, error: err.message });
+          }
+        }
+        
+        console.log(`[${sellerName}] ✅ New: ${newCount}, Updated: ${updateCount}`);
+        
+        results.totalOrders += ebayOrders.length;
+        results.newOrders += newCount;
+        results.updatedOrders += updateCount;
+        results.sellerResults.push({
+          seller: sellerName,
+          total: ebayOrders.length,
+          new: newCount,
+          updated: updateCount
+        });
+        
+      } catch (err) {
+        console.error(`[${sellerName}] ❌ Error:`, err.message);
+        results.errors.push({ seller: sellerName, error: err.message });
+      }
+    }
+
+    console.log('\n========== RESYNC COMPLETE ==========');
+    console.log(`Total Orders Processed: ${results.totalOrders}`);
+    console.log(`New Orders: ${results.newOrders}`);
+    console.log(`Updated Orders: ${results.updatedOrders}`);
+    console.log(`Errors: ${results.errors.length}`);
+    
+    res.json({
+      success: true,
+      message: 'Resync from Dec 1, 2025 completed',
+      results
+    });
+
+  } catch (err) {
+    console.error('Error in resync:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Poll all sellers for ORDER UPDATES ONLY (Phase 2)
 router.post('/poll-order-updates', requireAuth, requireRole('fulfillmentadmin', 'superadmin', 'compliancemanager', 'hoc'), async (req, res) => {
   try {
@@ -2404,43 +2553,63 @@ async function fetchAllOrdersWithPagination(accessToken, filter, sellerName) {
   console.log(`[${sellerName}] Starting paginated fetch...`);
 
   while (hasMore) {
-    try {
-      const params = {
-        filter: filter,
-        limit: limit
-      };
+    let attempt = 1;
+    const maxRetries = 3;
+    let success = false;
 
-      // Only add offset if it's greater than 0
-      if (offset > 0) {
-        params.offset = offset;
+    while (attempt <= maxRetries && !success) {
+      try {
+        const params = {
+          filter: filter,
+          limit: limit
+        };
+
+        // Only add offset if it's greater than 0
+        if (offset > 0) {
+          params.offset = offset;
+        }
+
+        const response = await axios.get('https://api.ebay.com/sell/fulfillment/v1/order', {
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+            'Content-Type': 'application/json',
+          },
+          params,
+          timeout: 15000 // 15 second timeout
+        });
+
+        const orders = response.data.orders || [];
+        totalOrders = response.data.total || orders.length;
+
+        allOrders.push(...orders);
+
+        console.log(`[${sellerName}] Fetched ${orders.length} orders at offset ${offset} (total so far: ${allOrders.length}/${totalOrders})`);
+
+        // Check if there are more orders to fetch
+        if (allOrders.length >= totalOrders || orders.length < limit) {
+          hasMore = false;
+        } else {
+          offset += limit;
+          // Small delay to avoid rate limiting
+          await new Promise(resolve => setTimeout(resolve, 300));
+        }
+
+        success = true; // Mark as successful
+      } catch (err) {
+        const status = err.response?.status;
+        const isRetryable = status === 503 || status === 429 || err.code === 'ECONNRESET' || err.code === 'ETIMEDOUT';
+
+        if (isRetryable && attempt < maxRetries) {
+          const waitTime = Math.min(1000 * Math.pow(2, attempt - 1), 5000); // 1s, 2s, 4s (max 5s)
+          console.log(`[${sellerName}] ⚠️ Pagination attempt ${attempt} at offset ${offset} failed with ${status || err.code}, retrying in ${waitTime}ms...`);
+          await new Promise(resolve => setTimeout(resolve, waitTime));
+          attempt++;
+        } else {
+          console.error(`[${sellerName}] ❌ Pagination error at offset ${offset} after ${attempt} attempts:`, err.message);
+          hasMore = false; // Stop on error after retries exhausted
+          success = true; // Exit retry loop
+        }
       }
-
-      const response = await axios.get('https://api.ebay.com/sell/fulfillment/v1/order', {
-        headers: {
-          Authorization: `Bearer ${accessToken}`,
-          'Content-Type': 'application/json',
-        },
-        params
-      });
-
-      const orders = response.data.orders || [];
-      totalOrders = response.data.total || orders.length;
-
-      allOrders.push(...orders);
-
-      console.log(`[${sellerName}] Fetched ${orders.length} orders at offset ${offset} (total so far: ${allOrders.length}/${totalOrders})`);
-
-      // Check if there are more orders to fetch
-      if (allOrders.length >= totalOrders || orders.length < limit) {
-        hasMore = false;
-      } else {
-        offset += limit;
-        // Small delay to avoid rate limiting
-        await new Promise(resolve => setTimeout(resolve, 300));
-      }
-    } catch (err) {
-      console.error(`[${sellerName}] Pagination error at offset ${offset}:`, err.message);
-      hasMore = false; // Stop on error
     }
   }
 
@@ -2458,7 +2627,8 @@ async function buildOrderData(ebayOrder, sellerId, accessToken) {
   const trackingNumber = await extractTrackingNumber(ebayOrder.fulfillmentHrefs, accessToken);
   const purchaseMarketplaceId = lineItem.purchaseMarketplaceId || '';
 
-  return {
+  // Build base order data
+  const orderData = {
     seller: sellerId,
     orderId: ebayOrder.orderId,
     legacyOrderId: ebayOrder.legacyOrderId,
@@ -2506,6 +2676,8 @@ async function buildOrderData(ebayOrder, sellerId, accessToken) {
     trackingNumber,
     purchaseMarketplaceId
   };
+
+  return orderData;
 }
 
 // Update messaging status for an order
@@ -4770,7 +4942,7 @@ router.patch('/orders/:orderId/manual-fields', requireAuth, async (req, res) => 
   const { orderId } = req.params;
   const updates = req.body;
 
-  const allowedFields = ['amazonAccount', 'arrivingDate', 'beforeTax', 'estimatedTax', 'azOrderId'];
+  const allowedFields = ['amazonAccount', 'arrivingDate', 'beforeTax', 'estimatedTax', 'azOrderId', 'amazonRefund', 'cardName'];
   const updateData = {};
 
   Object.keys(updates).forEach(key => {
