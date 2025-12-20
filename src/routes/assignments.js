@@ -24,24 +24,24 @@ router.get('/filter-options', requireAuth, requireRole('superadmin', 'listingadm
       listers,
       assigners
     ] = await Promise.all([
-      Assignment.distinct('listingPlatform').then(ids => 
+      Assignment.distinct('listingPlatform').then(ids =>
         mongoose.model('Platform').find({ _id: { $in: ids } }).select('name').lean()
       ),
-      Assignment.distinct('store').then(ids => 
+      Assignment.distinct('store').then(ids =>
         mongoose.model('Store').find({ _id: { $in: ids } }).select('name').lean()
       ),
       // Fetch ALL categories from database, not just ones in assignments
       mongoose.model('Category').find({}).select('name').lean(),
       // Fetch ALL subcategories from database, not just ones in assignments
       mongoose.model('Subcategory').find({}).select('name').lean(),
-      Assignment.distinct('lister').then(ids => 
+      Assignment.distinct('lister').then(ids =>
         mongoose.model('User').find({ _id: { $in: ids } }).select('username').lean()
       ),
-      Assignment.distinct('createdBy').then(ids => 
+      Assignment.distinct('createdBy').then(ids =>
         mongoose.model('User').find({ _id: { $in: ids } }).select('username').lean()
       )
     ]);
-    
+
     // Define all available marketplaces from enum
     const allMarketplaces = ['EBAY_US', 'EBAY_AUS', 'EBAY_CANADA'];
 
@@ -91,7 +91,7 @@ router.post('/', requireAuth, requireRole('superadmin', 'listingadmin'), async (
 
     const task = await Task.findById(taskId);
     if (!task) return res.status(404).json({ message: 'Task not found.' });
-    
+
     // Get marketplace from the task
     if (!task.marketplace) {
       return res.status(400).json({ message: 'Task does not have a marketplace assigned.' });
@@ -130,9 +130,11 @@ router.post('/', requireAuth, requireRole('superadmin', 'listingadmin'), async (
   }
 });
 
+
+
 router.get('/', requireAuth, requireRole('superadmin', 'listingadmin', 'productadmin'), async (req, res) => {
   try {
-    const { 
+    const {
       taskId, listerId, platformId, storeId,
       // New filter parameters
       marketplace, productTitle,
@@ -218,7 +220,7 @@ router.get('/', requireAuth, requireRole('superadmin', 'listingadmin', 'producta
     }
     if (productTitle) {
       const titleLower = productTitle.toLowerCase();
-      items = items.filter(item => 
+      items = items.filter(item =>
         item.task?.productTitle?.toLowerCase().includes(titleLower)
       );
     }
@@ -313,7 +315,7 @@ router.get('/mine/with-status',
       const endOfToday = new Date(today.getFullYear(), today.getMonth(), today.getDate() + 1);
 
       // Only fetch assignments where scheduledDate <= today
-      const allAssignments = await Assignment.find({ 
+      const allAssignments = await Assignment.find({
         lister: meObjId,
         scheduledDate: { $lte: endOfToday }
       })
@@ -333,7 +335,7 @@ router.get('/mine/with-status',
         // An assignment is only "completed" when explicitly submitted (completedAt is set)
         // Not when ranges are just added
         const isCompleted = !!a.completedAt;
-        
+
         // Use scheduledDate instead of createdAt to categorize
         const scheduledAt = new Date(a.scheduledDate);
         const isToday = scheduledAt >= startOfToday && scheduledAt < endOfToday;
@@ -730,12 +732,12 @@ router.get('/:id/ranges',
       const doc = await Assignment.findById(id)
         .populate('rangeQuantities.range', 'name')
         .populate('task', 'category subcategory');
-      
+
       if (!doc) return res.status(404).json({ message: 'Assignment not found' });
 
       const me = req.user?.userId || req.user?.id;
       const isAdmin = ['superadmin', 'listingadmin'].includes(req.user?.role);
-      
+
       // Lister can only view their own assignments
       if (!isAdmin && String(doc.lister) !== String(me)) {
         return res.status(403).json({ message: 'Forbidden' });
@@ -758,7 +760,7 @@ router.post('/:id/complete-range',
       const { id } = req.params;
       const { rangeId, quantity, mode = 'set' } = req.body || {};
       // mode: 'set' = replace quantity, 'add' = add to existing quantity
-      
+
       if (!rangeId || quantity == null || quantity < 0) {
         return res.status(400).json({ message: 'rangeId and quantity (>= 0) required' });
       }
@@ -768,17 +770,17 @@ router.post('/:id/complete-range',
 
       const me = req.user?.userId || req.user?.id;
       const isAdmin = ['superadmin', 'listingadmin'].includes(req.user?.role);
-      
+
       // Lister can only update their own assignments
       if (!isAdmin && String(doc.lister) !== String(me)) {
         return res.status(403).json({ message: 'Forbidden' });
       }
 
       // Validate that range belongs to the task's category
-      
+
       const range = await Range.findById(rangeId).populate('category');
       if (!range) return res.status(404).json({ message: 'Range not found' });
-      
+
       if (String(range.category._id) !== String(doc.task.category)) {
         return res.status(400).json({ message: 'Range does not belong to task category' });
       }
@@ -810,10 +812,10 @@ router.post('/:id/complete-range',
 
       // Calculate total distributed quantity
       const totalDistributed = doc.rangeQuantities.reduce((sum, rq) => sum + (rq.quantity || 0), 0);
-      
+
       // Update completedQuantity
       doc.completedQuantity = Math.min(totalDistributed, doc.quantity);
-      
+
       // Auto-complete assignment when total distributed equals or exceeds assigned quantity
       if (totalDistributed >= doc.quantity && !doc.completedAt) {
         doc.completedAt = new Date();
@@ -853,12 +855,12 @@ router.post('/:id/submit',
     try {
       const { id } = req.params;
       const doc = await Assignment.findById(id).populate('task', 'category subcategory');
-      
+
       if (!doc) return res.status(404).json({ message: 'Assignment not found' });
 
       const me = req.user?.userId || req.user?.id;
       const isAdmin = ['superadmin', 'listingadmin'].includes(req.user?.role);
-      
+
       // Lister can only submit their own assignments
       if (!isAdmin && String(doc.lister) !== String(me)) {
         return res.status(403).json({ message: 'Forbidden' });
@@ -866,11 +868,11 @@ router.post('/:id/submit',
 
       // Calculate total distributed quantity
       const totalDistributed = doc.rangeQuantities.reduce((sum, rq) => sum + (rq.quantity || 0), 0);
-      
+
       // Validate that total distributed equals assigned quantity
       if (totalDistributed < doc.quantity) {
-        return res.status(400).json({ 
-          message: `Cannot submit: distributed quantity (${totalDistributed}) is less than assigned quantity (${doc.quantity})` 
+        return res.status(400).json({
+          message: `Cannot submit: distributed quantity (${totalDistributed}) is less than assigned quantity (${doc.quantity})`
         });
       }
 
@@ -882,7 +884,7 @@ router.post('/:id/submit',
 
       // Update or create ListingCompletion record
       const existingCompletion = await ListingCompletion.findOne({ assignment: doc._id });
-      
+
       const completionData = {
         date: new Date(),
         assignment: doc._id,
@@ -924,11 +926,11 @@ router.post('/:id/submit',
 // --- NEW ROUTE: BULK ASSIGNMENT ---
 router.post('/bulk', requireAuth, requireRole('superadmin', 'listingadmin'), async (req, res) => {
   try {
-    const { 
-      listerId, 
-      listingPlatformId, 
+    const {
+      listerId,
+      listingPlatformId,
       storeId: defaultStoreId, // Renamed to clarify it's a fallback
-      notes, 
+      notes,
       scheduledDate,
       assignments // Array of { taskId, quantity, storeId }
     } = req.body || {};
@@ -945,7 +947,7 @@ router.post('/bulk', requireAuth, requireRole('superadmin', 'listingadmin'), asy
 
     for (const item of assignments) {
       const { taskId, quantity, storeId } = item;
-      
+
       // Use specific storeId if provided, otherwise fallback to default
       const finalStoreId = storeId || defaultStoreId;
 
@@ -953,7 +955,7 @@ router.post('/bulk', requireAuth, requireRole('superadmin', 'listingadmin'), asy
         errors.push(`Task ${taskId} missing Store ID`);
         continue;
       }
-      
+
       try {
         const task = await Task.findById(taskId);
         if (!task) {
@@ -985,10 +987,10 @@ router.post('/bulk', requireAuth, requireRole('superadmin', 'listingadmin'), asy
       }
     }
 
-    res.status(201).json({ 
-      success: true, 
-      count: createdAssignments.length, 
-      errors: errors.length > 0 ? errors : undefined 
+    res.status(201).json({
+      success: true,
+      count: createdAssignments.length,
+      errors: errors.length > 0 ? errors : undefined
     });
 
   } catch (e) {
