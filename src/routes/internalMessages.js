@@ -2,6 +2,7 @@ import { Router } from 'express';
 import { requireAuth, requireRole } from '../middleware/auth.js';
 import InternalMessage from '../models/InternalMessage.js';
 import User from '../models/User.js';
+import { io } from '../index.js';
 
 const router = Router();
 
@@ -193,6 +194,12 @@ router.post('/send', requireAuth, async (req, res) => {
     // Populate for response
     await newMessage.populate('sender', 'username role');
     await newMessage.populate('recipient', 'username role');
+
+    // Emit socket event to recipient
+    io.to(`user-${recipientId}`).emit('new-message', {
+      message: newMessage,
+      conversationId: conversationId
+    });
 
     res.json(newMessage);
   } catch (err) {

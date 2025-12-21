@@ -1,4 +1,6 @@
 import express from 'express';
+import { createServer } from 'http';
+import { Server } from 'socket.io';
 import cors from 'cors';
 import helmet from 'helmet';
 import morgan from 'morgan';
@@ -39,6 +41,30 @@ import exchangeRatesRoutes from './routes/exchangeRates.js';
 import internalMessagesRoutes from './routes/internalMessages.js';
 
 const app = express();
+const httpServer = createServer(app);
+
+// Set up Socket.IO with CORS
+export const io = new Server(httpServer, {
+  cors: {
+    origin: '*',
+    methods: ['GET', 'POST']
+  }
+});
+
+// Socket.IO connection handler
+io.on('connection', (socket) => {
+  console.log(`Socket connected: ${socket.id}`);
+
+  // Join user-specific room
+  socket.on('join', (userId) => {
+    socket.join(`user-${userId}`);
+    console.log(`User ${userId} joined room user-${userId}`);
+  });
+
+  socket.on('disconnect', () => {
+    console.log(`Socket disconnected: ${socket.id}`);
+  });
+});
 
 app.use(helmet());
 app.use(cors({
@@ -110,8 +136,9 @@ connectToDatabase()
       console.error('Failed to create sparse unique index on email:', e?.message || e);
     }
 
-    app.listen(port, () => {
+    httpServer.listen(port, () => {
       console.log(`API listening on :${port}`);
+      console.log(`Socket.IO server ready`);
     });
   })
   .catch((err) => {
