@@ -127,10 +127,11 @@ async function calculateFinancials(order, marketplace = 'EBAY') {
   // NET = orderEarnings - tds - tid
   updates.net = parseFloat((earnings - updates.tds - updates.tid).toFixed(2));
 
-  // P.Balance INR = net × exchangeRate
-  // Fetch latest eBay exchange rate for the marketplace
+  // P.Balance INR = net × eBay exchangeRate (USD to INR)
+  // ALWAYS use EBAY marketplace (USD to INR) regardless of order marketplace
+  // Because orderEarnings is already in USD after conversion
   try {
-    const exchangeRate = await ExchangeRate.findOne({ marketplace }).sort({ effectiveDate: -1 });
+    const exchangeRate = await ExchangeRate.findOne({ marketplace: 'EBAY' }).sort({ effectiveDate: -1 });
     if (exchangeRate && exchangeRate.rate) {
       updates.ebayExchangeRate = exchangeRate.rate; // Store the eBay exchange rate used
       updates.pBalanceINR = parseFloat((updates.net * exchangeRate.rate).toFixed(2));
@@ -143,6 +144,13 @@ async function calculateFinancials(order, marketplace = 'EBAY') {
     updates.ebayExchangeRate = null;
     updates.pBalanceINR = null;
   }
+
+  // Calculate and store profit per order
+  // Profit = P.Balance (INR) - A_total-inr - Total_CC
+  const pBalanceINR = updates.pBalanceINR !== undefined ? updates.pBalanceINR : (order.pBalanceINR || 0);
+  const amazonTotalINR = order.amazonTotalINR || 0;
+  const totalCC = order.totalCC || 0;
+  updates.profit = parseFloat((pBalanceINR - amazonTotalINR - totalCC).toFixed(2));
 
   return updates;
 }
@@ -213,6 +221,13 @@ async function calculateAmazonFinancials(order) {
     updates.igst = null;
     updates.totalCC = null;
   }
+
+  // Recalculate profit after Amazon financials update
+  // Profit = P.Balance (INR) - A_total-inr - Total_CC
+  const pBalanceINR = order.pBalanceINR || 0;
+  const amazonTotalINR = updates.amazonTotalINR !== undefined ? updates.amazonTotalINR : (order.amazonTotalINR || 0);
+  const totalCC = updates.totalCC !== undefined ? updates.totalCC : (order.totalCC || 0);
+  updates.profit = parseFloat((pBalanceINR - amazonTotalINR - totalCC).toFixed(2));
 
   return updates;
 }
@@ -5981,7 +5996,7 @@ router.post('/cache/clear', requireAuth, requireRole('superadmin'), (req, res) =
 // Seller Analytics - Aggregated data by day/week/month
 router.get('/seller-analytics', requireAuth, requireRole('fulfillmentadmin', 'superadmin', 'hoc'), async (req, res) => {
   try {
-    const { sellerId, groupBy = 'day', startDate, endDate } = req.query;
+    const { sellerId, groupBy = 'day', startDate, endDate, marketplace } = req.query;
 
     if (!startDate || !endDate) {
       return res.status(400).json({ error: 'Start date and end date are required' });
@@ -6025,6 +6040,12 @@ router.get('/seller-analytics', requireAuth, requireRole('fulfillmentadmin', 'su
       matchQuery.seller = new mongoose.Types.ObjectId(sellerId);
     }
 
+    if (marketplace) {
+      // Handle Canada marketplace mapping: EBAY_ENCA → EBAY_CA
+      const marketplaceId = marketplace === 'EBAY_ENCA' ? 'EBAY_CA' : marketplace;
+      matchQuery.purchaseMarketplaceId = marketplaceId;
+    }
+
     // Determine grouping format with PST timezone
     let dateGroupFormat;
     if (groupBy === 'day') {
@@ -6053,7 +6074,8 @@ router.get('/seller-analytics', requireAuth, requireRole('fulfillmentadmin', 'su
           totalEarnings: { $sum: { $ifNull: ['$orderEarnings', 0] } },
           totalPBalanceINR: { $sum: { $ifNull: ['$pBalanceINR', 0] } },
           totalAmazonCosts: { $sum: { $ifNull: ['$amazonTotalINR', 0] } },
-          totalCreditCardFees: { $sum: { $ifNull: ['$totalCC', 0] } }
+          totalCreditCardFees: { $sum: { $ifNull: ['$totalCC', 0] } },
+          totalProfit: { $sum: { $ifNull: ['$profit', 0] } }
         }
       },
       {
@@ -6070,17 +6092,7 @@ router.get('/seller-analytics', requireAuth, requireRole('fulfillmentadmin', 'su
           totalPBalanceINR: { $round: ['$totalPBalanceINR', 2] },
           totalAmazonCosts: { $round: ['$totalAmazonCosts', 2] },
           totalCreditCardFees: { $round: ['$totalCreditCardFees', 2] },
-          totalProfit: { 
-            $round: [
-              { 
-                $subtract: [
-                  { $subtract: ['$totalPBalanceINR', '$totalAmazonCosts'] },
-                  '$totalCreditCardFees'
-                ]
-              },
-              2
-            ]
-          },
+          totalProfit: { $round: ['$totalProfit', 2] },
           _id: 0
         }
       },

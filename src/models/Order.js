@@ -95,6 +95,7 @@ const OrderSchema = new mongoose.Schema(
     marketplaceFee: Number, // 4% of amazonTotalINR
     igst: Number, // 18% of marketplaceFee
     totalCC: Number, // marketplaceFee + igst
+    profit: { type: Number, default: 0 }, // P.Balance (INR) - A_total-inr - Total_CC
   },
   { timestamps: true }
 );
