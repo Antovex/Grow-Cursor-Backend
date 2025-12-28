@@ -3,7 +3,8 @@ import mongoose from 'mongoose';
 const BankAccountSchema = new mongoose.Schema(
     {
         name: { type: String, required: true, unique: true }, // e.g., "HDFC Bank"
-        accountNumber: { type: String }
+        accountNumber: { type: String },
+        ifscCode: { type: String }
     },
     { timestamps: true }
 );

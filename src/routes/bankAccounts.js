@@ -17,11 +17,11 @@ router.get('/', requireAuth, requireRole('superadmin'), async (req, res) => {
 // POST /api/bank-accounts - Create
 router.post('/', requireAuth, requireRole('superadmin'), async (req, res) => {
     try {
-        const { name, accountNumber } = req.body;
+        const { name, accountNumber, ifscCode } = req.body;
         if (!name) {
             return res.status(400).json({ error: 'Name is required' });
         }
-        const newAccount = new BankAccount({ name, accountNumber });
+        const newAccount = new BankAccount({ name, accountNumber, ifscCode });
         await newAccount.save();
         res.status(201).json(newAccount);
     } catch (err) {
@@ -36,10 +36,10 @@ router.post('/', requireAuth, requireRole('superadmin'), async (req, res) => {
 router.put('/:id', requireAuth, requireRole('superadmin'), async (req, res) => {
     try {
         const { id } = req.params;
-        const { name, accountNumber } = req.body;
+        const { name, accountNumber, ifscCode } = req.body;
         const account = await BankAccount.findByIdAndUpdate(
             id,
-            { name, accountNumber },
+            { name, accountNumber, ifscCode },
             { new: true }
         );
         res.json(account);
