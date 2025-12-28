@@ -1,0 +1,139 @@
+import express from 'express';
+import Transaction from '../models/Transaction.js';
+import { requireAuth, requireRole } from '../middleware/auth.js';
+
+const router = express.Router();
+
+// GET /api/transactions/balance-summary - Get balance per bank account
+router.get('/balance-summary', requireAuth, requireRole('superadmin'), async (req, res) => {
+    try {
+        const summary = await Transaction.aggregate([
+            {
+                $group: {
+                    _id: '$bankAccount',
+                    totalCredit: {
+                        $sum: {
+                            $cond: [{ $eq: ['$transactionType', 'Credit'] }, '$amount', 0]
+                        }
+                    },
+                    totalDebit: {
+                        $sum: {
+                            $cond: [{ $eq: ['$transactionType', 'Debit'] }, '$amount', 0]
+                        }
+                    }
+                }
+            },
+            {
+                $lookup: {
+                    from: 'bankaccounts',
+                    localField: '_id',
+                    foreignField: '_id',
+                    as: 'bankDetails'
+                }
+            },
+            {
+                $unwind: '$bankDetails'
+            },
+            {
+                $project: {
+                    bankName: '$bankDetails.name',
+                    balance: { $subtract: ['$totalCredit', '$totalDebit'] }
+                }
+            },
+            {
+                $sort: { bankName: 1 }
+            }
+        ]);
+        res.json(summary);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// GET /api/transactions - List all
+router.get('/', requireAuth, requireRole('superadmin'), async (req, res) => {
+    try {
+        const transactions = await Transaction.find()
+            .populate('bankAccount', 'name')
+            .sort({ date: -1 });
+        res.json(transactions);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// POST /api/transactions - Create Manual Transaction
+router.post('/', requireAuth, requireRole('superadmin'), async (req, res) => {
+    try {
+        const { date, bankAccount, transactionType, amount, remark } = req.body;
+
+        if (!date || !bankAccount || !transactionType || !amount) {
+            return res.status(400).json({ error: 'Missing required fields' });
+        }
+
+        const newTransaction = new Transaction({
+            date,
+            bankAccount,
+            transactionType,
+            amount,
+            remark,
+            source: 'MANUAL'
+        });
+
+        await newTransaction.save();
+        await newTransaction.populate('bankAccount', 'name');
+
+        res.status(201).json(newTransaction);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// PUT /api/transactions/:id - Update Manual Transaction
+router.put('/:id', requireAuth, requireRole('superadmin'), async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { date, bankAccount, transactionType, amount, remark } = req.body;
+
+        const transaction = await Transaction.findById(id);
+        if (!transaction) return res.status(404).json({ error: 'Transaction not found' });
+
+        if (transaction.source !== 'MANUAL') {
+            return res.status(403).json({ error: 'Cannot edit auto-generated transactions manually.' });
+        }
+
+        if (date) transaction.date = date;
+        if (bankAccount) transaction.bankAccount = bankAccount;
+        if (transactionType) transaction.transactionType = transactionType;
+        if (amount) transaction.amount = amount;
+        if (remark !== undefined) transaction.remark = remark;
+
+        await transaction.save();
+        await transaction.populate('bankAccount', 'name');
+
+        res.json(transaction);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// DELETE /api/transactions/:id - Delete Manual Transaction
+router.delete('/:id', requireAuth, requireRole('superadmin'), async (req, res) => {
+    try {
+        const { id } = req.params;
+        const transaction = await Transaction.findById(id);
+
+        if (!transaction) return res.status(404).json({ error: 'Transaction not found' });
+
+        if (transaction.source !== 'MANUAL') {
+            return res.status(403).json({ error: 'Cannot delete auto-generated transactions manually.' });
+        }
+
+        await Transaction.findByIdAndDelete(id);
+        res.json({ message: 'Transaction deleted' });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+export default router;

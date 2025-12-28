@@ -37,14 +37,18 @@ import uploadRoutes from './routes/upload.js';
 import creditCardRoutes from './routes/creditCards.js';
 import exchangeRatesRoutes from './routes/exchangeRates.js';
 import internalMessagesRoutes from './routes/internalMessages.js';
+import payoneerRoutes from './routes/payoneer.js';
+import paymentAccountRoutes from './routes/paymentAccounts.js';
+import transactionRoutes from './routes/transactions.js';
+import bankAccountRoutes from './routes/bankAccounts.js';
 
 const app = express();
 
 app.use(helmet());
 app.use(cors({
-    origin: '*',
-    methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization']
+  origin: '*',
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization']
 }));
 app.use(express.json());
 app.use(morgan('dev'));
@@ -91,6 +95,10 @@ app.use('/api/upload', uploadRoutes);
 app.use('/api/credit-cards', creditCardRoutes);
 app.use('/api/exchange-rates', exchangeRatesRoutes);
 app.use('/api/internal-messages', internalMessagesRoutes);
+app.use('/api/payoneer', payoneerRoutes);
+app.use('/api/payment-accounts', paymentAccountRoutes);
+app.use('/api/transactions', transactionRoutes);
+app.use('/api/bank-accounts', bankAccountRoutes);
 
 
 const port = process.env.PORT || 5000;
