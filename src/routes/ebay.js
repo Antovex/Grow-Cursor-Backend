@@ -4761,7 +4761,8 @@ router.post('/send-message', requireAuth, requireRole('fulfillmentadmin', 'super
 // 4. GET THREADS (With Pagination & Search)
 router.get('/chat/threads', requireAuth, async (req, res) => {
   try {
-    const { sellerId, page = 1, limit = 20, search = '', filterType = 'ALL' } = req.query;
+    const { sellerId, page = 1, limit = 20, search = '', filterType = 'ALL', filterMarketplace = '' } = req.query;
+
 
     const pageNum = parseInt(page);
     const limitNum = parseInt(limit);
@@ -4823,11 +4824,55 @@ router.get('/chat/threads', requireAuth, async (req, res) => {
         itemTitle: 1,
         messageType: 1,
         unreadCount: 1,
-        buyerName: { $arrayElemAt: ["$orderDetails.buyer.buyerRegistrationAddress.fullName", 0] }
+        buyerName: { $arrayElemAt: ["$orderDetails.buyer.buyerRegistrationAddress.fullName", 0] },
+        // NEW: Get Marketplace ID from Order
+        orderMarketplaceId: { $arrayElemAt: ["$orderDetails.purchaseMarketplaceId", 0] }
       }
     });
 
-    // 5.1. FILTER BY TYPE (NEW)
+    // 5.0 LOOKUP LISTING DETAILS (For Currency -> Marketplace fallback)
+    pipeline.push({
+      $lookup: {
+        from: 'listings',
+        localField: 'itemId',
+        foreignField: 'itemId',
+        as: 'listingDetails'
+      }
+    });
+
+    // 5.1 COMPUTE MARKETPLACE ID
+    pipeline.push({
+      $addFields: {
+        listingCurrency: { $arrayElemAt: ["$listingDetails.currency", 0] }
+      }
+    });
+
+    pipeline.push({
+      $addFields: {
+        computedMarketplaceId: {
+          $switch: {
+            branches: [
+              // Case 1: Order exists
+              {
+                case: { $ifNull: ["$orderMarketplaceId", false] },
+                then: "$orderMarketplaceId"
+              },
+              // Case 2: Listing Currency Map
+              { case: { $eq: ["$listingCurrency", "USD"] }, then: "EBAY_US" },
+              { case: { $eq: ["$listingCurrency", "CAD"] }, then: "EBAY_CA" },
+              { case: { $eq: ["$listingCurrency", "AUD"] }, then: "EBAY_AU" },
+              { case: { $eq: ["$listingCurrency", "GBP"] }, then: "EBAY_GB" },
+              { case: { $eq: ["$listingCurrency", "EUR"] }, then: "EBAY_DE" },
+              // Case 3: Inferred from Item ItemID (basic assumption, can be refined)
+              // If we really wanted to we could check site ID here but currency is best proxy
+            ],
+            default: "Unknown"
+          }
+        }
+      }
+    });
+
+    // 5.2. FILTER BY TYPE
     if (filterType === 'ORDER') {
       pipeline.push({
         $match: {
@@ -4845,6 +4890,14 @@ router.get('/chat/threads', requireAuth, async (req, res) => {
             { orderId: null }
           ]
         }
+      });
+    }
+
+    // 5.3 FILTER BY MARKETPLACE (NEW)
+    if (filterMarketplace && filterMarketplace !== '') {
+      // If filtering by specific marketplace
+      pipeline.push({
+        $match: { computedMarketplaceId: filterMarketplace }
       });
     }
 
@@ -4882,6 +4935,117 @@ router.get('/chat/threads', requireAuth, async (req, res) => {
 
     const threads = result[0].data;
     const total = result[0].metadata[0] ? result[0].metadata[0].total : 0;
+
+    // --- NEW: MARKETPLACE RESOLUTION LOGIC ---
+    // Process threads to add 'marketplaceId'
+    // 1. Order -> purchaseMarketplaceId
+    // 2. Listing currency -> Inferred Marketplace
+    // 3. API -> GetItem -> Site -> Marketplace
+
+    // Currency Map
+    const currencyToMarketplace = {
+      'USD': 'EBAY_US',
+      'CAD': 'EBAY_CA',
+      'AUD': 'EBAY_AU',
+      'GBP': 'EBAY_GB',
+      'EUR': 'EBAY_DE' // Defaulting EUR to DE as it's most common, but could be others. 
+      // Ideally we want specific site ID from API if inconsistent.
+    };
+
+    // Helper to get Site ID from API
+    async function fetchItemSiteFromApi(itemId, sellerId) {
+      try {
+        const seller = await Seller.findById(sellerId);
+        if (!seller) return null;
+
+        const token = await ensureValidToken(seller);
+
+        const xmlRequest = `
+          <?xml version="1.0" encoding="utf-8"?>
+          <GetItemRequest xmlns="urn:ebay:apis:eBLBaseComponents">
+            <RequesterCredentials><eBayAuthToken>${token}</eBayAuthToken></RequesterCredentials>
+            <ErrorLanguage>en_US</ErrorLanguage>
+            <WarningLevel>High</WarningLevel>
+            <ItemID>${itemId}</ItemID>
+            <DetailLevel>ItemReturnDescription</DetailLevel>
+            <IncludeItemSpecifics>false</IncludeItemSpecifics>
+          </GetItemRequest>
+        `;
+
+        const response = await axios.post('https://api.ebay.com/ws/api.dll', xmlRequest, {
+          headers: {
+            'X-EBAY-API-SITEID': '0',
+            'X-EBAY-API-COMPATIBILITY-LEVEL': '1423',
+            'X-EBAY-API-CALL-NAME': 'GetItem',
+            'Content-Type': 'text/xml'
+          }
+        });
+
+        const result = await parseStringPromise(response.data);
+        if (result.GetItemResponse.Ack[0] === 'Failure') return null;
+
+        const item = result.GetItemResponse.Item[0];
+        const site = item.Site[0]; // e.g. "US", "Canada", "Australia"
+        const currency = item.Currency[0]; // e.g., "USD"
+
+        // Map Site to ID
+        const siteMap = {
+          'US': 'EBAY_US',
+          'Canada': 'EBAY_CA',
+          'Australia': 'EBAY_AU',
+          'UK': 'EBAY_GB',
+          'Germany': 'EBAY_DE',
+          'France': 'EBAY_FR',
+          'Italy': 'EBAY_IT',
+          'Spain': 'EBAY_ES'
+        };
+
+        return {
+          marketplaceId: siteMap[site] || 'EBAY_US', // Default to US if unknown
+          currency: currency
+        };
+
+      } catch (err) {
+        console.error(`[Fetch Item Site] Failed for ${itemId}:`, err.message);
+        return null;
+      }
+    }
+
+    // Process in parallel
+    await Promise.all(threads.map(async (thread) => {
+      // Use computed value from aggregation if available and valid
+      if (thread.computedMarketplaceId && thread.computedMarketplaceId !== 'Unknown') {
+        thread.marketplaceId = thread.computedMarketplaceId;
+        return;
+      }
+
+      // Fallback: Check if we have valid IDs to check API (Only if computed was Unknown)
+      if (thread.itemId && thread.itemId !== 'DIRECT_MESSAGE') {
+        const apiResult = await fetchItemSiteFromApi(thread.itemId, thread.sellerId);
+        if (apiResult) {
+          thread.marketplaceId = apiResult.marketplaceId;
+
+          // Save to Listing DB so next time it's fast
+          try {
+            await Listing.findOneAndUpdate(
+              { itemId: thread.itemId },
+              {
+                seller: thread.sellerId,
+                itemId: thread.itemId,
+                currency: apiResult.currency,
+              },
+              { upsert: true, setDefaultsOnInsert: true }
+            );
+          } catch (e) {
+            console.error('Failed to cache listing marketplace', e);
+          }
+        } else {
+          thread.marketplaceId = 'Unknown';
+        }
+      } else {
+        thread.marketplaceId = 'System'; // Direct messages
+      }
+    }));
 
     res.json({ threads, total, page: pageNum, pages: Math.ceil(total / limitNum) });
 
