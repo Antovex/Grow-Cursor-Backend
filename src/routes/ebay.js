@@ -5119,6 +5119,33 @@ router.get('/chat/search-order', requireAuth, async (req, res) => {
   }
 });
 
+// 7. MARK CONVERSATION AS UNREAD
+router.post('/chat/mark-unread', requireAuth, async (req, res) => {
+  const { orderId, buyerUsername, itemId } = req.body;
+
+  try {
+    let query = {};
+    if (orderId) {
+      query.orderId = orderId;
+    } else if (buyerUsername && itemId) {
+      query.buyerUsername = buyerUsername;
+      query.itemId = itemId;
+    } else {
+      return res.status(400).json({ error: 'Invalid query params' });
+    }
+
+    // Mark buyer messages as unread
+    const result = await Message.updateMany(
+      { ...query, sender: 'BUYER' },
+      { read: false }
+    );
+
+    res.json({ success: true, modifiedCount: result.modifiedCount });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ===== BUYER MESSAGES ENDPOINTS =====
 
 // Fetch buyer messages/inquiries from eBay Post-Order API and store in DB
