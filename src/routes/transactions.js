@@ -121,7 +121,7 @@ router.post('/', requireAuth, requireRole('superadmin'), async (req, res) => {
             amount,
             remark,
             source: 'MANUAL',
-            creditCardName: transactionType === 'Debit' ? creditCardName : undefined
+            creditCardName: transactionType === 'Debit' && creditCardName ? creditCardName : undefined
         });
 
         await newTransaction.save();
@@ -138,7 +138,7 @@ router.post('/', requireAuth, requireRole('superadmin'), async (req, res) => {
 router.put('/:id', requireAuth, requireRole('superadmin'), async (req, res) => {
     try {
         const { id } = req.params;
-        const { date, bankAccount, transactionType, amount, remark } = req.body;
+        const { date, bankAccount, transactionType, amount, remark, creditCardName } = req.body;
 
         const transaction = await Transaction.findById(id);
         if (!transaction) return res.status(404).json({ error: 'Transaction not found' });
@@ -152,7 +152,7 @@ router.put('/:id', requireAuth, requireRole('superadmin'), async (req, res) => {
         if (transactionType) transaction.transactionType = transactionType;
         if (amount) transaction.amount = amount;
         if (remark !== undefined) transaction.remark = remark;
-        if (creditCardName !== undefined) transaction.creditCardName = transactionType === 'Debit' ? creditCardName : undefined;
+        if (creditCardName !== undefined) transaction.creditCardName = transactionType === 'Debit' && creditCardName ? creditCardName : undefined;
 
         await transaction.save();
         await transaction.populate('bankAccount', 'name');
