@@ -1102,7 +1102,7 @@ router.get('/cancelled-orders', async (req, res) => {
 
 // Get stored orders from database with pagination support
 router.get('/stored-orders', async (req, res) => {
-  const { sellerId, page = 1, limit = 50, searchOrderId, searchBuyerName, searchMarketplace, paymentStatus, startDate, endDate, awaitingShipment, hasFulfillmentNotes } = req.query;
+  const { sellerId, page = 1, limit = 50, searchOrderId, searchBuyerName, searchItemId, searchMarketplace, paymentStatus, startDate, endDate, awaitingShipment, hasFulfillmentNotes } = req.query;
 
   try {
     let query = {};
@@ -1138,6 +1138,14 @@ router.get('/stored-orders', async (req, res) => {
 
     if (searchBuyerName) {
       query['buyer.buyerRegistrationAddress.fullName'] = { $regex: searchBuyerName, $options: 'i' };
+    }
+
+    // Item ID search (searches both lineItems.legacyItemId and itemNumber)
+    if (searchItemId) {
+      query.$or = [
+        { 'lineItems.legacyItemId': { $regex: searchItemId, $options: 'i' } },
+        { itemNumber: { $regex: searchItemId, $options: 'i' } }
+      ];
     }
 
     // Timezone-Aware Date Range Logic
@@ -4761,7 +4769,7 @@ router.post('/send-message', requireAuth, requireRole('fulfillmentadmin', 'super
 // 4. GET THREADS (With Pagination & Search)
 router.get('/chat/threads', requireAuth, async (req, res) => {
   try {
-    const { sellerId, page = 1, limit = 20, search = '', filterType = 'ALL', filterMarketplace = '' } = req.query;
+    const { sellerId, page = 1, limit = 20, search = '', filterType = 'ALL', filterMarketplace = '', showUnreadOnly = 'false' } = req.query;
 
 
     const pageNum = parseInt(page);
@@ -4898,6 +4906,13 @@ router.get('/chat/threads', requireAuth, async (req, res) => {
       // If filtering by specific marketplace
       pipeline.push({
         $match: { computedMarketplaceId: filterMarketplace }
+      });
+    }
+
+    // 5.4 FILTER BY UNREAD STATUS (NEW)
+    if (showUnreadOnly === 'true') {
+      pipeline.push({
+        $match: { unreadCount: { $gt: 0 } }
       });
     }
 
