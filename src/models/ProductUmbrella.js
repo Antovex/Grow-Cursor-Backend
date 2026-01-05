@@ -1,11 +1,24 @@
 import mongoose from 'mongoose';
 
+const customColumnConfigSchema = new mongoose.Schema({
+  columnId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'CustomColumn',
+    required: true
+  },
+  prompt: {
+    type: String,
+    required: true
+  }
+}, { _id: false });
+
 const productUmbrellaSchema = new mongoose.Schema({
   name: {
     type: String,
     required: true,
     trim: true
   },
+  customColumns: [customColumnConfigSchema],
   createdBy: {
     type: mongoose.Schema.Types.ObjectId,
     ref: 'User'

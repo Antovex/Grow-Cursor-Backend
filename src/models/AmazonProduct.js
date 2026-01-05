@@ -37,6 +37,11 @@ const amazonProductSchema = new mongoose.Schema({
   rawData: {
     type: mongoose.Schema.Types.Mixed
   },
+  customFields: {
+    type: Map,
+    of: String,
+    default: {}
+  },
   createdBy: {
     type: mongoose.Schema.Types.ObjectId,
     ref: 'User'

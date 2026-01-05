@@ -11,6 +11,7 @@ router.get('/', requireAuth, async (req, res) => {
     const filter = sellerId ? { sellerId } : {};
     
     const umbrellas = await ProductUmbrella.find(filter)
+      .populate('customColumns.columnId', 'name prompt dataType')
       .populate('createdBy', 'name email')
       .sort({ createdAt: -1 });
     
@@ -25,6 +26,7 @@ router.get('/', requireAuth, async (req, res) => {
 router.get('/:id', requireAuth, async (req, res) => {
   try {
     const umbrella = await ProductUmbrella.findById(req.params.id)
+      .populate('customColumns.columnId', 'name prompt dataType')
       .populate('createdBy', 'name email');
     
     if (!umbrella) {
@@ -41,7 +43,7 @@ router.get('/:id', requireAuth, async (req, res) => {
 // Create new product umbrella
 router.post('/', requireAuth, async (req, res) => {
   try {
-    const { name } = req.body;
+    const { name, customColumns } = req.body;
     
     if (!name) {
       return res.status(400).json({ error: 'Name is required' });
@@ -49,10 +51,12 @@ router.post('/', requireAuth, async (req, res) => {
     
     const umbrella = new ProductUmbrella({
       name,
+      customColumns: customColumns || [],
       createdBy: req.user.userId
     });
     
     await umbrella.save();
+    await umbrella.populate('customColumns.columnId', 'name prompt dataType');
     await umbrella.populate('createdBy', 'name email');
     
     res.status(201).json(umbrella);
@@ -65,13 +69,18 @@ router.post('/', requireAuth, async (req, res) => {
 // Update product umbrella
 router.put('/:id', requireAuth, async (req, res) => {
   try {
-    const { name } = req.body;
+    const { name, customColumns } = req.body;
     
     const umbrella = await ProductUmbrella.findByIdAndUpdate(
       req.params.id,
-      { name, updatedAt: Date.now() },
+      { 
+        name, 
+        customColumns: customColumns || [],
+        updatedAt: Date.now() 
+      },
       { new: true, runValidators: true }
     )
+      .populate('customColumns.columnId', 'name prompt dataType')
       .populate('createdBy', 'name email');
     
     if (!umbrella) {

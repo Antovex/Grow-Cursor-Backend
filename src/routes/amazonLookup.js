@@ -1,6 +1,8 @@
 import express from 'express';
 import { requireAuth } from '../middleware/auth.js';
 import AmazonProduct from '../models/AmazonProduct.js';
+import ProductUmbrella from '../models/ProductUmbrella.js';
+import { generateWithGemini, replacePlaceholders } from '../utils/gemini.js';
 
 const router = express.Router();
 
@@ -79,9 +81,60 @@ router.post('/', requireAuth, async (req, res) => {
 
     // If sellerId and productUmbrellaId are provided, save to database
     if (productUmbrellaId) {
+      // Fetch the product umbrella with custom columns
+      const umbrella = await ProductUmbrella.findById(productUmbrellaId)
+        .populate('customColumns.columnId');
+      
+      if (!umbrella) {
+        return res.status(404).json({ error: 'Product umbrella not found' });
+      }
+
+      // Generate custom fields using Gemini
+      const customFields = {};
+      
+      if (umbrella.customColumns && umbrella.customColumns.length > 0) {
+        const dataForPlaceholders = {
+          title,
+          brand,
+          description,
+          price,
+          asin
+        };
+
+        // Process each custom column
+        for (const customCol of umbrella.customColumns) {
+          try {
+            const columnName = customCol.columnId.name;
+            const promptTemplate = customCol.prompt;
+            
+            // Replace placeholders in the prompt
+            const processedPrompt = replacePlaceholders(promptTemplate, dataForPlaceholders);
+            
+            // Generate content with OpenAI
+            console.log(`Generating ${columnName} for ASIN ${asin}...`);
+            let generatedValue = await generateWithGemini(processedPrompt);
+            
+            // Truncate to 80 characters if it's an eBay title column
+            if (columnName.toLowerCase().includes('ebay') && columnName.toLowerCase().includes('title')) {
+              if (generatedValue.length > 80) {
+                generatedValue = generatedValue.substring(0, 80);
+                console.log(`Truncated ${columnName} to exactly 80 characters`);
+              }
+            }
+            
+            customFields[columnName] = generatedValue;
+            console.log(`Generated ${columnName}: ${generatedValue.substring(0, 50)}...`);
+          } catch (error) {
+            console.error(`Error generating ${customCol.columnId.name}:`, error);
+            customFields[customCol.columnId.name] = 'Error generating content';
+          }
+        }
+      }
+
       const amazonProductData = {
         ...productData,
         productUmbrellaId,
+        customFields,
         createdBy: req.user.userId
       };
       
@@ -99,6 +152,7 @@ router.post('/', requireAuth, async (req, res) => {
 
       return res.json({
         ...productData,
+        customFields,
         saved: true,
         _id: amazonProduct._id,
         seller: amazonProduct.sellerId,

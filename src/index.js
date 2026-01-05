@@ -45,6 +45,7 @@ import bankAccountRoutes from './routes/bankAccounts.js';
 import columnPresetRoutes from './routes/columnPresets.js';
 import amazonLookupRoutes from './routes/amazonLookup.js';
 import productUmbrellaRoutes from './routes/productUmbrellas.js';
+import customColumnsRoutes from './routes/customColumns.js';
 
 const app = express();
 
@@ -107,6 +108,7 @@ app.use('/api/bank-accounts', bankAccountRoutes);
 app.use('/api/column-presets', columnPresetRoutes);
 app.use('/api/amazon-lookup', amazonLookupRoutes);
 app.use('/api/product-umbrellas', productUmbrellaRoutes);
+app.use('/api/custom-columns', customColumnsRoutes);
 
 
 const port = process.env.PORT || 5000;
