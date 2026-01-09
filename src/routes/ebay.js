@@ -6243,7 +6243,7 @@ router.patch('/orders/:orderId/manual-fields', requireAuth, async (req, res) => 
   const { orderId } = req.params;
   const updates = req.body;
 
-  const allowedFields = ['amazonAccount', 'arrivingDate', 'beforeTax', 'estimatedTax', 'azOrderId', 'amazonRefund', 'cardName'];
+  const allowedFields = ['amazonAccount', 'arrivingDate', 'beforeTax', 'estimatedTax', 'azOrderId', 'amazonRefund', 'cardName', 'remark'];
   const updateData = {};
 
   Object.keys(updates).forEach(key => {

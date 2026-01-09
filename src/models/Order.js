@@ -82,6 +82,21 @@ const OrderSchema = new mongoose.Schema(
     azOrderId: String,
     amazonRefund: Number,
     cardName: String, // Reference to credit card name
+    remark: {
+      type: String,
+      enum: [
+        'Delivered',
+        'In-transit',
+        'Not yet shipped',
+        'Shipped',
+        'Out for delivery',
+        'Delayed',
+        'Re-ordered',
+        'Refund',
+        'Return started'
+      ],
+      default: null
+    },
     // Financial calculations (All Orders Sheet)
     tds: Number, // Tax Deducted at Source (1% of orderEarnings)
     tid: { type: Number, default: 0.24 }, // Transaction ID (fixed at $0.24)
