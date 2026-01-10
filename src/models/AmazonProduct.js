@@ -50,6 +50,19 @@ const amazonProductSchema = new mongoose.Schema({
     type: mongoose.Schema.Types.ObjectId,
     ref: 'User'
   },
+  deleted: {
+    type: Boolean,
+    default: false
+  },
+  deletedAt: {
+    type: Date,
+    default: null
+  },
+  deletedBy: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User',
+    default: null
+  },
   createdAt: {
     type: Date,
     default: Date.now
@@ -60,7 +73,11 @@ const amazonProductSchema = new mongoose.Schema({
   }
 });
 
-amazonProductSchema.index({ asin: 1, sellerId: 1, productUmbrellaId: 1 });
+// Compound index for unique constraint: same ASIN cannot be added twice for the same seller
+amazonProductSchema.index({ asin: 1, sellerId: 1 }, { unique: true });
+
+// Additional index for query performance
+amazonProductSchema.index({ productUmbrellaId: 1 });
 
 amazonProductSchema.pre('save', function(next) {
   this.updatedAt = Date.now();
