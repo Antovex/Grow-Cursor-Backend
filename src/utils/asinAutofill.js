@@ -1,4 +1,5 @@
 import { generateWithGemini, replacePlaceholders } from './gemini.js';
+import { calculateStartPrice } from './pricingCalculator.js';
 
 /**
  * Fetch Amazon product data by ASIN
@@ -69,10 +70,15 @@ export async function fetchAmazonData(asin) {
 /**
  * Apply field configurations to generate auto-fill data
  * Separates core eBay fields and custom columns
+ * @param {Object} amazonData - Fetched Amazon product data
+ * @param {Array} fieldConfigs - Field configuration array from template
+ * @param {Object} pricingConfig - Optional pricing configuration for startPrice calculation
+ * @returns {Object} { coreFields, customFields, pricingCalculation }
  */
-export async function applyFieldConfigs(amazonData, fieldConfigs) {
+export async function applyFieldConfigs(amazonData, fieldConfigs, pricingConfig = null) {
   const coreFields = {};
   const customFields = {};
+  let pricingCalculation = null;
   
   // Placeholder data for AI prompts
   const placeholderData = {
@@ -124,7 +130,38 @@ export async function applyFieldConfigs(amazonData, fieldConfigs) {
     }
   }
   
-  return { coreFields, customFields };
+  // PRIORITY: If pricing config enabled, calculate startPrice (overrides field config)
+  if (pricingConfig?.enabled && amazonData.price) {
+    try {
+      // Extract numeric cost from Amazon price string (e.g., "$49.99" -> 49.99)
+      const amazonCost = parseFloat(amazonData.price.replace(/[^0-9.]/g, ''));
+      
+      if (!isNaN(amazonCost) && amazonCost > 0) {
+        const result = calculateStartPrice(pricingConfig, amazonCost);
+        
+        // Override startPrice regardless of field configs
+        coreFields.startPrice = result.price.toFixed(2);
+        
+        pricingCalculation = {
+          enabled: true,
+          amazonCost: amazonData.price,
+          calculatedStartPrice: result.price.toFixed(2),
+          breakdown: result.breakdown
+        };
+        
+        console.log(`[Pricing Calculator] Cost: ${amazonData.price}, Calculated Start Price: $${result.price.toFixed(2)}`);
+      }
+    } catch (error) {
+      console.error('[Pricing Calculator] Error:', error.message);
+      // Fall back to regular field config processing for startPrice
+      pricingCalculation = {
+        enabled: true,
+        error: error.message
+      };
+    }
+  }
+  
+  return { coreFields, customFields, pricingCalculation };
 }
 
 /**

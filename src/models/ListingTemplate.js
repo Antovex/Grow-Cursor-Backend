@@ -72,6 +72,66 @@ const asinAutomationSchema = new mongoose.Schema({
   fieldConfigs: [fieldConfigSchema]
 }, { _id: false });
 
+const pricingConfigSchema = new mongoose.Schema({
+  enabled: {
+    type: Boolean,
+    default: false
+  },
+  // Currency conversion rates
+  spentRate: {
+    type: Number,
+    required: false,
+    default: null
+  },
+  payoutRate: {
+    type: Number,
+    required: false,
+    default: null
+  },
+  // Profit & Fees
+  desiredProfit: {
+    type: Number,
+    required: false,
+    default: null
+  },
+  fixedFee: {
+    type: Number,
+    required: false,
+    default: 0
+  },
+  // Percentage-based fees
+  saleTax: {
+    type: Number,
+    required: false,
+    default: 0
+  },
+  ebayFee: {
+    type: Number,
+    required: false,
+    default: 12.9
+  },
+  adsFee: {
+    type: Number,
+    required: false,
+    default: 3
+  },
+  tdsFee: {
+    type: Number,
+    required: false,
+    default: 1
+  },
+  // Shipping & Tax on cost
+  shippingCost: {
+    type: Number,
+    required: false,
+    default: 0
+  },
+  taxRate: {
+    type: Number,
+    default: 10
+  }
+}, { _id: false });
+
 const listingTemplateSchema = new mongoose.Schema({
   name: {
     type: String,
@@ -98,6 +158,10 @@ const listingTemplateSchema = new mongoose.Schema({
   asinAutomation: {
     type: asinAutomationSchema,
     default: { enabled: false, fieldConfigs: [] }
+  },
+  pricingConfig: {
+    type: pricingConfigSchema,
+    default: () => ({ enabled: false })
   },
   createdBy: {
     type: mongoose.Schema.Types.ObjectId,

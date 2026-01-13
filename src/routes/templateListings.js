@@ -183,9 +183,10 @@ router.post('/autofill-from-asin', requireAuth, async (req, res) => {
     
     // 3. Apply field configurations (AI + direct mappings)
     console.log(`Processing ${template.asinAutomation.fieldConfigs.length} field configs`);
-    const { coreFields, customFields } = await applyFieldConfigs(
+    const { coreFields, customFields, pricingCalculation } = await applyFieldConfigs(
       amazonData,
-      template.asinAutomation.fieldConfigs
+      template.asinAutomation.fieldConfigs,
+      template.pricingConfig  // Pass pricing config for automatic startPrice calculation
     );
     
     // 4. Return auto-filled data (separated by type)
@@ -201,7 +202,8 @@ router.post('/autofill-from-asin', requireAuth, async (req, res) => {
         brand: amazonData.brand,
         price: amazonData.price,
         imageCount: amazonData.images.length
-      }
+      },
+      pricingCalculation: pricingCalculation || null
     });
     
   } catch (error) {

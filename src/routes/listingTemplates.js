@@ -38,7 +38,7 @@ router.get('/:id', requireAuth, async (req, res) => {
 // Create new template
 router.post('/', requireAuth, async (req, res) => {
   try {
-    const { name, description, category, ebayCategory, customColumns, asinAutomation } = req.body;
+    const { name, description, category, ebayCategory, customColumns, asinAutomation, pricingConfig } = req.body;
     
     if (!name) {
       return res.status(400).json({ error: 'Template name is required' });
@@ -51,6 +51,7 @@ router.post('/', requireAuth, async (req, res) => {
       ebayCategory,
       customColumns: customColumns || [],
       asinAutomation: asinAutomation || { enabled: false, fieldConfigs: [] },
+      pricingConfig: pricingConfig || { enabled: false },
       createdBy: req.user.userId
     });
     
@@ -67,7 +68,7 @@ router.post('/', requireAuth, async (req, res) => {
 // Update template
 router.put('/:id', requireAuth, async (req, res) => {
   try {
-    const { name, description, category, ebayCategory, customColumns, asinAutomation } = req.body;
+    const { name, description, category, ebayCategory, customColumns, asinAutomation, pricingConfig } = req.body;
     
     const template = await ListingTemplate.findByIdAndUpdate(
       req.params.id,
@@ -78,6 +79,7 @@ router.put('/:id', requireAuth, async (req, res) => {
         ebayCategory,
         customColumns: customColumns || [],
         asinAutomation: asinAutomation || { enabled: false, fieldConfigs: [] },
+        pricingConfig: pricingConfig || { enabled: false },
         updatedAt: Date.now() 
       },
       { new: true, runValidators: true }
