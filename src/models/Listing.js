@@ -27,4 +27,8 @@ const ListingSchema = new mongoose.Schema({
   endTime: Date,
 }, { timestamps: true });
 
+// Compound index for efficient pagination queries
+// Optimizes: { seller: X, listingStatus: 'Active' } sorted by startTime
+ListingSchema.index({ seller: 1, listingStatus: 1, startTime: -1 });
+
 export default mongoose.model('Listing', ListingSchema);
