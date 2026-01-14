@@ -214,6 +214,147 @@ router.post('/autofill-from-asin', requireAuth, async (req, res) => {
   }
 });
 
+// Bulk auto-fill from multiple ASINs
+router.post('/bulk-autofill-from-asins', requireAuth, async (req, res) => {
+  try {
+    const { asins, templateId } = req.body;
+    
+    if (!asins || !Array.isArray(asins) || asins.length === 0) {
+      return res.status(400).json({ 
+        error: 'ASINs array is required and must not be empty' 
+      });
+    }
+    
+    if (!templateId) {
+      return res.status(400).json({ error: 'Template ID is required' });
+    }
+    
+    // Validate batch size
+    if (asins.length > 50) {
+      return res.status(400).json({ 
+        error: 'Maximum 50 ASINs allowed per batch' 
+      });
+    }
+    
+    // Fetch template with automation config
+    const template = await ListingTemplate.findById(templateId);
+    
+    if (!template) {
+      return res.status(404).json({ error: 'Template not found' });
+    }
+    
+    if (!template.asinAutomation?.enabled) {
+      return res.status(400).json({ 
+        error: 'ASIN automation is not enabled for this template' 
+      });
+    }
+    
+    // Clean and deduplicate ASINs
+    const cleanedAsins = [...new Set(
+      asins.map(asin => asin.trim().toUpperCase()).filter(asin => asin.length > 0)
+    )];
+    
+    console.log(`Processing ${cleanedAsins.length} ASINs in batch`);
+    
+    // Check for existing listings with these ASINs
+    const existingListings = await TemplateListing.find({
+      templateId,
+      _asinReference: { $in: cleanedAsins }
+    }).select('_asinReference _id');
+    
+    const existingAsinMap = new Map(
+      existingListings.map(listing => [listing._asinReference, listing._id])
+    );
+    
+    const startTime = Date.now();
+    const results = [];
+    
+    // Process ASINs in batches of 5 (parallel within batch, sequential between batches)
+    const batchSize = 5;
+    for (let i = 0; i < cleanedAsins.length; i += batchSize) {
+      const batch = cleanedAsins.slice(i, i + batchSize);
+      
+      const batchPromises = batch.map(async (asin) => {
+        // Check if ASIN already exists
+        if (existingAsinMap.has(asin)) {
+          return {
+            asin,
+            status: 'duplicate',
+            existingListingId: existingAsinMap.get(asin).toString(),
+            error: 'ASIN already exists in this template'
+          };
+        }
+        
+        try {
+          // Fetch Amazon data
+          const amazonData = await fetchAmazonData(asin);
+          
+          // Apply field configurations
+          const { coreFields, customFields, pricingCalculation } = await applyFieldConfigs(
+            amazonData,
+            template.asinAutomation.fieldConfigs,
+            template.pricingConfig
+          );
+          
+          return {
+            asin,
+            status: 'success',
+            autoFilledData: {
+              coreFields,
+              customFields
+            },
+            amazonSource: {
+              title: amazonData.title,
+              brand: amazonData.brand,
+              price: amazonData.price,
+              imageCount: amazonData.images.length
+            },
+            pricingCalculation: pricingCalculation || null
+          };
+        } catch (error) {
+          console.error(`Error processing ASIN ${asin}:`, error);
+          return {
+            asin,
+            status: 'error',
+            error: error.message || 'Failed to fetch or process ASIN data'
+          };
+        }
+      });
+      
+      const batchResults = await Promise.all(batchPromises);
+      results.push(...batchResults);
+      
+      // Add small delay between batches to avoid rate limiting
+      if (i + batchSize < cleanedAsins.length) {
+        await new Promise(resolve => setTimeout(resolve, 500));
+      }
+    }
+    
+    const processingTime = ((Date.now() - startTime) / 1000).toFixed(1);
+    const successful = results.filter(r => r.status === 'success').length;
+    const failed = results.filter(r => r.status === 'error').length;
+    const duplicates = results.filter(r => r.status === 'duplicate').length;
+    
+    console.log(`Bulk autofill completed: ${successful} successful, ${failed} failed, ${duplicates} duplicates in ${processingTime}s`);
+    
+    res.json({
+      success: true,
+      total: cleanedAsins.length,
+      successful,
+      failed,
+      duplicates,
+      results,
+      processingTime: `${processingTime}s`
+    });
+    
+  } catch (error) {
+    console.error('Bulk ASIN autofill error:', error);
+    res.status(500).json({ 
+      error: error.message || 'Failed to process bulk ASIN autofill' 
+    });
+  }
+});
+
 // Bulk delete listings
 router.post('/bulk-delete', requireAuth, async (req, res) => {
   try {
@@ -234,6 +375,206 @@ router.post('/bulk-delete', requireAuth, async (req, res) => {
   } catch (error) {
     console.error('Error bulk deleting listings:', error);
     res.status(500).json({ error: error.message });
+  }
+});
+
+// Bulk create listings from auto-fill results
+router.post('/bulk-create', requireAuth, async (req, res) => {
+  try {
+    const { templateId, listings, options = {} } = req.body;
+    
+    if (!templateId) {
+      return res.status(400).json({ error: 'Template ID is required' });
+    }
+    
+    if (!listings || !Array.isArray(listings) || listings.length === 0) {
+      return res.status(400).json({ error: 'Listings array is required' });
+    }
+    
+    // Validate batch size
+    if (listings.length > 50) {
+      return res.status(400).json({ 
+        error: 'Maximum 50 listings allowed per batch' 
+      });
+    }
+    
+    const {
+      autoGenerateSKU = true,
+      skipDuplicates = true
+    } = options;
+    
+    // Fetch template to get next SKU counter
+    const template = await ListingTemplate.findById(templateId);
+    if (!template) {
+      return res.status(404).json({ error: 'Template not found' });
+    }
+    
+    const results = [];
+    const errors = [];
+    let skippedCount = 0;
+    
+    // Get existing SKUs to avoid duplicates
+    const existingSKUs = await TemplateListing.find({ 
+      templateId 
+    }).distinct('customLabel');
+    
+    const skuSet = new Set(existingSKUs);
+    let skuCounter = Date.now();
+    
+    // Process each listing
+    for (const listingData of listings) {
+      try {
+        // Validate required fields
+        if (!listingData.title) {
+          errors.push({
+            asin: listingData._asinReference,
+            error: 'Title is required',
+            details: 'Missing required field: title'
+          });
+          results.push({
+            status: 'failed',
+            asin: listingData._asinReference,
+            error: 'Title is required'
+          });
+          continue;
+        }
+        
+        if (listingData.startPrice === undefined || listingData.startPrice === null) {
+          errors.push({
+            asin: listingData._asinReference,
+            error: 'Start price is required',
+            details: 'Missing required field: startPrice'
+          });
+          results.push({
+            status: 'failed',
+            asin: listingData._asinReference,
+            error: 'Start price is required'
+          });
+          continue;
+        }
+        
+        // Generate SKU if not provided
+        let sku = listingData.customLabel;
+        if (!sku && autoGenerateSKU) {
+          // Generate unique SKU
+          do {
+            sku = listingData._asinReference 
+              ? `${listingData._asinReference}-${skuCounter++}`
+              : `SKU-${skuCounter++}`;
+          } while (skuSet.has(sku));
+        }
+        
+        if (!sku) {
+          errors.push({
+            asin: listingData._asinReference,
+            error: 'SKU (Custom label) is required',
+            details: 'No SKU provided and auto-generation disabled'
+          });
+          results.push({
+            status: 'failed',
+            asin: listingData._asinReference,
+            error: 'SKU is required'
+          });
+          continue;
+        }
+        
+        // Check for duplicate SKU
+        if (skuSet.has(sku)) {
+          if (skipDuplicates) {
+            skippedCount++;
+            results.push({
+              status: 'skipped',
+              asin: listingData._asinReference,
+              sku,
+              error: 'Duplicate SKU - skipped'
+            });
+            continue;
+          } else {
+            errors.push({
+              asin: listingData._asinReference,
+              error: 'Duplicate SKU',
+              details: `SKU ${sku} already exists`
+            });
+            results.push({
+              status: 'failed',
+              asin: listingData._asinReference,
+              sku,
+              error: 'Duplicate SKU'
+            });
+            continue;
+          }
+        }
+        
+        // Convert customFields object to Map
+        const customFieldsMap = listingData.customFields && typeof listingData.customFields === 'object'
+          ? new Map(Object.entries(listingData.customFields))
+          : new Map();
+        
+        // Create listing
+        const listing = new TemplateListing({
+          ...listingData,
+          customLabel: sku,
+          customFields: customFieldsMap,
+          templateId,
+          createdBy: req.user.userId
+        });
+        
+        await listing.save();
+        skuSet.add(sku);
+        
+        results.push({
+          status: 'created',
+          listing: listing.toObject(),
+          asin: listingData._asinReference,
+          sku
+        });
+        
+      } catch (error) {
+        console.error('Error creating listing:', error);
+        
+        if (error.code === 11000) {
+          // Duplicate key error
+          skippedCount++;
+          results.push({
+            status: 'skipped',
+            asin: listingData._asinReference,
+            error: 'Duplicate SKU'
+          });
+        } else {
+          errors.push({
+            asin: listingData._asinReference,
+            error: error.message,
+            details: error.toString()
+          });
+          results.push({
+            status: 'failed',
+            asin: listingData._asinReference,
+            error: error.message
+          });
+        }
+      }
+    }
+    
+    const created = results.filter(r => r.status === 'created').length;
+    const failed = results.filter(r => r.status === 'failed').length;
+    
+    console.log(`Bulk create completed: ${created} created, ${failed} failed, ${skippedCount} skipped`);
+    
+    res.json({
+      success: true,
+      total: listings.length,
+      created,
+      failed,
+      skipped: skippedCount,
+      results,
+      errors
+    });
+    
+  } catch (error) {
+    console.error('Bulk create error:', error);
+    res.status(500).json({ 
+      error: error.message || 'Failed to bulk create listings' 
+    });
   }
 });
 
