@@ -90,9 +90,16 @@ export async function applyFieldConfigs(amazonData, fieldConfigs, pricingConfig 
   };
   
   for (const config of fieldConfigs) {
-    if (!config.enabled) continue;
-    
     const targetObject = config.fieldType === 'custom' ? customFields : coreFields;
+    
+    // Apply default value if config is disabled
+    if (!config.enabled) {
+      if (config.defaultValue) {
+        targetObject[config.ebayField] = config.defaultValue;
+        console.log(`Applied default value for ${config.ebayField}: ${config.defaultValue}`);
+      }
+      continue;
+    }
     
     try {
       if (config.source === 'direct' && config.fieldType === 'core') {
@@ -121,12 +128,19 @@ export async function applyFieldConfigs(amazonData, fieldConfigs, pricingConfig 
         targetObject[config.ebayField] = generatedValue;
       }
       
+      // Fallback to default value if generation/mapping resulted in empty value
+      if (!targetObject[config.ebayField] && config.defaultValue) {
+        targetObject[config.ebayField] = config.defaultValue;
+        console.log(`Used default value fallback for ${config.ebayField}: ${config.defaultValue}`);
+      }
+      
       const fieldLabel = config.fieldType === 'custom' ? `[Custom] ${config.ebayField}` : config.ebayField;
       console.log(`Auto-filled ${fieldLabel}: ${targetObject[config.ebayField]?.substring(0, 50)}...`);
       
     } catch (error) {
       console.error(`Error processing ${config.ebayField}:`, error);
-      targetObject[config.ebayField] = '';
+      // Use default value as fallback on error
+      targetObject[config.ebayField] = config.defaultValue || '';
     }
   }
   

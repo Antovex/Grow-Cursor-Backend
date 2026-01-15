@@ -38,13 +38,13 @@ router.get('/:id', requireAuth, async (req, res) => {
 // Create new template
 router.post('/', requireAuth, async (req, res) => {
   try {
-    const { name, description, category, ebayCategory, customColumns, asinAutomation, pricingConfig } = req.body;
+    const { name, description, category, ebayCategory, customColumns, asinAutomation, pricingConfig, coreFieldDefaults } = req.body;
     
     if (!name) {
       return res.status(400).json({ error: 'Template name is required' });
     }
     
-    const template = new ListingTemplate({
+    const templateData = {
       name,
       description,
       category,
@@ -53,7 +53,14 @@ router.post('/', requireAuth, async (req, res) => {
       asinAutomation: asinAutomation || { enabled: false, fieldConfigs: [] },
       pricingConfig: pricingConfig || { enabled: false },
       createdBy: req.user.userId
-    });
+    };
+    
+    // Add coreFieldDefaults if provided
+    if (coreFieldDefaults !== undefined) {
+      templateData.coreFieldDefaults = coreFieldDefaults;
+    }
+    
+    const template = new ListingTemplate(templateData);
     
     await template.save();
     await template.populate('createdBy', 'name email');
@@ -68,20 +75,27 @@ router.post('/', requireAuth, async (req, res) => {
 // Update template
 router.put('/:id', requireAuth, async (req, res) => {
   try {
-    const { name, description, category, ebayCategory, customColumns, asinAutomation, pricingConfig } = req.body;
+    const { name, description, category, ebayCategory, customColumns, asinAutomation, pricingConfig, coreFieldDefaults } = req.body;
+    
+    const updateData = { 
+      name, 
+      description,
+      category,
+      ebayCategory,
+      customColumns: customColumns || [],
+      asinAutomation: asinAutomation || { enabled: false, fieldConfigs: [] },
+      pricingConfig: pricingConfig || { enabled: false },
+      updatedAt: Date.now()
+    };
+    
+    // Add coreFieldDefaults if provided
+    if (coreFieldDefaults !== undefined) {
+      updateData.coreFieldDefaults = coreFieldDefaults;
+    }
     
     const template = await ListingTemplate.findByIdAndUpdate(
       req.params.id,
-      { 
-        name, 
-        description,
-        category,
-        ebayCategory,
-        customColumns: customColumns || [],
-        asinAutomation: asinAutomation || { enabled: false, fieldConfigs: [] },
-        pricingConfig: pricingConfig || { enabled: false },
-        updatedAt: Date.now() 
-      },
+      updateData,
       { new: true, runValidators: true }
     ).populate('createdBy', 'name email');
     

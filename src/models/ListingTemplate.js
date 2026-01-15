@@ -61,6 +61,10 @@ const fieldConfigSchema = new mongoose.Schema({
   enabled: {
     type: Boolean,
     default: true
+  },
+  defaultValue: {
+    type: String,
+    default: ''
   }
 }, { _id: false });
 
@@ -162,6 +166,10 @@ const listingTemplateSchema = new mongoose.Schema({
   pricingConfig: {
     type: pricingConfigSchema,
     default: () => ({ enabled: false })
+  },
+  coreFieldDefaults: {
+    type: mongoose.Schema.Types.Mixed,
+    default: {}
   },
   createdBy: {
     type: mongoose.Schema.Types.ObjectId,
