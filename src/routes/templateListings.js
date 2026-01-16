@@ -2,6 +2,7 @@ import express from 'express';
 import { requireAuth } from '../middleware/auth.js';
 import TemplateListing from '../models/TemplateListing.js';
 import ListingTemplate from '../models/ListingTemplate.js';
+import Seller from '../models/Seller.js';
 import { fetchAmazonData, applyFieldConfigs } from '../utils/asinAutofill.js';
 
 const router = express.Router();
@@ -9,7 +10,7 @@ const router = express.Router();
 // Get all listings for a template
 router.get('/', requireAuth, async (req, res) => {
   try {
-    const { templateId, page = 1, limit = 50 } = req.query;
+    const { templateId, sellerId, page = 1, limit = 50 } = req.query;
     
     if (!templateId) {
       return res.status(400).json({ error: 'Template ID is required' });
@@ -17,13 +18,26 @@ router.get('/', requireAuth, async (req, res) => {
     
     const skip = (parseInt(page) - 1) * parseInt(limit);
     
+    // Build filter with optional seller filtering
+    const filter = { templateId };
+    if (sellerId) {
+      filter.sellerId = sellerId;
+    }
+    
     const [listings, total] = await Promise.all([
-      TemplateListing.find({ templateId })
+      TemplateListing.find(filter)
         .populate('createdBy', 'name email')
+        .populate({
+          path: 'sellerId',
+          populate: {
+            path: 'user',
+            select: 'username email'
+          }
+        })
         .sort({ createdAt: -1 })
         .skip(skip)
         .limit(parseInt(limit)),
-      TemplateListing.countDocuments({ templateId })
+      TemplateListing.countDocuments(filter)
     ]);
     
     res.json({
@@ -68,6 +82,16 @@ router.post('/', requireAuth, async (req, res) => {
       return res.status(400).json({ error: 'Template ID is required' });
     }
     
+    if (!listingData.sellerId) {
+      return res.status(400).json({ error: 'Seller ID is required' });
+    }
+    
+    // Validate seller exists
+    const seller = await Seller.findById(listingData.sellerId);
+    if (!seller) {
+      return res.status(404).json({ error: 'Seller not found' });
+    }
+    
     if (!listingData.customLabel) {
       return res.status(400).json({ error: 'SKU (Custom label) is required' });
     }
@@ -91,7 +115,16 @@ router.post('/', requireAuth, async (req, res) => {
     });
     
     await listing.save();
-    await listing.populate('createdBy', 'name email');
+    await listing.populate([
+      { path: 'createdBy', select: 'name email' },
+      { 
+        path: 'sellerId',
+        populate: {
+          path: 'user',
+          select: 'username email'
+        }
+      }
+    ]);
     
     res.status(201).json(listing);
   } catch (error) {
@@ -217,7 +250,7 @@ router.post('/autofill-from-asin', requireAuth, async (req, res) => {
 // Bulk auto-fill from multiple ASINs
 router.post('/bulk-autofill-from-asins', requireAuth, async (req, res) => {
   try {
-    const { asins, templateId } = req.body;
+    const { asins, templateId, sellerId } = req.body;
     
     if (!asins || !Array.isArray(asins) || asins.length === 0) {
       return res.status(400).json({ 
@@ -227,6 +260,10 @@ router.post('/bulk-autofill-from-asins', requireAuth, async (req, res) => {
     
     if (!templateId) {
       return res.status(400).json({ error: 'Template ID is required' });
+    }
+    
+    if (!sellerId) {
+      return res.status(400).json({ error: 'Seller ID is required' });
     }
     
     // Validate batch size
@@ -256,9 +293,10 @@ router.post('/bulk-autofill-from-asins', requireAuth, async (req, res) => {
     
     console.log(`Processing ${cleanedAsins.length} ASINs in batch`);
     
-    // Check for existing listings with these ASINs
+    // Check for existing listings with these ASINs (filter by seller)
     const existingListings = await TemplateListing.find({
       templateId,
+      sellerId,
       _asinReference: { $in: cleanedAsins }
     }).select('_asinReference _id');
     
@@ -381,10 +419,20 @@ router.post('/bulk-delete', requireAuth, async (req, res) => {
 // Bulk create listings from auto-fill results
 router.post('/bulk-create', requireAuth, async (req, res) => {
   try {
-    const { templateId, listings, options = {} } = req.body;
+    const { templateId, sellerId, listings, options = {} } = req.body;
     
     if (!templateId) {
       return res.status(400).json({ error: 'Template ID is required' });
+    }
+    
+    if (!sellerId) {
+      return res.status(400).json({ error: 'Seller ID is required' });
+    }
+    
+    // Validate seller exists
+    const seller = await Seller.findById(sellerId);
+    if (!seller) {
+      return res.status(404).json({ error: 'Seller not found' });
     }
     
     if (!listings || !Array.isArray(listings) || listings.length === 0) {
@@ -413,9 +461,10 @@ router.post('/bulk-create', requireAuth, async (req, res) => {
     const errors = [];
     let skippedCount = 0;
     
-    // Get existing SKUs to avoid duplicates
+    // Get existing SKUs for this seller to avoid duplicates
     const existingSKUs = await TemplateListing.find({ 
-      templateId 
+      templateId,
+      sellerId
     }).distinct('customLabel');
     
     const skuSet = new Set(existingSKUs);
@@ -510,12 +559,13 @@ router.post('/bulk-create', requireAuth, async (req, res) => {
           ? new Map(Object.entries(listingData.customFields))
           : new Map();
         
-        // Create listing
+        // Create listing with sellerId
         const listing = new TemplateListing({
           ...listingData,
           customLabel: sku,
           customFields: customFieldsMap,
           templateId,
+          sellerId,
           createdBy: req.user.userId
         });
         
@@ -628,11 +678,18 @@ router.post('/bulk-import', requireAuth, async (req, res) => {
 router.get('/export-csv/:templateId', requireAuth, async (req, res) => {
   try {
     const { templateId } = req.params;
+    const { sellerId } = req.query;
     
-    // Fetch template and all listings
+    // Build filter with optional seller filtering
+    const filter = { templateId };
+    if (sellerId) {
+      filter.sellerId = sellerId;
+    }
+    
+    // Fetch template and filtered listings
     const [template, listings] = await Promise.all([
       ListingTemplate.findById(templateId),
-      TemplateListing.find({ templateId }).sort({ createdAt: -1 })
+      TemplateListing.find(filter).sort({ createdAt: -1 })
     ]);
     
     if (!template) {

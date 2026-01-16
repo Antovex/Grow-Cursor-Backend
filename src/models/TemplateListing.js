@@ -7,6 +7,14 @@ const templateListingSchema = new mongoose.Schema({
     required: true
   },
   
+  // Seller association for multi-seller template management
+  sellerId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Seller',
+    required: true,
+    index: true
+  },
+  
   // CORE COLUMNS (38 fixed fields)
   action: {
     type: String,
@@ -107,6 +115,9 @@ const templateListingSchema = new mongoose.Schema({
 
 // Compound index for SKU uniqueness per template
 templateListingSchema.index({ templateId: 1, customLabel: 1 }, { unique: true });
+
+// Compound index for seller + template filtering
+templateListingSchema.index({ templateId: 1, sellerId: 1 });
 
 templateListingSchema.pre('save', function(next) {
   this.updatedAt = Date.now();
