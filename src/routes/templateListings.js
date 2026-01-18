@@ -3,6 +3,7 @@ import { requireAuth } from '../middleware/auth.js';
 import TemplateListing from '../models/TemplateListing.js';
 import ListingTemplate from '../models/ListingTemplate.js';
 import Seller from '../models/Seller.js';
+import SellerPricingConfig from '../models/SellerPricingConfig.js';
 import { fetchAmazonData, applyFieldConfigs } from '../utils/asinAutofill.js';
 
 const router = express.Router();
@@ -189,7 +190,7 @@ router.delete('/:id', requireAuth, async (req, res) => {
 // ASIN Autofill endpoint
 router.post('/autofill-from-asin', requireAuth, async (req, res) => {
   try {
-    const { asin, templateId } = req.body;
+    const { asin, templateId, sellerId } = req.body;
     
     if (!asin || !templateId) {
       return res.status(400).json({ 
@@ -210,6 +211,18 @@ router.post('/autofill-from-asin', requireAuth, async (req, res) => {
       });
     }
     
+    // 1.5. Get seller-specific pricing config if sellerId is provided
+    let pricingConfig = template.pricingConfig;
+    if (sellerId) {
+      const sellerConfig = await SellerPricingConfig.findOne({
+        sellerId,
+        templateId
+      });
+      if (sellerConfig) {
+        pricingConfig = sellerConfig.pricingConfig;
+      }
+    }
+    
     // 2. Fetch fresh Amazon data
     console.log(`Fetching Amazon data for ASIN: ${asin}`);
     const amazonData = await fetchAmazonData(asin);
@@ -219,7 +232,7 @@ router.post('/autofill-from-asin', requireAuth, async (req, res) => {
     const { coreFields, customFields, pricingCalculation } = await applyFieldConfigs(
       amazonData,
       template.asinAutomation.fieldConfigs,
-      template.pricingConfig  // Pass pricing config for automatic startPrice calculation
+      pricingConfig  // Use seller-specific or template default pricing config
     );
     
     // 4. Return auto-filled data (separated by type)
@@ -286,6 +299,16 @@ router.post('/bulk-autofill-from-asins', requireAuth, async (req, res) => {
       });
     }
     
+    // Get seller-specific pricing config if available
+    let pricingConfig = template.pricingConfig;
+    const sellerConfig = await SellerPricingConfig.findOne({
+      sellerId,
+      templateId
+    });
+    if (sellerConfig) {
+      pricingConfig = sellerConfig.pricingConfig;
+    }
+    
     // Clean and deduplicate ASINs
     const cleanedAsins = [...new Set(
       asins.map(asin => asin.trim().toUpperCase()).filter(asin => asin.length > 0)
@@ -331,7 +354,7 @@ router.post('/bulk-autofill-from-asins', requireAuth, async (req, res) => {
           const { coreFields, customFields, pricingCalculation } = await applyFieldConfigs(
             amazonData,
             template.asinAutomation.fieldConfigs,
-            template.pricingConfig
+            pricingConfig  // Use seller-specific or template default pricing config
           );
           
           return {
