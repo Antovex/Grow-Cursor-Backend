@@ -56,6 +56,107 @@ router.get('/', requireAuth, async (req, res) => {
   }
 });
 
+// Database view endpoint with comprehensive filters (MUST be before /:id route)
+router.get('/database-view', requireAuth, async (req, res) => {
+  try {
+    const { 
+      sellerId, 
+      templateId, 
+      status, 
+      search, 
+      page = 1, 
+      limit = 50 
+    } = req.query;
+    
+    // Build query - exclude soft-deleted items
+    const query = { deletedAt: null };
+    
+    if (sellerId) query.sellerId = sellerId;
+    if (templateId) query.templateId = templateId;
+    if (status) query.status = status;
+    
+    // Search across ASIN, SKU (customLabel), and Title
+    if (search) {
+      query.$or = [
+        { _asinReference: new RegExp(search, 'i') },
+        { customLabel: new RegExp(search, 'i') },
+        { title: new RegExp(search, 'i') }
+      ];
+    }
+    
+    const skip = (parseInt(page) - 1) * parseInt(limit);
+    
+    // Fetch with populated fields
+    const [listings, total] = await Promise.all([
+      TemplateListing.find(query)
+        .select('+_asinReference') // Include ASIN in results
+        .populate({
+          path: 'sellerId',
+          populate: {
+            path: 'user',
+            select: 'username email'
+          }
+        })
+        .populate('templateId', 'name')
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(parseInt(limit)),
+      TemplateListing.countDocuments(query)
+    ]);
+    
+    res.json({
+      listings,
+      pagination: {
+        page: parseInt(page),
+        limit: parseInt(limit),
+        total,
+        pages: Math.ceil(total / parseInt(limit))
+      }
+    });
+  } catch (error) {
+    console.error('Database view error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Database statistics endpoint (MUST be before /:id route)
+router.get('/database-stats', requireAuth, async (req, res) => {
+  try {
+    const stats = await TemplateListing.aggregate([
+      { $match: { deletedAt: null } },
+      {
+        $group: {
+          _id: null,
+          totalListings: { $sum: 1 },
+          uniqueSellers: { $addToSet: '$sellerId' },
+          uniqueTemplates: { $addToSet: '$templateId' },
+          draftCount: {
+            $sum: { $cond: [{ $eq: ['$status', 'draft'] }, 1, 0] }
+          },
+          activeCount: {
+            $sum: { $cond: [{ $eq: ['$status', 'active'] }, 1, 0] }
+          },
+          inactiveCount: {
+            $sum: { $cond: [{ $eq: ['$status', 'inactive'] }, 1, 0] }
+          }
+        }
+      }
+    ]);
+    
+    res.json({
+      total: stats[0]?.totalListings || 0,
+      sellers: stats[0]?.uniqueSellers?.length || 0,
+      templates: stats[0]?.uniqueTemplates?.length || 0,
+      draft: stats[0]?.draftCount || 0,
+      active: stats[0]?.activeCount || 0,
+      inactive: stats[0]?.inactiveCount || 0
+    });
+  } catch (error) {
+    console.error('Database stats error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // Get single listing by ID
 router.get('/:id', requireAuth, async (req, res) => {
   try {
@@ -550,31 +651,17 @@ router.post('/bulk-create', requireAuth, async (req, res) => {
           continue;
         }
         
-        // Check for duplicate SKU
+        // Check for duplicate SKU and make it unique by appending suffix
         if (skuSet.has(sku)) {
-          if (skipDuplicates) {
-            skippedCount++;
-            results.push({
-              status: 'skipped',
-              asin: listingData._asinReference,
-              sku,
-              error: 'Duplicate SKU - skipped'
-            });
-            continue;
-          } else {
-            errors.push({
-              asin: listingData._asinReference,
-              error: 'Duplicate SKU',
-              details: `SKU ${sku} already exists`
-            });
-            results.push({
-              status: 'failed',
-              asin: listingData._asinReference,
-              sku,
-              error: 'Duplicate SKU'
-            });
-            continue;
-          }
+          const baseSKU = sku;
+          let suffix = 1;
+          
+          // Try appending -1, -2, -3, etc. until we find a unique SKU
+          do {
+            sku = `${baseSKU}-${suffix++}`;
+          } while (skuSet.has(sku));
+          
+          console.log(`SKU collision detected: ${baseSKU} → ${sku}`);
         }
         
         // Convert customFields object to Map
