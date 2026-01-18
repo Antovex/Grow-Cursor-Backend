@@ -23,8 +23,7 @@ const templateListingSchema = new mongoose.Schema({
   customLabel: {
     type: String,
     required: true,
-    trim: true,
-    index: true
+    trim: true
   },
   categoryId: Number,
   categoryName: String,
@@ -89,7 +88,40 @@ const templateListingSchema = new mongoose.Schema({
   _asinReference: {
     type: String,
     trim: true,
-    select: false
+    select: false,
+    index: true
+  },
+  
+  // Amazon product link - auto-generated from ASIN
+  amazonLink: {
+    type: String,
+    trim: true
+  },
+  
+  // Listing status for database tracking
+  status: {
+    type: String,
+    enum: ['draft', 'active', 'inactive', 'sold', 'ended'],
+    default: 'draft',
+    index: true
+  },
+  
+  // eBay integration fields (for future use)
+  ebayItemId: {
+    type: String,
+    trim: true
+  },
+  ebayListingUrl: {
+    type: String,
+    trim: true
+  },
+  ebayPublishedAt: Date,
+  lastSyncedAt: Date,
+  
+  // Soft delete support
+  deletedAt: {
+    type: Date,
+    default: null
   },
   
   // CUSTOM COLUMNS (flexible Map structure)
@@ -113,14 +145,31 @@ const templateListingSchema = new mongoose.Schema({
   }
 });
 
-// Compound index for SKU uniqueness per template
-templateListingSchema.index({ templateId: 1, customLabel: 1 }, { unique: true });
+// Compound index for SKU uniqueness per seller per template
+templateListingSchema.index({ templateId: 1, sellerId: 1, customLabel: 1 }, { unique: true });
 
 // Compound index for seller + template filtering
 templateListingSchema.index({ templateId: 1, sellerId: 1 });
 
+// Additional indexes for database view performance
+templateListingSchema.index({ sellerId: 1, templateId: 1, createdAt: -1 });
+templateListingSchema.index({ customLabel: 1 });
+templateListingSchema.index({ deletedAt: 1 });
+
+// Pre-save hook to auto-generate Amazon link and update timestamp
 templateListingSchema.pre('save', function(next) {
   this.updatedAt = Date.now();
+  
+  // Auto-generate Amazon link from ASIN
+  if (this._asinReference && !this.amazonLink) {
+    this.amazonLink = `https://www.amazon.com/dp/${this._asinReference}`;
+  }
+  
+  // Update amazonLink if ASIN changed
+  if (this.isModified('_asinReference') && this._asinReference) {
+    this.amazonLink = `https://www.amazon.com/dp/${this._asinReference}`;
+  }
+  
   next();
 });
 
