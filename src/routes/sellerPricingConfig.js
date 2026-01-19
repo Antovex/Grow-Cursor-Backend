@@ -2,6 +2,7 @@ import express from 'express';
 import { requireAuth } from '../middleware/auth.js';
 import SellerPricingConfig from '../models/SellerPricingConfig.js';
 import ListingTemplate from '../models/ListingTemplate.js';
+import { validateProfitTiers } from '../utils/pricingCalculator.js';
 
 const router = express.Router();
 
@@ -73,6 +74,17 @@ router.post('/', requireAuth, async (req, res) => {
       return res.status(400).json({ 
         error: 'pricingConfig is required' 
       });
+    }
+
+    // Validate profit tiers if enabled
+    if (pricingConfig.profitTiers?.enabled) {
+      try {
+        validateProfitTiers(pricingConfig.profitTiers.tiers);
+      } catch (validationError) {
+        return res.status(400).json({ 
+          error: `Invalid profit tiers: ${validationError.message}` 
+        });
+      }
     }
 
     // Upsert: create if not exists, update if exists

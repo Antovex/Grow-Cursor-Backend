@@ -163,7 +163,12 @@ export async function applyFieldConfigs(amazonData, fieldConfigs, pricingConfig 
           breakdown: result.breakdown
         };
         
-        console.log(`[Pricing Calculator] Cost: ${amazonData.price}, Calculated Start Price: $${result.price.toFixed(2)}`);
+        // Enhanced logging with tier information
+        if (result.breakdown.profitTier?.enabled) {
+          console.log(`[Pricing Calculator] Cost: ${amazonData.price}, Tier: ${result.breakdown.profitTier.costRange} (${result.breakdown.profitTier.profit} INR), Start Price: $${result.price.toFixed(2)}`);
+        } else {
+          console.log(`[Pricing Calculator] Cost: ${amazonData.price}, Calculated Start Price: $${result.price.toFixed(2)}`);
+        }
       }
     } catch (error) {
       console.error('[Pricing Calculator] Error:', error.message);

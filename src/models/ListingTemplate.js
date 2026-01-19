@@ -133,6 +133,30 @@ const pricingConfigSchema = new mongoose.Schema({
   taxRate: {
     type: Number,
     default: 10
+  },
+  // Tiered profit system
+  profitTiers: {
+    enabled: {
+      type: Boolean,
+      default: false
+    },
+    tiers: [{
+      minCost: {
+        type: Number,
+        required: true,
+        min: 0
+      },
+      maxCost: {
+        type: Number,
+        required: false,
+        default: null
+      },
+      profit: {
+        type: Number,
+        required: true,
+        min: 0
+      }
+    }]
   }
 }, { _id: false });
 
