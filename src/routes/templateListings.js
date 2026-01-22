@@ -481,11 +481,12 @@ router.post('/bulk-autofill-from-asins', requireAuth, async (req, res) => {
     
     console.log(`Processing ${cleanedAsins.length} ASINs in batch`);
     
-    // Check for existing listings with these ASINs (filter by seller)
+    // Check for existing ACTIVE listings with these ASINs (filter by seller and status)
     const existingListings = await TemplateListing.find({
       templateId,
       sellerId,
-      _asinReference: { $in: cleanedAsins }
+      _asinReference: { $in: cleanedAsins },
+      status: 'active'
     }).select('_asinReference _id');
     
     const existingAsinMap = new Map(
@@ -661,7 +662,7 @@ router.post('/bulk-create', requireAuth, async (req, res) => {
       templateId,
       sellerId,
       status: 'inactive'
-    });
+    }).select('+_asinReference');
     
     const inactiveMap = new Map(
       inactiveListings.map(l => [l.customLabel, l])
