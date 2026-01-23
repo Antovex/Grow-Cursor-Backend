@@ -1122,10 +1122,13 @@ router.get('/export-csv/:templateId', requireAuth, async (req, res) => {
     const { templateId } = req.params;
     const { sellerId } = req.query;
     
-    // Build filter for ACTIVE listings only
+    // Build filter for ACTIVE listings only that haven't been downloaded yet
+    // Inactive listings (deactivated by user) are excluded from CSV downloads
+    // even if they have downloadBatchId=null, ensuring consistency with UI
     const filter = { 
       templateId,
-      downloadBatchId: null // Only active batch
+      downloadBatchId: null, // Only active batch (not yet downloaded)
+      status: 'active'       // Only active listings (exclude inactive/draft/sold/ended)
     };
     if (sellerId) {
       filter.sellerId = sellerId;
@@ -1140,6 +1143,7 @@ router.get('/export-csv/:templateId', requireAuth, async (req, res) => {
     
     console.log('📊 Export CSV - Seller info:', seller?.user?.username || seller?.user?.email || 'No seller');
     console.log('📊 Export CSV - Listings count:', listings.length);
+    console.log('📥 Exporting active listings only (excluded inactive/draft)');
     
     if (!template) {
       return res.status(404).json({ error: 'Template not found' });
