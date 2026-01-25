@@ -40,7 +40,10 @@ function pickProfile(body) {
     'panNumber',
     'profilePicUrl',
     'aadharImageUrl',
-    'panImageUrl'
+    'panImageUrl',
+    'myTaskList',
+    'primaryTask',
+    'secondaryTask'
   ];
   const out = {};
   for (const k of allowed) {

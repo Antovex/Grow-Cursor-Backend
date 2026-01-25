@@ -18,6 +18,11 @@ const EmployeeProfileSchema = new mongoose.Schema(
     aadharNumber: { type: String, trim: true },
     panNumber: { type: String, trim: true },
 
+    // Task Management Fields
+    myTaskList: { type: String, trim: true },
+    primaryTask: { type: String, trim: true },
+    secondaryTask: { type: String, trim: true },
+
     // NEW: BLOB storage for files (images and PDFs)
     profilePic: {
       data: Buffer,
