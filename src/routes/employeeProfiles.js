@@ -101,22 +101,24 @@ router.get('/', requireAuth, async (req, res) => {
     }
     const list = await EmployeeProfile.find({}).populate('user', 'username role email department');
 
-    // Map profiles to exclude binary data and add file flags
-    const profiles = list.map(profile => {
-      const profileObj = profile.toObject();
+    // Filter out superadmin accounts and map profiles to exclude binary data and add file flags
+    const profiles = list
+      .filter(profile => profile.user && profile.user.role !== 'superadmin')
+      .map(profile => {
+        const profileObj = profile.toObject();
 
-      // Add boolean flags for file existence
-      profileObj.hasProfilePic = !!(profile.profilePic && profile.profilePic.data);
-      profileObj.hasAadhar = !!(profile.aadharDocument && profile.aadharDocument.data);
-      profileObj.hasPan = !!(profile.panDocument && profile.panDocument.data);
+        // Add boolean flags for file existence
+        profileObj.hasProfilePic = !!(profile.profilePic && profile.profilePic.data);
+        profileObj.hasAadhar = !!(profile.aadharDocument && profile.aadharDocument.data);
+        profileObj.hasPan = !!(profile.panDocument && profile.panDocument.data);
 
-      // Remove binary data
-      delete profileObj.profilePic;
-      delete profileObj.aadharDocument;
-      delete profileObj.panDocument;
+        // Remove binary data
+        delete profileObj.profilePic;
+        delete profileObj.aadharDocument;
+        delete profileObj.panDocument;
 
-      return profileObj;
-    });
+        return profileObj;
+      });
 
     res.json(profiles);
   } catch (err) {
