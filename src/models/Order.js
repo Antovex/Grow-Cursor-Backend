@@ -116,6 +116,14 @@ const OrderSchema = new mongoose.Schema(
     igst: Number, // 18% of marketplaceFee
     totalCC: Number, // marketplaceFee + igst
     profit: { type: Number, default: 0 }, // P.Balance (INR) - A_total-inr - Total_CC
+    
+    // Manual logs field for internal notes (used in Issues & Resolutions)
+    logs: { type: String, default: '' },
+    
+    // Auto-message feature (24-hour order processing message)
+    autoMessageSent: { type: Boolean, default: false },
+    autoMessageSentAt: Date,
+    autoMessageDisabled: { type: Boolean, default: false },
   },
   { timestamps: true }
 );
@@ -127,5 +135,6 @@ OrderSchema.index({ seller: 1, lastModifiedDate: -1 });
 OrderSchema.index({ seller: 1, creationDate: -1, lastModifiedDate: -1 }); // Compound index for polling queries
 OrderSchema.index({ dateSold: 1 }); // Index for date range searches
 OrderSchema.index({ cancelState: 1, creationDate: -1 }); // Index for cancelled orders queries
+OrderSchema.index({ autoMessageSent: 1, autoMessageDisabled: 1, creationDate: -1 }); // Index for auto-message cron job
 
 export default mongoose.model('Order', OrderSchema);

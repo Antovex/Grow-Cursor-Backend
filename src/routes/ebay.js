@@ -6771,5 +6771,258 @@ router.patch('/cases/:caseId/worksheet-status', requireAuth, async (req, res) =>
   }
 });
 
+// Update logs for a case (INR)
+router.patch('/cases/:caseId/logs', requireAuth, async (req, res) => {
+  try {
+    const { caseId } = req.params;
+    const { logs } = req.body;
+
+    const caseDoc = await Case.findOneAndUpdate(
+      { caseId },
+      { logs: logs || '' },
+      { new: true }
+    );
+
+    if (!caseDoc) {
+      return res.status(404).json({ error: 'Case not found' });
+    }
+
+    res.json({ success: true, case: caseDoc });
+  } catch (err) {
+    console.error('Error updating case logs:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Update logs for a return
+router.patch('/returns/:returnId/logs', requireAuth, async (req, res) => {
+  try {
+    const { returnId } = req.params;
+    const { logs } = req.body;
+
+    const returnDoc = await Return.findOneAndUpdate(
+      { returnId },
+      { logs: logs || '' },
+      { new: true }
+    );
+
+    if (!returnDoc) {
+      return res.status(404).json({ error: 'Return not found' });
+    }
+
+    res.json({ success: true, return: returnDoc });
+  } catch (err) {
+    console.error('Error updating return logs:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Update logs for an order (Cancellation)
+router.patch('/orders/:orderId/logs', requireAuth, async (req, res) => {
+  try {
+    const { orderId } = req.params;
+    const { logs } = req.body;
+
+    const order = await Order.findOneAndUpdate(
+      { orderId },
+      { logs: logs || '' },
+      { new: true }
+    );
+
+    if (!order) {
+      return res.status(404).json({ error: 'Order not found' });
+    }
+
+    res.json({ success: true, order });
+  } catch (err) {
+    console.error('Error updating order logs:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// =====================================================
+// AUTO-MESSAGE FEATURE (24-hour order processing message)
+// =====================================================
+
+// Auto-message template
+const AUTO_MESSAGE_TEMPLATE = `Hi {{BUYER_NAME}},
+
+We're pleased to inform you that your order has been processed.
+
+Also, we are actively monitoring your order to ensure it reaches you smoothly and tracking number will be updated on your eBay order page as soon as they become available.
+
+We truly appreciate your patience and understanding.`;
+
+// Toggle auto-message for specific order
+router.patch('/orders/:orderId/auto-message-toggle', requireAuth, async (req, res) => {
+  try {
+    const { orderId } = req.params;
+    const { disabled } = req.body;
+
+    const order = await Order.findOneAndUpdate(
+      { orderId },
+      { autoMessageDisabled: disabled },
+      { new: true }
+    );
+
+    if (!order) {
+      return res.status(404).json({ error: 'Order not found' });
+    }
+
+    res.json({ success: true, order });
+  } catch (err) {
+    console.error('Error toggling auto-message:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Get auto-message stats
+router.get('/orders/auto-message-stats', requireAuth, async (req, res) => {
+  try {
+    const twentyFourHoursAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
+
+    // Count orders eligible for auto-message (24+ hours old, not sent, not disabled, not cancelled)
+    // Count orders eligible for auto-message (24+ hours old, not sent, not disabled, not cancelled, AND NOT FULFILLED)
+    const pending = await Order.countDocuments({
+      creationDate: { $lte: twentyFourHoursAgo },
+      autoMessageSent: { $ne: true },
+      autoMessageDisabled: { $ne: true },
+      orderFulfillmentStatus: { $ne: 'FULFILLED' }, // Skip if already shipped
+      $or: [
+        { cancelState: { $exists: false } },
+        { cancelState: null },
+        { cancelState: { $nin: ['CANCELED', 'CANCELLED'] } }
+      ]
+    });
+
+    const sent = await Order.countDocuments({ autoMessageSent: true });
+    const disabled = await Order.countDocuments({ autoMessageDisabled: true });
+
+    res.json({ pending, sent, disabled });
+  } catch (err) {
+    console.error('Error getting auto-message stats:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Helper function to send auto-message for a single order
+async function sendAutoMessage(order, seller) {
+  const token = await ensureValidToken(seller);
+  const itemId = order.lineItems?.[0]?.legacyItemId || order.itemNumber;
+  const buyerUsername = order.buyer?.username;
+
+  if (!itemId || !buyerUsername) {
+    console.log(`[AutoMessage] Skip order ${order.orderId}: Missing itemId or buyerUsername`);
+    return { success: false, reason: 'Missing itemId or buyerUsername' };
+  }
+
+  // Prepare message body with dynamic buyer name
+  const nameToUse = order.shippingFullName || order.buyer?.username || 'Buyer';
+  // Attempt to get just the first name if it's a full name
+  const firstName = nameToUse.split(' ')[0];
+  
+  const initialBody = AUTO_MESSAGE_TEMPLATE.replace('{{BUYER_NAME}}', firstName);
+
+  // Escape the message body
+  const escapedBody = initialBody.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+  // Use AddMemberMessageAAQToPartner for post-transaction messages
+  const xmlRequest = `<?xml version="1.0" encoding="utf-8"?>
+    <AddMemberMessageAAQToPartnerRequest xmlns="urn:ebay:apis:eBLBaseComponents">
+      <RequesterCredentials><eBayAuthToken>${token}</eBayAuthToken></RequesterCredentials>
+      <ItemID>${itemId}</ItemID>
+      <MemberMessage>
+        <Subject>Order Update - #${order.orderId}</Subject>
+        <Body>${escapedBody}</Body>
+        <QuestionType>General</QuestionType>
+        <RecipientID>${buyerUsername}</RecipientID>
+      </MemberMessage>
+    </AddMemberMessageAAQToPartnerRequest>`;
+
+  try {
+    const response = await axios.post('https://api.ebay.com/ws/api.dll', xmlRequest, {
+      headers: {
+        'X-EBAY-API-COMPATIBILITY-LEVEL': '967',
+        'X-EBAY-API-CALL-NAME': 'AddMemberMessageAAQToPartner',
+        'X-EBAY-API-SITEID': '0',
+        'Content-Type': 'text/xml'
+      }
+    });
+
+    if (response.data.includes('<Ack>Success</Ack>') || response.data.includes('<Ack>Warning</Ack>')) {
+      // Update order to mark message as sent
+      await Order.findByIdAndUpdate(order._id, {
+        autoMessageSent: true,
+        autoMessageSentAt: new Date()
+      });
+      console.log(`[AutoMessage] Success: Order ${order.orderId}`);
+      return { success: true };
+    } else {
+      console.error(`[AutoMessage] Failed: Order ${order.orderId}`, response.data);
+      return { success: false, reason: 'eBay returned error' };
+    }
+  } catch (err) {
+    console.error(`[AutoMessage] Error: Order ${order.orderId}`, err.message);
+    return { success: false, reason: err.message };
+  }
+}
+
+// Manual trigger to send pending auto-messages
+router.post('/orders/send-auto-messages', requireAuth, requireRole('fulfillmentadmin', 'superadmin'), async (req, res) => {
+  try {
+    const twentyFourHoursAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
+
+    // Find all eligible orders (not sent, not disabled, not cancelled, NOT FULFILLED)
+    const orders = await Order.find({
+      creationDate: { $lte: twentyFourHoursAgo },
+      autoMessageSent: { $ne: true },
+      autoMessageDisabled: { $ne: true },
+      orderFulfillmentStatus: { $ne: 'FULFILLED' }, // Skip if already shipped
+      $or: [
+        { cancelState: { $exists: false } },
+        { cancelState: null },
+        { cancelState: { $nin: ['CANCELED', 'CANCELLED'] } }
+      ]
+    }).populate({
+      path: 'seller',
+      populate: { path: 'user' }
+    }).limit(50); // Process max 50 at a time to avoid timeouts
+
+    let successCount = 0;
+    let failCount = 0;
+
+    for (const order of orders) {
+      if (!order.seller) {
+        console.log(`[AutoMessage] Skip order ${order.orderId}: No seller`);
+        failCount++;
+        continue;
+      }
+
+      const result = await sendAutoMessage(order, order.seller);
+      if (result.success) {
+        successCount++;
+      } else {
+        failCount++;
+      }
+
+      // Small delay to avoid rate limiting
+      await new Promise(resolve => setTimeout(resolve, 500));
+    }
+
+    res.json({
+      success: true,
+      processed: orders.length,
+      sent: successCount,
+      failed: failCount
+    });
+  } catch (err) {
+    console.error('Error sending auto-messages:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Export the sendAutoMessage function for cron job use
+export { sendAutoMessage };
+
 export default router;
 
