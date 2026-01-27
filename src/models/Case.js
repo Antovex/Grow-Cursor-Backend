@@ -35,7 +35,10 @@ const CaseSchema = new mongoose.Schema({
   sellerResponse: String,
   
   // Raw eBay data for reference
-  rawData: Object
+  rawData: Object,
+  
+  // Manual logs field for internal notes
+  logs: { type: String, default: '' }
 }, { timestamps: true });
 
 // Index for faster queries (caseId already indexed via unique: true)

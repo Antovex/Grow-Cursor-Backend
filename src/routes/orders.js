@@ -43,6 +43,11 @@ router.get('/daily-statistics', requireAuth, requireRole('fulfillmentadmin', 'su
       query.seller = sellerId;
     }
 
+    // Filter out low value orders if requested (< $3)
+    if (req.query.excludeLowValue === 'true') {
+      query.subtotalUSD = { $gte: 3 };
+    }
+
     // Aggregate orders by seller, date, and marketplace
     const statistics = await Order.aggregate([
       { $match: query },

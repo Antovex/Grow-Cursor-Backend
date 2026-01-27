@@ -42,7 +42,10 @@ const ReturnSchema = new mongoose.Schema(
     sellerComments: String,
     
     // Full eBay response (for reference)
-    rawData: Object
+    rawData: Object,
+    
+    // Manual logs field for internal notes
+    logs: { type: String, default: '' }
   },
   { timestamps: true }
 );
