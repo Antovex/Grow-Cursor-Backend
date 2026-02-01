@@ -685,7 +685,10 @@ router.post('/bulk-autofill-from-asins', requireAuth, async (req, res) => {
       asins.map(asin => asin.trim().toUpperCase()).filter(asin => asin.length > 0)
     )];
     
-    console.log(`Processing ${cleanedAsins.length} ASINs in batch`);
+    console.log(`\n========== BULK AUTOFILL: ${cleanedAsins.length} ASINs ==========`);
+    console.log(`Template: ${template.name || templateId}`);
+    console.log(`Seller: ${sellerId}`);
+    console.log(`AI Fields: ${template.asinAutomation.fieldConfigs.filter(c => c.source === 'ai' && c.enabled).length}`);
     
     // Check for existing ACTIVE listings with these ASINs (filter by seller and status)
     const existingListings = await TemplateListing.find({
@@ -698,6 +701,8 @@ router.post('/bulk-autofill-from-asins', requireAuth, async (req, res) => {
     const existingAsinMap = new Map(
       existingListings.map(listing => [listing._asinReference, listing._id])
     );
+    
+    console.log(`Found ${existingAsinMap.size} existing listings (will skip duplicates)\n`);
     
     const startTime = Date.now();
     const results = [];
@@ -745,7 +750,9 @@ router.post('/bulk-autofill-from-asins', requireAuth, async (req, res) => {
             pricingCalculation: pricingCalculation || null
           };
         } catch (error) {
-          console.error(`Error processing ASIN ${asin}:`, error);
+          console.error(`\n❌ ERROR processing ASIN ${asin}:`);
+          console.error(`   Message: ${error.message}`);
+          console.error(`   Stack: ${error.stack?.split('\n').slice(0, 3).join('\n   ')}`);
           return {
             asin,
             status: 'error',
@@ -768,7 +775,13 @@ router.post('/bulk-autofill-from-asins', requireAuth, async (req, res) => {
     const failed = results.filter(r => r.status === 'error').length;
     const duplicates = results.filter(r => r.status === 'duplicate').length;
     
-    console.log(`Bulk autofill completed: ${successful} successful, ${failed} failed, ${duplicates} duplicates in ${processingTime}s`);
+    console.log(`\n========== BULK AUTOFILL COMPLETE ==========`);
+    console.log(`✅ Successful: ${successful}`);
+    console.log(`❌ Failed: ${failed}`);
+    console.log(`⏭️  Duplicates: ${duplicates}`);
+    console.log(`⏱️  Total Time: ${processingTime}s`);
+    console.log(`⚡ Avg per ASIN: ${(parseFloat(processingTime) / cleanedAsins.length).toFixed(2)}s`);
+    console.log(`==========================================\n`);
     
     res.json({
       success: true,

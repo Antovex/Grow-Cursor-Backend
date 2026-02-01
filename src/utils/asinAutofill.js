@@ -90,35 +90,68 @@ export async function applyFieldConfigs(amazonData, fieldConfigs, pricingConfig 
     asin: amazonData.asin
   };
   
+  // Separate configs by processing type for parallel execution
+  const directConfigs = [];
+  const aiConfigs = [];
+  const disabledConfigs = [];
+  
   for (const config of fieldConfigs) {
+    if (!config.enabled) {
+      disabledConfigs.push(config);
+    } else if (config.source === 'direct' && config.fieldType === 'core') {
+      directConfigs.push(config);
+    } else if (config.source === 'ai') {
+      aiConfigs.push(config);
+    }
+  }
+  
+  // Process disabled configs (apply default values immediately)
+  for (const config of disabledConfigs) {
+    if (config.defaultValue) {
+      const targetObject = config.fieldType === 'custom' ? customFields : coreFields;
+      targetObject[config.ebayField] = config.defaultValue;
+      console.log(`Applied default value for ${config.ebayField}: ${config.defaultValue}`);
+    }
+  }
+  
+  // Process direct mapping configs (fast, no API calls)
+  for (const config of directConfigs) {
     const targetObject = config.fieldType === 'custom' ? customFields : coreFields;
     
-    // Apply default value if config is disabled
-    if (!config.enabled) {
-      if (config.defaultValue) {
-        targetObject[config.ebayField] = config.defaultValue;
-        console.log(`Applied default value for ${config.ebayField}: ${config.defaultValue}`);
-      }
-      continue;
-    }
-    
     try {
-      if (config.source === 'direct' && config.fieldType === 'core') {
-        // Direct mapping only available for core fields
-        let value = amazonData[config.amazonField];
-        
-        // Apply transformations
-        value = applyTransform(value, config.transform);
-        
-        // Apply image placeholder replacement for description field
-        if (config.ebayField === 'description' && typeof value === 'string') {
-          value = processImagePlaceholders(value, amazonData.images);
-        }
-        
-        targetObject[config.ebayField] = value;
-        
-      } else if (config.source === 'ai') {
-        // AI generation for both core and custom fields
+      let value = amazonData[config.amazonField];
+      
+      // Apply transformations
+      value = applyTransform(value, config.transform);
+      
+      // Apply image placeholder replacement for description field
+      if (config.ebayField === 'description' && typeof value === 'string') {
+        value = processImagePlaceholders(value, amazonData.images);
+      }
+      
+      targetObject[config.ebayField] = value;
+      
+      // Fallback to default value if mapping resulted in empty value
+      if (!targetObject[config.ebayField] && config.defaultValue) {
+        targetObject[config.ebayField] = config.defaultValue;
+        console.log(`Used default value fallback for ${config.ebayField}: ${config.defaultValue}`);
+      }
+      
+      const fieldLabel = config.fieldType === 'custom' ? `[Custom] ${config.ebayField}` : config.ebayField;
+      console.log(`Auto-filled ${fieldLabel}: ${targetObject[config.ebayField]?.substring(0, 50)}...`);
+      
+    } catch (error) {
+      console.error(`[ASIN: ${amazonData.asin}] Error processing direct mapping for ${config.ebayField}:`, error);
+      targetObject[config.ebayField] = config.defaultValue || '';
+    }
+  }
+  
+  // Process AI configs in parallel for maximum speed
+  if (aiConfigs.length > 0) {
+    console.log(`[ASIN: ${amazonData.asin}] Generating ${aiConfigs.length} AI fields in parallel...`);
+    
+    const aiPromises = aiConfigs.map(async (config) => {
+      try {
         const processedPrompt = replacePlaceholders(
           config.promptTemplate, 
           placeholderData
@@ -139,22 +172,45 @@ export async function applyFieldConfigs(amazonData, fieldConfigs, pricingConfig 
           generatedValue = processImagePlaceholders(generatedValue, amazonData.images);
         }
         
-        targetObject[config.ebayField] = generatedValue;
+        return {
+          config,
+          value: generatedValue,
+          success: true
+        };
+        
+      } catch (error) {
+        console.error(`[ASIN: ${amazonData.asin}] Error generating AI field ${config.ebayField}:`, error);
+        return {
+          config,
+          value: config.defaultValue || '',
+          success: false,
+          error: error.message
+        };
+      }
+    });
+    
+    // Wait for all AI generations to complete in parallel
+    const aiResults = await Promise.all(aiPromises);
+    
+    // Apply AI results to target objects
+    for (const result of aiResults) {
+      const targetObject = result.config.fieldType === 'custom' ? customFields : coreFields;
+      targetObject[result.config.ebayField] = result.value;
+      
+      // Critical check for title field (required for listing creation)
+      if (result.config.ebayField === 'title' && !result.value) {
+        console.error(`❌ CRITICAL [ASIN: ${amazonData.asin}]: Title generation failed - listing cannot be created`);
       }
       
-      // Fallback to default value if generation/mapping resulted in empty value
-      if (!targetObject[config.ebayField] && config.defaultValue) {
-        targetObject[config.ebayField] = config.defaultValue;
-        console.log(`Used default value fallback for ${config.ebayField}: ${config.defaultValue}`);
+      // Fallback to default value if generation resulted in empty value
+      if (!targetObject[result.config.ebayField] && result.config.defaultValue) {
+        targetObject[result.config.ebayField] = result.config.defaultValue;
+        console.log(`[ASIN: ${amazonData.asin}] Used default value fallback for ${result.config.ebayField}: ${result.config.defaultValue}`);
       }
       
-      const fieldLabel = config.fieldType === 'custom' ? `[Custom] ${config.ebayField}` : config.ebayField;
-      console.log(`Auto-filled ${fieldLabel}: ${targetObject[config.ebayField]?.substring(0, 50)}...`);
-      
-    } catch (error) {
-      console.error(`Error processing ${config.ebayField}:`, error);
-      // Use default value as fallback on error
-      targetObject[config.ebayField] = config.defaultValue || '';
+      const fieldLabel = result.config.fieldType === 'custom' ? `[Custom] ${result.config.ebayField}` : result.config.ebayField;
+      const status = result.success ? '✅' : '⚠️';
+      console.log(`${status} [ASIN: ${amazonData.asin}] Auto-filled ${fieldLabel}: ${targetObject[result.config.ebayField]?.substring(0, 50)}...`);
     }
   }
   
