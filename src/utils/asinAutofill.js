@@ -162,9 +162,14 @@ export async function applyFieldConfigs(amazonData, fieldConfigs, pricingConfig 
         
         let generatedValue = await generateWithGemini(processedPrompt, { maxTokens });
         
-        // Auto-truncate titles to 80 chars (only for core title field)
-        if (config.fieldType === 'core' && config.ebayField === 'title' && generatedValue.length > 80) {
+        // Auto-truncate based on field type:
+        // - Title: 80 characters
+        // - Description: No limit (full HTML content)
+        // - All other fields (core + custom): 60 characters
+        if (config.ebayField === 'title' && generatedValue.length > 80) {
           generatedValue = generatedValue.substring(0, 80);
+        } else if (config.ebayField !== 'description' && config.ebayField !== 'title' && generatedValue.length > 60) {
+          generatedValue = generatedValue.substring(0, 60);
         }
         
         // Apply image placeholder replacement for description field and description-like custom fields
@@ -268,6 +273,9 @@ function applyTransform(value, transform) {
       
     case 'truncate80':
       return typeof value === 'string' ? value.substring(0, 80) : value;
+      
+    case 'truncate60':
+      return typeof value === 'string' ? value.substring(0, 60) : value;
       
     case 'htmlFormat':
       // Convert plain text to simple HTML
