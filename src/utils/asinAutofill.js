@@ -98,9 +98,11 @@ export async function applyFieldConfigs(amazonData, fieldConfigs, pricingConfig 
   for (const config of fieldConfigs) {
     if (!config.enabled) {
       disabledConfigs.push(config);
-    } else if (config.source === 'direct' && config.fieldType === 'core') {
+    } else if (config.source === 'direct') {
+      // Process ALL direct mappings (both core and custom fields)
       directConfigs.push(config);
     } else if (config.source === 'ai') {
+      // Process ALL AI configs (both core and custom fields)
       aiConfigs.push(config);
     }
   }

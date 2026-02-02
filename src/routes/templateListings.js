@@ -1095,6 +1095,448 @@ router.post('/bulk-create', requireAuth, async (req, res) => {
   }
 });
 
+// Bulk preview: Process ASINs and return preview data (no save to database)
+router.post('/bulk-preview', requireAuth, async (req, res) => {
+  try {
+    const { templateId, sellerId, asins } = req.body;
+    
+    if (!templateId) {
+      return res.status(400).json({ error: 'Template ID is required' });
+    }
+    
+    if (!sellerId) {
+      return res.status(400).json({ error: 'Seller ID is required' });
+    }
+    
+    if (!asins || !Array.isArray(asins) || asins.length === 0) {
+      return res.status(400).json({ error: 'ASINs array is required' });
+    }
+    
+    // Validate batch size
+    if (asins.length > 80) {
+      return res.status(400).json({ 
+        error: 'Maximum 80 ASINs allowed per batch' 
+      });
+    }
+    
+    // Validate seller exists
+    const seller = await Seller.findById(sellerId);
+    if (!seller) {
+      return res.status(404).json({ error: 'Seller not found' });
+    }
+    
+    // Fetch effective template (includes seller overrides)
+    const template = await getEffectiveTemplate(templateId, sellerId);
+    if (!template) {
+      return res.status(404).json({ error: 'Template not found' });
+    }
+    
+    if (!template.asinAutomation?.enabled) {
+      return res.status(400).json({ 
+        error: 'ASIN automation is not enabled for this template' 
+      });
+    }
+    
+    // Get seller-specific pricing config if available
+    let pricingConfig = template.pricingConfig;
+    if (sellerId) {
+      const sellerConfig = await SellerPricingConfig.findOne({
+        sellerId,
+        templateId
+      });
+      if (sellerConfig) {
+        pricingConfig = sellerConfig.pricingConfig;
+      }
+    }
+    
+    console.log(`💰 Pricing config enabled: ${pricingConfig?.enabled}, multiplier: ${pricingConfig?.multiplier}`);
+    console.log(`📋 Field configs: ${template.asinAutomation.fieldConfigs.length} total`);
+    
+    // Log field config breakdown
+    const coreConfigs = template.asinAutomation.fieldConfigs.filter(c => c.fieldType === 'core');
+    const customConfigs = template.asinAutomation.fieldConfigs.filter(c => c.fieldType === 'custom');
+    const aiConfigs = template.asinAutomation.fieldConfigs.filter(c => c.source === 'ai');
+    const directConfigs = template.asinAutomation.fieldConfigs.filter(c => c.source === 'direct');
+    
+    console.log(`   Core: ${coreConfigs.length}, Custom: ${customConfigs.length}`);
+    console.log(`   AI: ${aiConfigs.length}, Direct: ${directConfigs.length}`);
+    console.log(`   Custom field names: ${customConfigs.map(c => c.ebayField).join(', ')}`);
+    
+    const previewItems = [];
+    const errors = [];
+    
+    // Get existing ACTIVE SKUs to detect duplicates
+    const existingActiveSKUs = await TemplateListing.find({ 
+      templateId,
+      sellerId,
+      status: 'active'
+    }).distinct('customLabel');
+    
+    const skuSet = new Set(existingActiveSKUs);
+    
+    // Process each ASIN
+    for (const asin of asins) {
+      try {
+        console.log(`📦 Processing ASIN for preview: ${asin}`);
+        
+        // Fetch Amazon data
+        const amazonData = await fetchAmazonData(asin);
+        
+        // Apply field configurations
+        const { coreFields, customFields, pricingCalculation } = 
+          await applyFieldConfigs(amazonData, template.asinAutomation.fieldConfigs, pricingConfig);
+        
+        // Apply template core field defaults as base layer (autofilled fields override these)
+        const mergedCoreFields = {
+          ...(template.coreFieldDefaults || {}),
+          ...coreFields
+        };
+        
+        // Apply custom column default values for missing fields
+        if (template?.customColumns && template.customColumns.length > 0) {
+          template.customColumns.forEach(col => {
+            if (col.defaultValue && !customFields[col.name]) {
+              customFields[col.name] = col.defaultValue;
+              console.log(`✨ Applied column default for ${col.name}: ${col.defaultValue}`);
+            }
+          });
+        }
+        
+        console.log(`✅ Generated fields for ${asin}:`);
+        console.log(`   Core fields: ${Object.keys(mergedCoreFields).join(', ')}`);
+        console.log(`   Custom fields: ${Object.keys(customFields).join(', ')}`);
+        
+        // Generate SKU
+        const sku = generateSKUFromASIN(asin);
+        
+        // Check for warnings
+        const warnings = [];
+        const validationErrors = [];
+        
+        if (!mergedCoreFields.title) {
+          validationErrors.push('Missing required field: title');
+        }
+        
+        if (mergedCoreFields.startPrice === undefined || mergedCoreFields.startPrice === null) {
+          validationErrors.push('Missing required field: startPrice');
+        }
+        
+        if (skuSet.has(sku)) {
+          warnings.push('Duplicate SKU - will be skipped or replace existing');
+        }
+        
+        // Check for missing important fields
+        if (!mergedCoreFields.description) {
+          warnings.push('Missing description');
+        }
+        
+        previewItems.push({
+          id: `preview-${asin}`,
+          asin,
+          sku,
+          sourceData: {
+            title: amazonData.title,
+            brand: amazonData.brand,
+            price: amazonData.price,
+            description: amazonData.description,
+            images: amazonData.images,
+            rawData: amazonData.rawData
+          },
+          generatedListing: {
+            ...mergedCoreFields,
+            customLabel: sku,
+            customFields,
+            _asinReference: asin
+          },
+          pricingCalculation,
+          warnings,
+          errors: validationErrors,
+          status: validationErrors.length > 0 ? 'error' : warnings.length > 0 ? 'warning' : 'ready'
+        });
+        
+        console.log(`✅ Preview generated for ${asin}: ${coreFields.title?.substring(0, 50)}...`);
+        
+      } catch (error) {
+        console.error(`❌ Error processing ASIN ${asin}:`, error);
+        
+        errors.push({
+          asin,
+          error: error.message
+        });
+        
+        previewItems.push({
+          id: `preview-${asin}`,
+          asin,
+          sku: generateSKUFromASIN(asin),
+          sourceData: null,
+          generatedListing: null,
+          warnings: [],
+          errors: [error.message],
+          status: 'error'
+        });
+      }
+    }
+    
+    const successful = previewItems.filter(i => i.status !== 'error').length;
+    const failed = previewItems.filter(i => i.status === 'error').length;
+    const withWarnings = previewItems.filter(i => i.status === 'warning').length;
+    
+    res.json({
+      success: true,
+      items: previewItems,
+      summary: {
+        total: asins.length,
+        successful,
+        failed,
+        withWarnings
+      },
+      errors: errors.length > 0 ? errors : undefined
+    });
+    
+  } catch (error) {
+    console.error('Bulk preview error:', error);
+    res.status(500).json({ 
+      error: error.message || 'Failed to generate preview' 
+    });
+  }
+});
+
+// Bulk save: Save reviewed/edited listings to database
+router.post('/bulk-save', requireAuth, async (req, res) => {
+  try {
+    const { templateId, sellerId, listings, options = {} } = req.body;
+    
+    if (!templateId) {
+      return res.status(400).json({ error: 'Template ID is required' });
+    }
+    
+    if (!sellerId) {
+      return res.status(400).json({ error: 'Seller ID is required' });
+    }
+    
+    if (!listings || !Array.isArray(listings) || listings.length === 0) {
+      return res.status(400).json({ error: 'Listings array is required' });
+    }
+    
+    // Validate seller exists
+    const seller = await Seller.findById(sellerId);
+    if (!seller) {
+      return res.status(404).json({ error: 'Seller not found' });
+    }
+    
+    const {
+      skipDuplicates = true
+    } = options;
+    
+    const results = [];
+    const errors = [];
+    let skippedCount = 0;
+    
+    // Get existing ACTIVE SKUs
+    const existingActiveSKUs = await TemplateListing.find({ 
+      templateId,
+      sellerId,
+      status: 'active'
+    }).distinct('customLabel');
+    
+    // Get existing INACTIVE listings for potential reactivation
+    const inactiveListings = await TemplateListing.find({
+      templateId,
+      sellerId,
+      status: 'inactive'
+    }).select('+_asinReference');
+    
+    const inactiveMap = new Map(
+      inactiveListings.map(l => [l.customLabel, l])
+    );
+    
+    const skuSet = new Set(existingActiveSKUs);
+    
+    console.log(`📊 Bulk save: ${existingActiveSKUs.length} active SKUs, ${inactiveListings.length} inactive listings`);
+    
+    // Process each listing
+    for (const listingData of listings) {
+      try {
+        // Validate required fields
+        if (!listingData.title) {
+          errors.push({
+            asin: listingData._asinReference,
+            error: 'Title is required'
+          });
+          results.push({
+            status: 'failed',
+            asin: listingData._asinReference,
+            error: 'Title is required'
+          });
+          continue;
+        }
+        
+        if (listingData.startPrice === undefined || listingData.startPrice === null) {
+          errors.push({
+            asin: listingData._asinReference,
+            error: 'Start price is required'
+          });
+          results.push({
+            status: 'failed',
+            asin: listingData._asinReference,
+            error: 'Start price is required'
+          });
+          continue;
+        }
+        
+        const sku = listingData.customLabel;
+        
+        if (!sku) {
+          errors.push({
+            asin: listingData._asinReference,
+            error: 'SKU (Custom label) is required'
+          });
+          results.push({
+            status: 'failed',
+            asin: listingData._asinReference,
+            error: 'SKU is required'
+          });
+          continue;
+        }
+        
+        console.log(`🔍 Saving SKU: ${sku}`);
+        
+        // Check if SKU exists as inactive - reactivate
+        const inactiveListing = inactiveMap.get(sku);
+        
+        if (inactiveListing) {
+          const customFieldsMap = listingData.customFields && typeof listingData.customFields === 'object'
+            ? new Map(Object.entries(listingData.customFields))
+            : new Map();
+          
+          Object.assign(inactiveListing, {
+            ...listingData,
+            customLabel: sku,
+            customFields: customFieldsMap,
+            templateId,
+            sellerId,
+            status: 'active',
+            updatedAt: Date.now()
+          });
+          
+          await inactiveListing.save();
+          skuSet.add(sku);
+          
+          results.push({
+            status: 'reactivated',
+            listing: inactiveListing.toObject(),
+            asin: listingData._asinReference,
+            sku
+          });
+          
+          console.log(`✅ Reactivated: ${sku}`);
+          continue;
+        }
+        
+        // Check for duplicate SKU
+        if (skuSet.has(sku)) {
+          if (skipDuplicates) {
+            skippedCount++;
+            results.push({
+              status: 'skipped',
+              asin: listingData._asinReference,
+              sku,
+              reason: 'Duplicate SKU'
+            });
+            console.log(`⏭️ Skipped duplicate: ${sku}`);
+            continue;
+          } else {
+            errors.push({
+              asin: listingData._asinReference,
+              error: 'Duplicate SKU',
+              sku
+            });
+            results.push({
+              status: 'failed',
+              asin: listingData._asinReference,
+              error: 'Duplicate SKU'
+            });
+            continue;
+          }
+        }
+        
+        // Convert customFields object to Map
+        const customFieldsMap = listingData.customFields && typeof listingData.customFields === 'object'
+          ? new Map(Object.entries(listingData.customFields))
+          : new Map();
+        
+        // Create new listing
+        const listing = new TemplateListing({
+          ...listingData,
+          customLabel: sku,
+          customFields: customFieldsMap,
+          templateId,
+          sellerId,
+          status: 'active',
+          createdBy: req.user.userId
+        });
+        
+        await listing.save();
+        skuSet.add(sku);
+        
+        results.push({
+          status: 'created',
+          listing: listing.toObject(),
+          asin: listingData._asinReference,
+          sku
+        });
+        
+        console.log(`✅ Created: ${sku}`);
+        
+      } catch (error) {
+        console.error('Error saving listing:', error);
+        
+        if (error.code === 11000) {
+          skippedCount++;
+          results.push({
+            status: 'skipped',
+            asin: listingData._asinReference,
+            error: 'Duplicate SKU'
+          });
+        } else {
+          errors.push({
+            asin: listingData._asinReference,
+            error: error.message
+          });
+          results.push({
+            status: 'failed',
+            asin: listingData._asinReference,
+            error: error.message
+          });
+        }
+      }
+    }
+    
+    const created = results.filter(r => r.status === 'created').length;
+    const reactivated = results.filter(r => r.status === 'reactivated').length;
+    const failed = results.filter(r => r.status === 'failed').length;
+    
+    console.log(`✅ Bulk save completed: ${created} created, ${reactivated} reactivated, ${failed} failed, ${skippedCount} skipped`);
+    
+    res.json({
+      success: true,
+      total: listings.length,
+      created,
+      reactivated,
+      failed,
+      skipped: skippedCount,
+      results,
+      errors: errors.length > 0 ? errors : undefined
+    });
+    
+  } catch (error) {
+    console.error('Bulk save error:', error);
+    res.status(500).json({ 
+      error: error.message || 'Failed to bulk save listings' 
+    });
+  }
+});
+
 // Bulk import ASINs (quick import without fetching Amazon data)
 router.post('/bulk-import-asins', requireAuth, async (req, res) => {
   try {
