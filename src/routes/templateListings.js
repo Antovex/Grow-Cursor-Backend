@@ -690,19 +690,27 @@ router.post('/bulk-autofill-from-asins', requireAuth, async (req, res) => {
     console.log(`Seller: ${sellerId}`);
     console.log(`AI Fields: ${template.asinAutomation.fieldConfigs.filter(c => c.source === 'ai' && c.enabled).length}`);
     
-    // Check for existing ACTIVE listings with these ASINs (filter by seller and status)
+    // Check for existing ACTIVE listings with these ASINs across ALL templates for this seller
     const existingListings = await TemplateListing.find({
-      templateId,
-      sellerId,
+      sellerId,  // Check across all templates for this seller
       _asinReference: { $in: cleanedAsins },
       status: 'active'
-    }).select('_asinReference _id');
+    }).select('_asinReference _id templateId');
     
-    const existingAsinMap = new Map(
-      existingListings.map(listing => [listing._asinReference, listing._id])
-    );
+    // Create maps for both current template and cross-template duplicates
+    const existingInCurrentTemplate = new Map();
+    const existingInOtherTemplates = new Map();
     
-    console.log(`Found ${existingAsinMap.size} existing listings (will skip duplicates)\n`);
+    existingListings.forEach(listing => {
+      if (listing.templateId.toString() === templateId.toString()) {
+        existingInCurrentTemplate.set(listing._asinReference, listing._id);
+      } else {
+        existingInOtherTemplates.set(listing._asinReference, listing.templateId);
+      }
+    });
+    
+    console.log(`Found ${existingInCurrentTemplate.size} ASINs in current template (will skip)`);
+    console.log(`Found ${existingInOtherTemplates.size} ASINs in other templates (will block)\n`);
     
     const startTime = Date.now();
     const results = [];
@@ -713,12 +721,22 @@ router.post('/bulk-autofill-from-asins', requireAuth, async (req, res) => {
       const batch = cleanedAsins.slice(i, i + batchSize);
       
       const batchPromises = batch.map(async (asin) => {
-        // Check if ASIN already exists
-        if (existingAsinMap.has(asin)) {
+        // Check if ASIN exists in OTHER templates for this seller (block)
+        if (existingInOtherTemplates.has(asin)) {
+          return {
+            asin,
+            status: 'blocked',
+            existingTemplateId: existingInOtherTemplates.get(asin).toString(),
+            error: 'ASIN already exists for this seller in another template. Each ASIN can only be used once per seller.'
+          };
+        }
+        
+        // Check if ASIN already exists in CURRENT template (skip)
+        if (existingInCurrentTemplate.has(asin)) {
           return {
             asin,
             status: 'duplicate',
-            existingListingId: existingAsinMap.get(asin).toString(),
+            existingListingId: existingInCurrentTemplate.get(asin).toString(),
             error: 'ASIN already exists in this template'
           };
         }
@@ -1183,12 +1201,57 @@ router.post('/bulk-preview', requireAuth, async (req, res) => {
     
     const skuSet = new Set(existingActiveSKUs);
     
+    // Check for existing ASINs across ALL templates for this seller
+    const existingAsinListings = await TemplateListing.find({
+      sellerId,
+      _asinReference: { $in: asins },
+      status: 'active'
+    }).select('_asinReference templateId').lean();
+    
+    // Create maps for both current template and cross-template ASIN duplicates
+    const asinInCurrentTemplate = new Set();
+    const asinInOtherTemplates = new Map(); // ASIN -> templateId
+    
+    existingAsinListings.forEach(listing => {
+      if (listing.templateId.toString() === templateId.toString()) {
+        asinInCurrentTemplate.add(listing._asinReference);
+      } else {
+        asinInOtherTemplates.set(listing._asinReference, listing.templateId);
+      }
+    });
+    
+    console.log(`🔍 ASIN Check: ${asinInCurrentTemplate.size} in current template, ${asinInOtherTemplates.size} in other templates`);
+    
     console.log(`🚀 Processing ${asins.length} ASINs in parallel...`);
     
     // Process ALL ASINs in parallel using Promise.allSettled
     const asinPromises = asins.map(async (asin) => {
       try {
         console.log(`📦 Processing ASIN for preview: ${asin}`);
+        
+        // Check if ASIN exists in OTHER templates for this seller (blocking error)
+        if (asinInOtherTemplates.has(asin)) {
+          const otherTemplateId = asinInOtherTemplates.get(asin);
+          const errorItem = {
+            id: `preview-${asin}`,
+            asin,
+            sku: generateSKUFromASIN(asin),
+            sourceData: null,
+            generatedListing: null,
+            pricingCalculation: null,
+            warnings: [],
+            errors: [`ASIN already exists for this seller in template ${otherTemplateId}. Each ASIN can only be used once per seller.`],
+            status: 'blocked',
+            blockedReason: 'cross_template_duplicate',
+            existingTemplateId: otherTemplateId.toString()
+          };
+          
+          return {
+            success: false,
+            item: errorItem,
+            error: `ASIN exists in another template`
+          };
+        }
         
         // Fetch Amazon data
         const amazonData = await fetchAmazonData(asin);
@@ -1245,6 +1308,11 @@ router.post('/bulk-preview', requireAuth, async (req, res) => {
         
         if (skuSet.has(sku)) {
           warnings.push('Duplicate SKU - will be skipped or replace existing');
+        }
+        
+        // Check if ASIN already exists in CURRENT template (warning only)
+        if (asinInCurrentTemplate.has(asin)) {
+          warnings.push('ASIN already exists in this template - will be skipped during save');
         }
         
         // Check for missing important fields
@@ -1416,9 +1484,44 @@ router.post('/bulk-save', requireAuth, async (req, res) => {
     
     console.log(`📊 Bulk save: ${existingActiveSKUs.length} active SKUs, ${inactiveListings.length} inactive listings`);
     
+    // Check for cross-template ASIN duplicates
+    const asinsToSave = listings
+      .map(l => l._asinReference)
+      .filter(asin => asin && asin.trim());
+    
+    const crossTemplateAsins = await TemplateListing.find({
+      sellerId,
+      templateId: { $ne: templateId }, // Different template
+      _asinReference: { $in: asinsToSave },
+      status: 'active'
+    }).select('_asinReference templateId').lean();
+    
+    const crossTemplateAsinMap = new Map(
+      crossTemplateAsins.map(l => [l._asinReference, l.templateId])
+    );
+    
+    console.log(`🚫 Found ${crossTemplateAsinMap.size} ASINs already in other templates`);
+    
     // Process each listing
     for (const listingData of listings) {
       try {
+        // Check for cross-template ASIN duplicate FIRST
+        if (listingData._asinReference && crossTemplateAsinMap.has(listingData._asinReference)) {
+          const existingTemplateId = crossTemplateAsinMap.get(listingData._asinReference);
+          errors.push({
+            asin: listingData._asinReference,
+            error: `ASIN already exists in template ${existingTemplateId} for this seller`
+          });
+          results.push({
+            status: 'blocked',
+            asin: listingData._asinReference,
+            error: `ASIN already exists in another template for this seller`,
+            existingTemplateId: existingTemplateId.toString()
+          });
+          console.log(`🚫 Blocked duplicate ASIN ${listingData._asinReference} (exists in template ${existingTemplateId})`);
+          continue;
+        }
+        
         // Validate required fields
         if (!listingData.title) {
           errors.push({
