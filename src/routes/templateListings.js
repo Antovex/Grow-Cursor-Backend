@@ -1896,6 +1896,187 @@ router.post('/bulk-import-asins', requireAuth, async (req, res) => {
   }
 });
 
+// Bulk import SKUs (quick import with SKUs directly)
+router.post('/bulk-import-skus', requireAuth, async (req, res) => {
+  try {
+    const { templateId, sellerId, skus } = req.body;
+    
+    // Validate required fields
+    if (!templateId) {
+      return res.status(400).json({ error: 'Template ID is required' });
+    }
+    
+    if (!sellerId) {
+      return res.status(400).json({ error: 'Seller ID is required' });
+    }
+    
+    if (!skus || !Array.isArray(skus) || skus.length === 0) {
+      return res.status(400).json({ error: 'SKUs array is required and must not be empty' });
+    }
+    
+    console.log('📦 Bulk SKU import request:', { templateId, sellerId, skuCount: skus.length });
+    
+    // Validate template (with seller overrides) and seller exist
+    const [template, seller] = await Promise.all([
+      getEffectiveTemplate(templateId, sellerId),
+      Seller.findById(sellerId)
+    ]);
+    
+    if (!template) {
+      return res.status(404).json({ error: 'Template not found' });
+    }
+    
+    if (!seller) {
+      return res.status(404).json({ error: 'Seller not found' });
+    }
+    
+    // Process SKUs
+    const listingsToCreate = [];
+    const skippedSKUs = [];
+    const processedSKUs = new Set();
+    
+    for (const sku of skus) {
+      const cleanSKU = sku.trim();
+      
+      // Basic SKU validation (not empty, reasonable length)
+      if (!cleanSKU || cleanSKU.length === 0) {
+        skippedSKUs.push({
+          sku: cleanSKU,
+          reason: 'Empty SKU'
+        });
+        continue;
+      }
+      
+      if (cleanSKU.length > 100) {
+        skippedSKUs.push({
+          sku: cleanSKU,
+          reason: 'SKU too long (max 100 characters)'
+        });
+        continue;
+      }
+      
+      // Check for duplicates in current batch
+      if (processedSKUs.has(cleanSKU)) {
+        skippedSKUs.push({
+          sku: cleanSKU,
+          reason: 'Duplicate SKU in import batch'
+        });
+        continue;
+      }
+      
+      processedSKUs.add(cleanSKU);
+      
+      // Create minimal listing object
+      listingsToCreate.push({
+        templateId,
+        sellerId,
+        customLabel: cleanSKU,
+        title: `Product - ${cleanSKU}`,
+        startPrice: 0.01, // Minimum placeholder
+        quantity: 1,
+        status: 'draft',
+        conditionId: '1000-New',
+        format: 'FixedPrice',
+        duration: 'GTC',
+        location: 'UnitedStates',
+        createdBy: req.user.userId
+      });
+    }
+    
+    console.log(`📊 Prepared ${listingsToCreate.length} listings, ${skippedSKUs.length} skipped (validation)`);
+    
+    // Check for existing listings with same SKUs (database duplicates)
+    const existingBySKU = await TemplateListing.find({
+      templateId,
+      sellerId,
+      customLabel: { $in: listingsToCreate.map(l => l.customLabel) }
+    }).select('customLabel _asinReference');
+    
+    const existingSKUs = new Set(existingBySKU.map(l => l.customLabel));
+    
+    console.log(`🔍 Found ${existingSKUs.size} existing SKUs in database`);
+    
+    // Filter out existing listings
+    const newListings = listingsToCreate.filter(listing => {
+      if (existingSKUs.has(listing.customLabel)) {
+        const existing = existingBySKU.find(e => e.customLabel === listing.customLabel);
+        skippedSKUs.push({
+          sku: listing.customLabel,
+          reason: `Already exists in database${existing._asinReference ? ` (ASIN: ${existing._asinReference})` : ''}`
+        });
+        return false;
+      }
+      return true;
+    });
+    
+    console.log(`✅ ${newListings.length} new listings to insert`);
+    
+    // Bulk insert new listings
+    let importedCount = 0;
+    let insertErrors = [];
+    
+    if (newListings.length > 0) {
+      try {
+        const result = await TemplateListing.insertMany(newListings, {
+          ordered: false, // Continue on error
+          rawResult: true
+        });
+        
+        importedCount = result.insertedCount || newListings.length;
+        
+        // Handle any write errors
+        if (result.writeErrors && result.writeErrors.length > 0) {
+          result.writeErrors.forEach(err => {
+            const listing = newListings[err.index];
+            if (err.code === 11000) {
+              skippedSKUs.push({
+                sku: listing.customLabel,
+                reason: 'Duplicate key error'
+              });
+            } else {
+              insertErrors.push({
+                sku: listing.customLabel,
+                error: err.errmsg
+              });
+            }
+          });
+        }
+      } catch (error) {
+        // Handle bulk insert errors
+        if (error.code === 11000 && error.writeErrors) {
+          importedCount = error.insertedDocs ? error.insertedDocs.length : 0;
+          
+          error.writeErrors.forEach(err => {
+            const listing = newListings[err.index];
+            skippedSKUs.push({
+              sku: listing.customLabel,
+              reason: 'Duplicate key error'
+            });
+          });
+        } else {
+          throw error;
+        }
+      }
+    }
+    
+    console.log(`🎉 SKU Import complete: ${importedCount} imported, ${skippedSKUs.length} skipped`);
+    
+    res.json({
+      total: skus.length,
+      imported: importedCount,
+      skipped: skippedSKUs.length,
+      skippedDetails: skippedSKUs,
+      errors: insertErrors.length > 0 ? insertErrors : undefined
+    });
+    
+  } catch (error) {
+    console.error('❌ Bulk SKU import error:', error);
+    res.status(500).json({ 
+      error: error.message || 'Failed to bulk import SKUs' 
+    });
+  }
+});
+
 // Bulk import from CSV
 router.post('/bulk-import', requireAuth, async (req, res) => {
   try {
