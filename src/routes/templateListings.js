@@ -690,19 +690,50 @@ router.post('/bulk-autofill-from-asins', requireAuth, async (req, res) => {
     console.log(`Seller: ${sellerId}`);
     console.log(`AI Fields: ${template.asinAutomation.fieldConfigs.filter(c => c.source === 'ai' && c.enabled).length}`);
     
-    // Check for existing ACTIVE listings with these ASINs (filter by seller and status)
+    // Check for existing ACTIVE listings with these ASINs across ALL templates for this seller
     const existingListings = await TemplateListing.find({
-      templateId,
-      sellerId,
+      sellerId,  // Check across all templates for this seller
       _asinReference: { $in: cleanedAsins },
       status: 'active'
-    }).select('_asinReference _id');
+    }).select('_asinReference _id templateId');
     
-    const existingAsinMap = new Map(
-      existingListings.map(listing => [listing._asinReference, listing._id])
+    // Create maps for both current template and cross-template duplicates
+    const existingInCurrentTemplate = new Map();
+    const existingInOtherTemplates = new Map();
+    
+    existingListings.forEach(listing => {
+      if (listing.templateId.toString() === templateId.toString()) {
+        existingInCurrentTemplate.set(listing._asinReference, listing._id);
+      } else {
+        existingInOtherTemplates.set(listing._asinReference, listing.templateId);
+      }
+    });
+    
+    console.log(`Found ${existingInCurrentTemplate.size} ASINs in current template (will skip)`);
+    console.log(`Found ${existingInOtherTemplates.size} ASINs in other templates (will block)\n`);
+    
+    // Pre-generate all SKUs and check for collisions with existing SKUs
+    const generatedSKUs = cleanedAsins.map(asin => ({
+      asin,
+      sku: generateSKUFromASIN(asin)
+    }));
+    
+    // Check if any generated SKUs already exist (from both ASIN imports and SKU imports)
+    const existingBySKU = await TemplateListing.find({
+      templateId,
+      sellerId,
+      customLabel: { $in: generatedSKUs.map(item => item.sku) },
+      status: { $in: ['active', 'draft'] }
+    }).select('customLabel _asinReference _id');
+    
+    const existingSKUMap = new Map(
+      existingBySKU.map(listing => [listing.customLabel, {
+        id: listing._id,
+        asin: listing._asinReference
+      }])
     );
     
-    console.log(`Found ${existingAsinMap.size} existing listings (will skip duplicates)\n`);
+    console.log(`Found ${existingSKUMap.size} SKU conflicts (will block)\n`);
     
     const startTime = Date.now();
     const results = [];
@@ -713,13 +744,39 @@ router.post('/bulk-autofill-from-asins', requireAuth, async (req, res) => {
       const batch = cleanedAsins.slice(i, i + batchSize);
       
       const batchPromises = batch.map(async (asin) => {
-        // Check if ASIN already exists
-        if (existingAsinMap.has(asin)) {
+        // Check if ASIN exists in OTHER templates for this seller (block)
+        if (existingInOtherTemplates.has(asin)) {
+          return {
+            asin,
+            status: 'blocked',
+            existingTemplateId: existingInOtherTemplates.get(asin).toString(),
+            error: 'ASIN already exists for this seller in another template. Each ASIN can only be used once per seller.'
+          };
+        }
+        
+        // Check if ASIN already exists in CURRENT template (skip)
+        if (existingInCurrentTemplate.has(asin)) {
           return {
             asin,
             status: 'duplicate',
-            existingListingId: existingAsinMap.get(asin).toString(),
+            existingListingId: existingInCurrentTemplate.get(asin).toString(),
             error: 'ASIN already exists in this template'
+          };
+        }
+        
+        // Check if generated SKU already exists (from ASIN imports or SKU imports)
+        const generatedSKU = generateSKUFromASIN(asin);
+        const existingSKU = existingSKUMap.get(generatedSKU);
+        if (existingSKU) {
+          return {
+            asin,
+            sku: generatedSKU,
+            status: 'blocked',
+            blockedReason: 'sku_conflict',
+            existingListingId: existingSKU.id.toString(),
+            error: existingSKU.asin 
+              ? `SKU ${generatedSKU} already exists for ASIN ${existingSKU.asin} in this template`
+              : `SKU ${generatedSKU} already exists in this template (imported via SKU import)`
           };
         }
         
@@ -774,11 +831,13 @@ router.post('/bulk-autofill-from-asins', requireAuth, async (req, res) => {
     const successful = results.filter(r => r.status === 'success').length;
     const failed = results.filter(r => r.status === 'error').length;
     const duplicates = results.filter(r => r.status === 'duplicate').length;
+    const blocked = results.filter(r => r.status === 'blocked').length;
     
     console.log(`\n========== BULK AUTOFILL COMPLETE ==========`);
     console.log(`✅ Successful: ${successful}`);
     console.log(`❌ Failed: ${failed}`);
     console.log(`⏭️  Duplicates: ${duplicates}`);
+    console.log(`🚫 Blocked: ${blocked}`);
     console.log(`⏱️  Total Time: ${processingTime}s`);
     console.log(`⚡ Avg per ASIN: ${(parseFloat(processingTime) / cleanedAsins.length).toFixed(2)}s`);
     console.log(`==========================================\n`);
@@ -789,6 +848,7 @@ router.post('/bulk-autofill-from-asins', requireAuth, async (req, res) => {
       successful,
       failed,
       duplicates,
+      blocked,
       results,
       processingTime: `${processingTime}s`
     });
@@ -893,6 +953,27 @@ router.post('/bulk-create', requireAuth, async (req, res) => {
     console.log(`📊 Pre-check: ${existingActiveSKUs.length} active SKUs, ${inactiveListings.length} inactive listings`);
     console.log(`📋 Inactive SKUs: ${Array.from(inactiveMap.keys()).join(', ')}`);
     
+    // Pre-check for SKU conflicts with existing listings (including drafts from SKU imports)
+    const potentialSKUs = listings
+      .map(l => l.customLabel || (l._asinReference ? generateSKUFromASIN(l._asinReference) : null))
+      .filter(sku => sku);
+    
+    const existingBySKU = await TemplateListing.find({
+      templateId,
+      sellerId,
+      customLabel: { $in: potentialSKUs },
+      status: { $in: ['active', 'draft'] }
+    }).select('customLabel _asinReference _id').lean();
+    
+    const existingSKUMap = new Map(
+      existingBySKU.map(listing => [listing.customLabel, {
+        id: listing._id,
+        asin: listing._asinReference
+      }])
+    );
+    
+    console.log(`🔍 SKU pre-check: ${existingSKUMap.size} SKU conflicts detected`);
+    
     // Process each listing
     for (const listingData of listings) {
       try {
@@ -935,9 +1016,33 @@ router.post('/bulk-create', requireAuth, async (req, res) => {
             sku = `SKU-${skuCounter++}`;
           }
           
-          // Ensure uniqueness
+          // Check if generated SKU conflicts with existing (from ASIN or SKU imports)
+          const existingSKU = existingSKUMap.get(sku);
+          if (existingSKU) {
+            errors.push({
+              asin: listingData._asinReference,
+              sku,
+              error: existingSKU.asin 
+                ? `Generated SKU ${sku} already exists for ASIN ${existingSKU.asin}`
+                : `Generated SKU ${sku} already exists (imported via SKU import)`,
+              details: 'SKU conflict detected'
+            });
+            results.push({
+              status: 'blocked',
+              asin: listingData._asinReference,
+              sku,
+              blockedReason: 'sku_conflict',
+              error: existingSKU.asin 
+                ? `SKU already exists for ASIN ${existingSKU.asin}`
+                : `SKU already exists (imported via SKU import)`
+            });
+            console.log(`🚫 Blocked SKU conflict: ${sku}`);
+            continue;
+          }
+          
+          // Ensure uniqueness within current batch
           while (skuSet.has(sku)) {
-            // If collision, append timestamp suffix
+            // If collision within batch, append timestamp suffix
             sku = `${generateSKUFromASIN(listingData._asinReference)}-${skuCounter++}`;
           }
         }
@@ -1183,12 +1288,110 @@ router.post('/bulk-preview', requireAuth, async (req, res) => {
     
     const skuSet = new Set(existingActiveSKUs);
     
+    // Check for existing ASINs across ALL templates for this seller
+    const existingAsinListings = await TemplateListing.find({
+      sellerId,
+      _asinReference: { $in: asins },
+      status: 'active'
+    }).select('_asinReference templateId').lean();
+    
+    // Create maps for both current template and cross-template ASIN duplicates
+    const asinInCurrentTemplate = new Set();
+    const asinInOtherTemplates = new Map(); // ASIN -> templateId
+    
+    existingAsinListings.forEach(listing => {
+      if (listing.templateId.toString() === templateId.toString()) {
+        asinInCurrentTemplate.add(listing._asinReference);
+      } else {
+        asinInOtherTemplates.set(listing._asinReference, listing.templateId);
+      }
+    });
+    
+    console.log(`🔍 ASIN Check: ${asinInCurrentTemplate.size} in current template, ${asinInOtherTemplates.size} in other templates`);
+    
+    // Pre-generate all SKUs and check for SKU collisions
+    const generatedSKUs = asins.map(asin => ({
+      asin,
+      sku: generateSKUFromASIN(asin)
+    }));
+    
+    // Check if any generated SKUs already exist (from both ASIN imports and SKU imports)
+    const existingBySKU = await TemplateListing.find({
+      templateId,
+      sellerId,
+      customLabel: { $in: generatedSKUs.map(item => item.sku) },
+      status: { $in: ['active', 'draft'] }
+    }).select('customLabel _asinReference _id').lean();
+    
+    const existingSKUMap = new Map(
+      existingBySKU.map(listing => [listing.customLabel, {
+        id: listing._id,
+        asin: listing._asinReference
+      }])
+    );
+    
+    console.log(`🔍 SKU Check: ${existingSKUMap.size} SKU conflicts detected`);
+    
     console.log(`🚀 Processing ${asins.length} ASINs in parallel...`);
     
     // Process ALL ASINs in parallel using Promise.allSettled
     const asinPromises = asins.map(async (asin) => {
       try {
         console.log(`📦 Processing ASIN for preview: ${asin}`);
+        
+        // Check if ASIN exists in OTHER templates for this seller (blocking error)
+        if (asinInOtherTemplates.has(asin)) {
+          const otherTemplateId = asinInOtherTemplates.get(asin);
+          const errorItem = {
+            id: `preview-${asin}`,
+            asin,
+            sku: generateSKUFromASIN(asin),
+            sourceData: null,
+            generatedListing: null,
+            pricingCalculation: null,
+            warnings: [],
+            errors: [`ASIN already exists for this seller in template ${otherTemplateId}. Each ASIN can only be used once per seller.`],
+            status: 'blocked',
+            blockedReason: 'cross_template_duplicate',
+            existingTemplateId: otherTemplateId.toString()
+          };
+          
+          return {
+            success: false,
+            item: errorItem,
+            error: `ASIN exists in another template`
+          };
+        }
+        
+        // Generate SKU early for collision check
+        const sku = generateSKUFromASIN(asin);
+        
+        // Check if generated SKU already exists (from ASIN imports or SKU imports)
+        const existingSKU = existingSKUMap.get(sku);
+        if (existingSKU) {
+          const errorItem = {
+            id: `preview-${asin}`,
+            asin,
+            sku,
+            sourceData: null,
+            generatedListing: null,
+            pricingCalculation: null,
+            warnings: [],
+            errors: [existingSKU.asin 
+              ? `SKU ${sku} already exists for ASIN ${existingSKU.asin} in this template`
+              : `SKU ${sku} already exists in this template (imported via SKU import)`
+            ],
+            status: 'blocked',
+            blockedReason: 'sku_conflict',
+            existingListingId: existingSKU.id.toString()
+          };
+          
+          return {
+            success: false,
+            item: errorItem,
+            error: `SKU conflict`
+          };
+        }
         
         // Fetch Amazon data
         const amazonData = await fetchAmazonData(asin);
@@ -1217,8 +1420,7 @@ router.post('/bulk-preview', requireAuth, async (req, res) => {
         console.log(`   Core fields: ${Object.keys(mergedCoreFields).join(', ')}`);
         console.log(`   Custom fields: ${Object.keys(customFields).join(', ')}`);
         
-        // Generate SKU
-        const sku = generateSKUFromASIN(asin);
+        // SKU already generated earlier for collision check
         
         // Check for warnings
         const warnings = [];
@@ -1245,6 +1447,11 @@ router.post('/bulk-preview', requireAuth, async (req, res) => {
         
         if (skuSet.has(sku)) {
           warnings.push('Duplicate SKU - will be skipped or replace existing');
+        }
+        
+        // Check if ASIN already exists in CURRENT template (warning only)
+        if (asinInCurrentTemplate.has(asin)) {
+          warnings.push('ASIN already exists in this template - will be skipped during save');
         }
         
         // Check for missing important fields
@@ -1416,9 +1623,65 @@ router.post('/bulk-save', requireAuth, async (req, res) => {
     
     console.log(`📊 Bulk save: ${existingActiveSKUs.length} active SKUs, ${inactiveListings.length} inactive listings`);
     
+    // Check for cross-template ASIN duplicates
+    const asinsToSave = listings
+      .map(l => l._asinReference)
+      .filter(asin => asin && asin.trim());
+    
+    const crossTemplateAsins = await TemplateListing.find({
+      sellerId,
+      templateId: { $ne: templateId }, // Different template
+      _asinReference: { $in: asinsToSave },
+      status: 'active'
+    }).select('_asinReference templateId').lean();
+    
+    const crossTemplateAsinMap = new Map(
+      crossTemplateAsins.map(l => [l._asinReference, l.templateId])
+    );
+    
+    console.log(`🚫 Found ${crossTemplateAsinMap.size} ASINs already in other templates`);
+    
+    // Pre-check all SKUs for collisions (including those from SKU imports)
+    const skusToSave = listings
+      .map(l => l.customLabel)
+      .filter(sku => sku && sku.trim());
+    
+    const existingBySKU = await TemplateListing.find({
+      templateId,
+      sellerId,
+      customLabel: { $in: skusToSave },
+      status: { $in: ['active', 'draft'] }
+    }).select('customLabel _asinReference _id').lean();
+    
+    const existingSKUMap = new Map(
+      existingBySKU.map(listing => [listing.customLabel, {
+        id: listing._id,
+        asin: listing._asinReference
+      }])
+    );
+    
+    console.log(`🔍 SKU pre-check: ${existingSKUMap.size} SKU conflicts detected`);
+    
     // Process each listing
     for (const listingData of listings) {
       try {
+        // Check for cross-template ASIN duplicate FIRST
+        if (listingData._asinReference && crossTemplateAsinMap.has(listingData._asinReference)) {
+          const existingTemplateId = crossTemplateAsinMap.get(listingData._asinReference);
+          errors.push({
+            asin: listingData._asinReference,
+            error: `ASIN already exists in template ${existingTemplateId} for this seller`
+          });
+          results.push({
+            status: 'blocked',
+            asin: listingData._asinReference,
+            error: `ASIN already exists in another template for this seller`,
+            existingTemplateId: existingTemplateId.toString()
+          });
+          console.log(`🚫 Blocked duplicate ASIN ${listingData._asinReference} (exists in template ${existingTemplateId})`);
+          continue;
+        }
+        
         // Validate required fields
         if (!listingData.title) {
           errors.push({
@@ -1462,6 +1725,30 @@ router.post('/bulk-save', requireAuth, async (req, res) => {
         }
         
         console.log(`🔍 Saving SKU: ${sku}`);
+        
+        // Check if SKU already exists (from ASIN imports or SKU imports)
+        const existingSKU = existingSKUMap.get(sku);
+        if (existingSKU && existingSKU.id) {
+          errors.push({
+            asin: listingData._asinReference,
+            sku,
+            error: existingSKU.asin 
+              ? `SKU ${sku} already exists for ASIN ${existingSKU.asin}`
+              : `SKU ${sku} already exists (imported via SKU import)`
+          });
+          results.push({
+            status: 'blocked',
+            asin: listingData._asinReference,
+            sku,
+            blockedReason: 'sku_conflict',
+            existingListingId: existingSKU.id.toString(),
+            error: existingSKU.asin 
+              ? `SKU already exists for ASIN ${existingSKU.asin}`
+              : `SKU already exists (imported via SKU import)`
+          });
+          console.log(`🚫 Blocked SKU conflict: ${sku}`);
+          continue;
+        }
         
         // Check if SKU exists as inactive - reactivate
         const inactiveListing = inactiveMap.get(sku);
@@ -1789,6 +2076,187 @@ router.post('/bulk-import-asins', requireAuth, async (req, res) => {
     console.error('❌ Bulk import error:', error);
     res.status(500).json({ 
       error: error.message || 'Failed to bulk import ASINs' 
+    });
+  }
+});
+
+// Bulk import SKUs (quick import with SKUs directly)
+router.post('/bulk-import-skus', requireAuth, async (req, res) => {
+  try {
+    const { templateId, sellerId, skus } = req.body;
+    
+    // Validate required fields
+    if (!templateId) {
+      return res.status(400).json({ error: 'Template ID is required' });
+    }
+    
+    if (!sellerId) {
+      return res.status(400).json({ error: 'Seller ID is required' });
+    }
+    
+    if (!skus || !Array.isArray(skus) || skus.length === 0) {
+      return res.status(400).json({ error: 'SKUs array is required and must not be empty' });
+    }
+    
+    console.log('📦 Bulk SKU import request:', { templateId, sellerId, skuCount: skus.length });
+    
+    // Validate template (with seller overrides) and seller exist
+    const [template, seller] = await Promise.all([
+      getEffectiveTemplate(templateId, sellerId),
+      Seller.findById(sellerId)
+    ]);
+    
+    if (!template) {
+      return res.status(404).json({ error: 'Template not found' });
+    }
+    
+    if (!seller) {
+      return res.status(404).json({ error: 'Seller not found' });
+    }
+    
+    // Process SKUs
+    const listingsToCreate = [];
+    const skippedSKUs = [];
+    const processedSKUs = new Set();
+    
+    for (const sku of skus) {
+      const cleanSKU = sku.trim();
+      
+      // Basic SKU validation (not empty, reasonable length)
+      if (!cleanSKU || cleanSKU.length === 0) {
+        skippedSKUs.push({
+          sku: cleanSKU,
+          reason: 'Empty SKU'
+        });
+        continue;
+      }
+      
+      if (cleanSKU.length > 100) {
+        skippedSKUs.push({
+          sku: cleanSKU,
+          reason: 'SKU too long (max 100 characters)'
+        });
+        continue;
+      }
+      
+      // Check for duplicates in current batch
+      if (processedSKUs.has(cleanSKU)) {
+        skippedSKUs.push({
+          sku: cleanSKU,
+          reason: 'Duplicate SKU in import batch'
+        });
+        continue;
+      }
+      
+      processedSKUs.add(cleanSKU);
+      
+      // Create minimal listing object
+      listingsToCreate.push({
+        templateId,
+        sellerId,
+        customLabel: cleanSKU,
+        title: `Product - ${cleanSKU}`,
+        startPrice: 0.01, // Minimum placeholder
+        quantity: 1,
+        status: 'draft',
+        conditionId: '1000-New',
+        format: 'FixedPrice',
+        duration: 'GTC',
+        location: 'UnitedStates',
+        createdBy: req.user.userId
+      });
+    }
+    
+    console.log(`📊 Prepared ${listingsToCreate.length} listings, ${skippedSKUs.length} skipped (validation)`);
+    
+    // Check for existing listings with same SKUs (database duplicates)
+    const existingBySKU = await TemplateListing.find({
+      templateId,
+      sellerId,
+      customLabel: { $in: listingsToCreate.map(l => l.customLabel) }
+    }).select('customLabel _asinReference');
+    
+    const existingSKUs = new Set(existingBySKU.map(l => l.customLabel));
+    
+    console.log(`🔍 Found ${existingSKUs.size} existing SKUs in database`);
+    
+    // Filter out existing listings
+    const newListings = listingsToCreate.filter(listing => {
+      if (existingSKUs.has(listing.customLabel)) {
+        const existing = existingBySKU.find(e => e.customLabel === listing.customLabel);
+        skippedSKUs.push({
+          sku: listing.customLabel,
+          reason: `Already exists in database${existing._asinReference ? ` (ASIN: ${existing._asinReference})` : ''}`
+        });
+        return false;
+      }
+      return true;
+    });
+    
+    console.log(`✅ ${newListings.length} new listings to insert`);
+    
+    // Bulk insert new listings
+    let importedCount = 0;
+    let insertErrors = [];
+    
+    if (newListings.length > 0) {
+      try {
+        const result = await TemplateListing.insertMany(newListings, {
+          ordered: false, // Continue on error
+          rawResult: true
+        });
+        
+        importedCount = result.insertedCount || newListings.length;
+        
+        // Handle any write errors
+        if (result.writeErrors && result.writeErrors.length > 0) {
+          result.writeErrors.forEach(err => {
+            const listing = newListings[err.index];
+            if (err.code === 11000) {
+              skippedSKUs.push({
+                sku: listing.customLabel,
+                reason: 'Duplicate key error'
+              });
+            } else {
+              insertErrors.push({
+                sku: listing.customLabel,
+                error: err.errmsg
+              });
+            }
+          });
+        }
+      } catch (error) {
+        // Handle bulk insert errors
+        if (error.code === 11000 && error.writeErrors) {
+          importedCount = error.insertedDocs ? error.insertedDocs.length : 0;
+          
+          error.writeErrors.forEach(err => {
+            const listing = newListings[err.index];
+            skippedSKUs.push({
+              sku: listing.customLabel,
+              reason: 'Duplicate key error'
+            });
+          });
+        } else {
+          throw error;
+        }
+      }
+    }
+    
+    console.log(`🎉 SKU Import complete: ${importedCount} imported, ${skippedSKUs.length} skipped`);
+    
+    res.json({
+      total: skus.length,
+      imported: importedCount,
+      skipped: skippedSKUs.length,
+      skippedDetails: skippedSKUs,
+      errors: insertErrors.length > 0 ? insertErrors : undefined
+    });
+    
+  } catch (error) {
+    console.error('❌ Bulk SKU import error:', error);
+    res.status(500).json({ 
+      error: error.message || 'Failed to bulk import SKUs' 
     });
   }
 });
