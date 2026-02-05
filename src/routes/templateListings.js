@@ -2169,11 +2169,40 @@ router.post('/bulk-import-skus', requireAuth, async (req, res) => {
     
     console.log(`📊 Prepared ${listingsToCreate.length} listings, ${skippedSKUs.length} skipped (validation)`);
     
-    // Check for existing listings with same SKUs (database duplicates)
+    // Check for existing SKUs across ALL templates for this seller (cross-template validation)
+    const crossTemplateSkus = await TemplateListing.find({
+      sellerId,
+      templateId: { $ne: templateId }, // Different templates
+      customLabel: { $in: listingsToCreate.map(l => l.customLabel) },
+      status: { $in: ['active', 'draft'] }
+    }).select('customLabel templateId _asinReference');
+    
+    const crossTemplateSKUMap = new Map(
+      crossTemplateSkus.map(l => [l.customLabel, { templateId: l.templateId, asin: l._asinReference }])
+    );
+    
+    console.log(`🚫 Found ${crossTemplateSKUMap.size} SKUs in other templates`);
+    
+    // Filter out SKUs that exist in other templates
+    const skusNotInOtherTemplates = listingsToCreate.filter(listing => {
+      if (crossTemplateSKUMap.has(listing.customLabel)) {
+        const existing = crossTemplateSKUMap.get(listing.customLabel);
+        skippedSKUs.push({
+          sku: listing.customLabel,
+          reason: existing.asin
+            ? `SKU already exists in another template for ASIN ${existing.asin}`
+            : `SKU already exists in another template`
+        });
+        return false;
+      }
+      return true;
+    });
+    
+    // Check for existing listings with same SKUs (database duplicates in current template)
     const existingBySKU = await TemplateListing.find({
       templateId,
       sellerId,
-      customLabel: { $in: listingsToCreate.map(l => l.customLabel) }
+      customLabel: { $in: skusNotInOtherTemplates.map(l => l.customLabel) }
     }).select('customLabel _asinReference');
     
     const existingSKUs = new Set(existingBySKU.map(l => l.customLabel));
@@ -2181,7 +2210,7 @@ router.post('/bulk-import-skus', requireAuth, async (req, res) => {
     console.log(`🔍 Found ${existingSKUs.size} existing SKUs in database`);
     
     // Filter out existing listings
-    const newListings = listingsToCreate.filter(listing => {
+    const newListings = skusNotInOtherTemplates.filter(listing => {
       if (existingSKUs.has(listing.customLabel)) {
         const existing = existingBySKU.find(e => e.customLabel === listing.customLabel);
         skippedSKUs.push({
