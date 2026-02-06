@@ -3,13 +3,13 @@ import { trackApiUsage } from './apiUsageTracker.js';
 
 /**
  * ScraperAPI - Complete Product Data Extraction
- * Replaces PAAPI entirely for all product fields (Title, Brand, Description, Images, Price)
+ * Uses Structured Data API endpoint for clean JSON extraction
  * 
  * Free tier: 5,000 requests/month
  * Sign up: https://www.scraperapi.com
  */
 
-const SCRAPER_API_BASE = 'http://api.scraperapi.com';
+const SCRAPER_API_BASE = 'https://api.scraperapi.com/structured/amazon/product/v1';
 
 // Rate limiting queue to prevent 429 errors
 let requestQueue = Promise.resolve();
@@ -69,7 +69,30 @@ function cleanText(str) {
 }
 
 /**
- * Extract title from Amazon HTML
+ * Extract price from structured API response
+ */
+function extractPriceFromStructured(data) {
+  // Try pricing field first
+  if (data.pricing) {
+    const price = data.pricing.replace(/^\$/, '');
+    if (price && !isNaN(parseFloat(price))) {
+      return price;
+    }
+  }
+  
+  // Try list_price as fallback
+  if (data.list_price) {
+    const price = data.list_price.replace(/^\$/, '');
+    if (price && !isNaN(parseFloat(price))) {
+      return price;
+    }
+  }
+  
+  return '';
+}
+
+/**
+ * Extract title from Amazon HTML (DEPRECATED - now using structured API)
  */
 function extractTitle(html, asin) {
   const selectors = [
@@ -239,9 +262,10 @@ function extractImages(html, asin) {
     }
   }
   
-  // Method 3: Extract from altImages thumbnails with data-old-hires (image carousel)
+  // Method 3: Extract from altImages carousel (main product only)
   if (images.length === 0) {
-    const altImagesRegex = /<div id="altImages"[\s\S]*?<ul[^>]*>([\s\S]*?)<\/ul>/i;
+    // Only extract from #altImages div (main product carousel)
+    const altImagesRegex = /<div[^>]*id="altImages"[^>]*>([\s\S]*?)<\/div>/i;
     const altImagesMatch = html.match(altImagesRegex);
     
     if (altImagesMatch && altImagesMatch[1]) {
@@ -257,14 +281,28 @@ function extractImages(html, asin) {
     }
   }
   
-  // Method 4: Extract ALL data-a-dynamic-image attributes (image gallery)
+  // Method 4: Extract data-a-dynamic-image from MAIN PRODUCT GALLERY ONLY
   if (images.length === 0) {
     console.log(`[ScraperAPI] 🔍 Trying data-a-dynamic-image for ${asin}`);
+    
+    // CRITICAL: Only extract from main product image containers to avoid related products
+    // Find the start of image block containers and search a reasonable scope from there
+    const imageBlockStart = html.search(/<div[^>]*id="(?:altImages|imageBlock|imageBlock_feature_div|main-image-container)"/i);
+    
+    let searchScope = html; // Default to full HTML if no container found
+    if (imageBlockStart !== -1) {
+      // Search from container start to next 50000 characters (enough for image gallery, not entire page)
+      searchScope = html.substring(imageBlockStart, imageBlockStart + 50000);
+      console.log(`[ScraperAPI] 🎯 Scoped to main product image container area`);
+    } else {
+      console.log(`[ScraperAPI] ⚠️ No image container found, searching full HTML (may include related products)`);
+    }
+    
     const dynamicImageRegex = /data-a-dynamic-image="({[^"]+})"/gi;
     let dynamicMatch;
     const imagesByKey = new Map(); // Track unique image IDs
     
-    while ((dynamicMatch = dynamicImageRegex.exec(html)) !== null) {
+    while ((dynamicMatch = dynamicImageRegex.exec(searchScope)) !== null) {
       try {
         const imageData = JSON.parse(dynamicMatch[1].replace(/&quot;/g, '"'));
         for (const imageUrl of Object.keys(imageData)) {
@@ -392,29 +430,18 @@ export async function scrapeAmazonProductWithScraperAPI(asin, region = 'US', ret
     const timeout = parseInt(process.env.SCRAPER_API_TIMEOUT_MS) || 30000;
     const maxRetries = parseInt(process.env.SCRAPER_API_MAX_RETRIES) || retries;
 
-    const regionDomains = {
-      US: 'amazon.com',
-      UK: 'amazon.co.uk',
-      CA: 'amazon.ca',
-      AU: 'amazon.com.au'
-    };
-
-    const domain = regionDomains[region] || regionDomains.US;
-    const url = `https://www.${domain}/dp/${asin}`;
-
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
       const startTime = Date.now();
       
       try {
         console.log(`[ScraperAPI] 🔍 Scraping ASIN: ${asin}${attempt > 1 ? ` (attempt ${attempt}/${maxRetries})` : ''}`);
 
-        // Make request to ScraperAPI
+        // Use Structured Data API endpoint for clean JSON extraction
         const response = await axios.get(SCRAPER_API_BASE, {
           params: {
             api_key: SCRAPER_API_KEY,
-            url: url,
-            render: 'false',
-            residential: 'false'
+            asin: asin,
+            tld: region === 'UK' ? '.co.uk' : region === 'CA' ? '.ca' : region === 'AU' ? '.com.au' : '.com'
           },
           timeout
         });
@@ -423,37 +450,55 @@ export async function scrapeAmazonProductWithScraperAPI(asin, region = 'US', ret
           throw new Error(`ScraperAPI returned status ${response.status}`);
         }
 
-        const html = response.data;
+        const data = response.data;
         const responseTime = Date.now() - startTime;
 
-        // Extract all product data
-        const productData = extractProductDataFromHTML(html, asin);
+        // Extract product data from structured JSON
+        const title = cleanText(data.name || '');
+        const brand = cleanText(data.brand?.replace(/^Visit the /, '').replace(/ Store$/, '') || '');
+        const price = extractPriceFromStructured(data);
+        
+        // Extract description from feature bullets (best source)
+        const features = data.feature_bullets || [];
+        const description = features.join('\n');
+        
+        // Use high_res_images if available, otherwise fall back to regular images
+        // Take ONLY first 6 images (main product images, not all variants)
+        let images = [];
+        if (data.high_res_images && data.high_res_images.length > 0) {
+          images = data.high_res_images.slice(0, 6);
+          console.log(`[ScraperAPI] 📸 Using ${images.length} high-res images`);
+        } else if (data.images && data.images.length > 0) {
+          images = data.images.slice(0, 6);
+          console.log(`[ScraperAPI] 📸 Using ${images.length} standard images`);
+        }
 
         // Validate critical fields
-        if (!productData.price) {
+        if (!price) {
           if (attempt < maxRetries) {
             console.warn(`[ScraperAPI] ⚠️ No price found for ${asin}, retrying...`);
             await new Promise(resolve => setTimeout(resolve, 2000));
             continue;
           }
-          console.warn(`[ScraperAPI] ⚠️ No price found in HTML for ASIN: ${asin}`);
+          console.warn(`[ScraperAPI] ⚠️ No price found for ASIN: ${asin}`);
           throw new Error('NO_PRICE_FOUND');
         }
-        
-        // Debug: Save HTML snippet if no images found (for debugging)
-        if (productData.images.length === 0 && process.env.NODE_ENV === 'development') {
-          console.warn(`[ScraperAPI] 🐛 DEBUG: No images found for ${asin}. HTML snippet (first 2000 chars):`);
-          console.log(html.substring(0, 2000));
+
+        // Log extraction results
+        console.log(`[ScraperAPI] ✅ Title found for ${asin}: "${title.substring(0, 60)}..."`);
+        console.log(`[ScraperAPI] ✅ Brand found for ${asin}: "${brand}"`);
+        console.log(`[ScraperAPI] ✅ Description found for ${asin}: ${features.length} features`);
+        console.log(`[ScraperAPI] ✅ Images found for ${asin}: ${images.length} images`);
+        if (images.length > 0) {
+          console.log(`[ScraperAPI] 🖼️ First image: ${images[0].substring(0, 80)}...`);
+          if (images.length > 1) {
+            console.log(`[ScraperAPI] 🖼️ Last image: ${images[images.length - 1].substring(0, 80)}...`);
+          }
         }
 
         // Track successful usage
-        const extractedFields = ['price'];
-        if (productData.title && productData.title !== 'Unknown Product') extractedFields.push('title');
-        if (productData.brand && productData.brand !== 'Unbranded') extractedFields.push('brand');
-        if (productData.description) extractedFields.push('description');
-        if (productData.images.length > 0) extractedFields.push('images');
+        const extractedFields = ['price', 'title', 'brand', 'description', 'images'];
 
-        // Track API usage (don't await to avoid blocking)
         trackApiUsage({
           service: 'ScraperAPI',
           asin,
@@ -466,8 +511,13 @@ export async function scrapeAmazonProductWithScraperAPI(asin, region = 'US', ret
         console.log(`[ScraperAPI] ✅ Successfully scraped all data for ${asin} in ${responseTime}ms`);
         
         return {
-          ...productData,
-          rawHtml: html.substring(0, 1000) // Store first 1KB for debugging
+          asin,
+          title: title || 'Unknown Product',
+          price: price || '',
+          brand: brand || 'Unbranded',
+          description: description || '',
+          images: images,
+          rawData: data // Store full response for debugging
         };
       } catch (error) {
         const responseTime = Date.now() - startTime;
