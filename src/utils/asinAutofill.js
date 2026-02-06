@@ -65,6 +65,18 @@ export async function applyFieldConfigs(amazonData, fieldConfigs, pricingConfig 
   const customFields = {};
   let pricingCalculation = null;
   
+  // DEBUG: Log all field configs received
+  console.log(`\n🔍 [ASIN: ${amazonData.asin}] === FIELD CONFIG DEBUG START ===`);
+  console.log(`📋 Total field configs received: ${fieldConfigs.length}`);
+  console.log(`Field configs:`, JSON.stringify(fieldConfigs.map(c => ({
+    ebayField: c.ebayField,
+    fieldType: c.fieldType,
+    source: c.source,
+    enabled: c.enabled,
+    hasPrompt: !!c.promptTemplate,
+    promptLength: c.promptTemplate?.length || 0
+  })), null, 2));
+  
   // Placeholder data for AI prompts
   const placeholderData = {
     title: amazonData.title,
@@ -73,6 +85,8 @@ export async function applyFieldConfigs(amazonData, fieldConfigs, pricingConfig 
     price: amazonData.price,
     asin: amazonData.asin
   };
+  
+  console.log(`📝 Placeholder data:`, JSON.stringify(placeholderData, null, 2));
   
   // Images are already an array (same as PAAPI format)
   const imagesArray = Array.isArray(amazonData.images) ? amazonData.images : [];
@@ -93,6 +107,11 @@ export async function applyFieldConfigs(amazonData, fieldConfigs, pricingConfig 
       aiConfigs.push(config);
     }
   }
+  
+  console.log(`\n📊 Config categorization:`);
+  console.log(`  ✅ Enabled Direct: ${directConfigs.length} (${directConfigs.map(c => c.ebayField).join(', ')})`);
+  console.log(`  🤖 Enabled AI: ${aiConfigs.length} (${aiConfigs.map(c => c.ebayField).join(', ')})`);
+  console.log(`  ⏸️  Disabled: ${disabledConfigs.length} (${disabledConfigs.map(c => c.ebayField).join(', ')})`);
   
   // Check if pricing calculator will override startPrice field config
   const startPriceConfig = fieldConfigs.find(c => c.ebayField === 'startPrice' && c.enabled);
@@ -143,34 +162,47 @@ export async function applyFieldConfigs(amazonData, fieldConfigs, pricingConfig 
   
   // Process AI configs in parallel for maximum speed
   if (aiConfigs.length > 0) {
-    console.log(`[ASIN: ${amazonData.asin}] Generating ${aiConfigs.length} AI fields in parallel...`);
+    console.log(`\n🤖 [ASIN: ${amazonData.asin}] Generating ${aiConfigs.length} AI fields in parallel...`);
     
     const aiPromises = aiConfigs.map(async (config) => {
       try {
+        console.log(`\n  🔹 Processing AI field: ${config.ebayField} (${config.fieldType})`);
+        console.log(`    📝 Original prompt template: "${config.promptTemplate}"`);
+        
         const processedPrompt = replacePlaceholders(
           config.promptTemplate, 
           placeholderData
         );
         
+        console.log(`    ✏️  Processed prompt (after placeholders): "${processedPrompt}"`);
+        
         // Use higher token limit for description field to avoid truncation
         const maxTokens = config.ebayField === 'description' ? 2000 : 150;
+        console.log(`    🎯 Token limit: ${maxTokens}`);
         
         let generatedValue = await generateWithGemini(processedPrompt, { maxTokens });
+        
+        console.log(`    💬 AI response (raw, ${generatedValue.length} chars): "${generatedValue}"`);
         
         // Auto-truncate based on field type:
         // - Title: 80 characters
         // - Description: No limit (full HTML content)
         // - All other fields (core + custom): 60 characters
+        const originalLength = generatedValue.length;
         if (config.ebayField === 'title' && generatedValue.length > 80) {
           generatedValue = generatedValue.substring(0, 80);
+          console.log(`    ✂️  Truncated title: ${originalLength} → 80 chars`);
         } else if (config.ebayField !== 'description' && config.ebayField !== 'title' && generatedValue.length > 60) {
           generatedValue = generatedValue.substring(0, 60);
+          console.log(`    ✂️  Truncated field: ${originalLength} → 60 chars`);
         }
         
         // Apply image placeholder replacement for description field and description-like custom fields
         if ((config.ebayField === 'description' || config.ebayField.toLowerCase().includes('description')) && typeof generatedValue === 'string') {
           generatedValue = processImagePlaceholders(generatedValue, imagesArray);
         }
+        
+        console.log(`    ✅ AI generation successful for ${config.ebayField}`);
         
         return {
           config,
@@ -179,7 +211,8 @@ export async function applyFieldConfigs(amazonData, fieldConfigs, pricingConfig 
         };
         
       } catch (error) {
-        console.error(`[ASIN: ${amazonData.asin}] Error generating AI field ${config.ebayField}:`, error);
+        console.error(`    ❌ Error generating AI field ${config.ebayField}:`, error);
+        console.error(`    🔄 Using default value: "${config.defaultValue || ''}"`);
         return {
           config,
           value: config.defaultValue || '',
@@ -211,6 +244,16 @@ export async function applyFieldConfigs(amazonData, fieldConfigs, pricingConfig 
       const fieldLabel = result.config.fieldType === 'custom' ? `[Custom] ${result.config.ebayField}` : result.config.ebayField;
       const status = result.success ? '✅' : '⚠️';
       console.log(`${status} [ASIN: ${amazonData.asin}] Auto-filled ${fieldLabel}: ${targetObject[result.config.ebayField]?.substring(0, 50)}...`);
+    }
+    
+    // DEBUG: AI processing summary
+    const successCount = aiResults.filter(r => r.success).length;
+    const failCount = aiResults.filter(r => !r.success).length;
+    console.log(`\n📊 AI Processing Summary:`);
+    console.log(`  ✅ Successful: ${successCount}/${aiResults.length}`);
+    console.log(`  ❌ Failed: ${failCount}/${aiResults.length}`);
+    if (failCount > 0) {
+      console.log(`  Failed fields:`, aiResults.filter(r => !r.success).map(r => r.config.ebayField));
     }
   }
   
@@ -267,6 +310,14 @@ export async function applyFieldConfigs(amazonData, fieldConfigs, pricingConfig 
       }
     }
   }
+  
+  // DEBUG: Final results summary
+  console.log(`\n✅ [ASIN: ${amazonData.asin}] === FIELD CONFIG DEBUG END ===`);
+  console.log(`📝 Final results:`);
+  console.log(`  Core fields (${Object.keys(coreFields).length}):`, Object.keys(coreFields));
+  console.log(`  Custom fields (${Object.keys(customFields).length}):`, Object.keys(customFields));
+  console.log(`  Pricing calculation:`, pricingCalculation ? 'enabled' : 'disabled');
+  console.log(`==========================================\n`);
   
   return { coreFields, customFields, pricingCalculation };
 }
