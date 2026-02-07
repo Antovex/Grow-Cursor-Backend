@@ -7345,6 +7345,127 @@ router.post('/orders/send-auto-messages', requireAuth, requireRole('fulfillmenta
   }
 });
 
+// =====================================================
+// AWAITING SHEET SUMMARY - Order counts by seller (no tracking)
+// =====================================================
+router.get('/awaiting-sheet-summary', requireAuth, requireRole('fulfillmentadmin', 'superadmin', 'hoc', 'compliancemanager'), async (req, res) => {
+  try {
+    const { date } = req.query;
+
+    if (!date) {
+      return res.status(400).json({ error: 'Date is required (YYYY-MM-DD format)' });
+    }
+
+    // Build date range for the selected day (PST timezone like other endpoints)
+    const PST_OFFSET_HOURS = 8;
+    const startOfDay = new Date(date);
+    startOfDay.setUTCHours(PST_OFFSET_HOURS, 0, 0, 0);
+
+    const endOfDay = new Date(date);
+    endOfDay.setDate(endOfDay.getDate() + 1);
+    endOfDay.setUTCHours(PST_OFFSET_HOURS - 1, 59, 59, 999);
+
+    // Base match conditions for the date and cancel state
+    const baseMatch = {
+      shipByDate: { $gte: startOfDay, $lte: endOfDay },
+      cancelState: { $in: ['NONE_REQUESTED', 'IN_PROGRESS', null, ''] }
+    };
+
+    // Aggregation pipeline - group by seller with conditional counts
+    const summary = await Order.aggregate([
+      {
+        $match: baseMatch
+      },
+      // Group by seller with conditional counts
+      {
+        $group: {
+          _id: '$seller',
+          // Count orders without tracking number
+          trackingIdCount: {
+            $sum: {
+              $cond: [
+                {
+                  $or: [
+                    { $eq: [{ $ifNull: ['$trackingNumber', ''] }, ''] },
+                    { $eq: ['$trackingNumber', null] }
+                  ]
+                },
+                1,
+                0
+              ]
+            }
+          },
+          // Count orders with remark = 'Delivered'
+          deliveredCount: {
+            $sum: {
+              $cond: [{ $eq: ['$remark', 'Delivered'] }, 1, 0]
+            }
+          },
+          // Count orders with remark = 'In-transit'
+          inTransitCount: {
+            $sum: {
+              $cond: [{ $eq: ['$remark', 'In-transit'] }, 1, 0]
+            }
+          },
+          // Total orders count (for Upload Tracking column)
+          uploadTrackingCount: { $sum: 1 }
+        }
+      },
+      // Lookup seller info
+      {
+        $lookup: {
+          from: 'sellers',
+          localField: '_id',
+          foreignField: '_id',
+          as: 'sellerDoc'
+        }
+      },
+      { $unwind: { path: '$sellerDoc', preserveNullAndEmptyArrays: true } },
+      // Lookup user for username
+      {
+        $lookup: {
+          from: 'users',
+          localField: 'sellerDoc.user',
+          foreignField: '_id',
+          as: 'userDoc'
+        }
+      },
+      { $unwind: { path: '$userDoc', preserveNullAndEmptyArrays: true } },
+      // Project final shape
+      {
+        $project: {
+          sellerId: '$_id',
+          sellerName: { $ifNull: ['$userDoc.username', '$userDoc.email', 'Unknown'] },
+          trackingIdCount: 1,
+          deliveredCount: 1,
+          inTransitCount: 1,
+          uploadTrackingCount: 1,
+          _id: 0
+        }
+      },
+      { $sort: { trackingIdCount: -1 } } // Sort by tracking ID count descending
+    ]);
+
+    // Calculate totals
+    const totals = summary.reduce((acc, item) => ({
+      trackingId: acc.trackingId + item.trackingIdCount,
+      delivered: acc.delivered + item.deliveredCount,
+      inTransit: acc.inTransit + item.inTransitCount,
+      uploadTracking: acc.uploadTracking + item.uploadTrackingCount
+    }), { trackingId: 0, delivered: 0, inTransit: 0, uploadTracking: 0 });
+
+    res.json({
+      date,
+      summary,
+      totals,
+      totalSellers: summary.length
+    });
+  } catch (err) {
+    console.error('Error fetching awaiting sheet summary:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Export the sendAutoMessage function for cron job use
 export { sendAutoMessage };
 
