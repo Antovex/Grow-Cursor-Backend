@@ -7428,6 +7428,78 @@ router.get('/awaiting-sheet-summary', requireAuth, requireRole('fulfillmentadmin
                 0
               ]
             }
+          },
+          // Count orders where notes contains 'amazon' (case insensitive) and no tracking
+          amazonCount: {
+            $sum: {
+              $cond: [
+                {
+                  $and: [
+                    {
+                      $or: [
+                        { $eq: [{ $ifNull: ['$trackingNumber', ''] }, ''] },
+                        { $eq: ['$trackingNumber', null] }
+                      ]
+                    },
+                    {
+                      $regexMatch: { input: { $ifNull: ['$notes', ''] }, regex: /amazon/i }
+                    }
+                  ]
+                },
+                1,
+                0
+              ]
+            }
+          },
+          // Count orders where notes starts with '1z' or '9' and no tracking
+          upsUspsCount: {
+            $sum: {
+              $cond: [
+                {
+                  $and: [
+                    {
+                      $or: [
+                        { $eq: [{ $ifNull: ['$trackingNumber', ''] }, ''] },
+                        { $eq: ['$trackingNumber', null] }
+                      ]
+                    },
+                    {
+                      $or: [
+                        { $regexMatch: { input: { $ifNull: ['$notes', ''] }, regex: /^1z/i } },
+                        { $regexMatch: { input: { $ifNull: ['$notes', ''] }, regex: /^9/ } }
+                      ]
+                    }
+                  ]
+                },
+                1,
+                0
+              ]
+            }
+          },
+          // Count orders where notes is blank/null and no tracking
+          blankCount: {
+            $sum: {
+              $cond: [
+                {
+                  $and: [
+                    {
+                      $or: [
+                        { $eq: [{ $ifNull: ['$trackingNumber', ''] }, ''] },
+                        { $eq: ['$trackingNumber', null] }
+                      ]
+                    },
+                    {
+                      $or: [
+                        { $eq: [{ $ifNull: ['$notes', ''] }, ''] },
+                        { $eq: ['$notes', null] }
+                      ]
+                    }
+                  ]
+                },
+                1,
+                0
+              ]
+            }
           }
         }
       },
@@ -7460,6 +7532,9 @@ router.get('/awaiting-sheet-summary', requireAuth, requireRole('fulfillmentadmin
           inTransitCount: 1,
           uploadTrackingCount: 1,
           alreadyInUseCount: 1,
+          amazonCount: 1,
+          upsUspsCount: 1,
+          blankCount: 1,
           _id: 0
         }
       },
@@ -7472,8 +7547,11 @@ router.get('/awaiting-sheet-summary', requireAuth, requireRole('fulfillmentadmin
       delivered: acc.delivered + item.deliveredCount,
       inTransit: acc.inTransit + item.inTransitCount,
       uploadTracking: acc.uploadTracking + item.uploadTrackingCount,
-      alreadyInUse: acc.alreadyInUse + item.alreadyInUseCount
-    }), { trackingId: 0, delivered: 0, inTransit: 0, uploadTracking: 0, alreadyInUse: 0 });
+      alreadyInUse: acc.alreadyInUse + item.alreadyInUseCount,
+      amazon: acc.amazon + item.amazonCount,
+      upsUsps: acc.upsUsps + item.upsUspsCount,
+      blank: acc.blank + item.blankCount
+    }), { trackingId: 0, delivered: 0, inTransit: 0, uploadTracking: 0, alreadyInUse: 0, amazon: 0, upsUsps: 0, blank: 0 });
 
     res.json({
       date,
