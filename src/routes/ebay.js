@@ -7407,6 +7407,26 @@ router.get('/awaiting-sheet-summary', requireAuth, requireRole('fulfillmentadmin
               $cond: [{ $eq: ['$remark', 'In-transit'] }, 1, 0]
             }
           },
+          // Count orders with remark = 'Not yet shipped' and no tracking number
+          notYetShippedCount: {
+            $sum: {
+              $cond: [
+                {
+                  $and: [
+                    { $eq: ['$remark', 'Not yet shipped'] },
+                    {
+                      $or: [
+                        { $eq: [{ $ifNull: ['$trackingNumber', ''] }, ''] },
+                        { $eq: ['$trackingNumber', null] }
+                      ]
+                    }
+                  ]
+                },
+                1,
+                0
+              ]
+            }
+          },
           // Total orders count (for Upload Tracking column)
           uploadTrackingCount: { $sum: 1 },
           // Count orders with alreadyInUse = 'Yes' and no tracking number
@@ -7535,6 +7555,7 @@ router.get('/awaiting-sheet-summary', requireAuth, requireRole('fulfillmentadmin
           amazonCount: 1,
           upsUspsCount: 1,
           blankCount: 1,
+          notYetShippedCount: 1,
           _id: 0
         }
       },
@@ -7546,12 +7567,13 @@ router.get('/awaiting-sheet-summary', requireAuth, requireRole('fulfillmentadmin
       trackingId: acc.trackingId + item.trackingIdCount,
       delivered: acc.delivered + item.deliveredCount,
       inTransit: acc.inTransit + item.inTransitCount,
+      notYetShipped: acc.notYetShipped + item.notYetShippedCount,
       uploadTracking: acc.uploadTracking + item.uploadTrackingCount,
       alreadyInUse: acc.alreadyInUse + item.alreadyInUseCount,
       amazon: acc.amazon + item.amazonCount,
       upsUsps: acc.upsUsps + item.upsUspsCount,
       blank: acc.blank + item.blankCount
-    }), { trackingId: 0, delivered: 0, inTransit: 0, uploadTracking: 0, alreadyInUse: 0, amazon: 0, upsUsps: 0, blank: 0 });
+    }), { trackingId: 0, delivered: 0, inTransit: 0, notYetShipped: 0, uploadTracking: 0, alreadyInUse: 0, amazon: 0, upsUsps: 0, blank: 0 });
 
     res.json({
       date,
