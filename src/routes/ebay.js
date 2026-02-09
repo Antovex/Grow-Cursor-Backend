@@ -1266,6 +1266,23 @@ router.get('/stored-orders', async (req, res) => {
       query.orderPaymentStatus = paymentStatus;
     }
 
+    // Ship By Date Filter
+    if (req.query.shipByDate) {
+      const shipByDate = req.query.shipByDate;
+      const PST_OFFSET_HOURS = 8;
+
+      // Start of ship-by date in UTC (midnight PST = 8am UTC)
+      const startOfDay = new Date(shipByDate);
+      startOfDay.setUTCHours(PST_OFFSET_HOURS, 0, 0, 0);
+
+      // End of ship-by date in UTC (11:59:59 PM PST = 7:59:59 AM UTC next day)
+      const endOfDay = new Date(shipByDate);
+      endOfDay.setDate(endOfDay.getDate() + 1);
+      endOfDay.setUTCHours(PST_OFFSET_HOURS - 1, 59, 59, 999);
+
+      query.shipByDate = { $gte: startOfDay, $lte: endOfDay };
+    }
+
     // Exclude Low Value Orders (less than $3)
     if (req.query.excludeLowValue === 'true') {
       // Filter orders where subtotal or subtotalUSD is >= 3
