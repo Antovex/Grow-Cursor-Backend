@@ -15,7 +15,41 @@ const EmployeeProfileSchema = new mongoose.Schema(
     bankIFSC: { type: String, trim: true },
     bankName: { type: String, trim: true },
     workingMode: { type: String, enum: ['remote', 'office', 'hybrid'], trim: true },
+
+    // DEPRECATED - Use standardWorkingHours instead (kept for backward compatibility)
     workingHours: { type: String, trim: true },
+
+    // Primary field for meeting scheduling
+    standardWorkingHours: {
+      start: {
+        type: String,
+        default: "09:00",
+        validate: {
+          validator: function (v) {
+            return /^([01]\d|2[0-3]):([0-5]\d)$/.test(v);
+          },
+          message: props => `${props.value} is not a valid time format! Use HH:mm (e.g., 09:00)`
+        }
+      },
+      end: {
+        type: String,
+        default: "18:00",
+        validate: {
+          validator: function (v) {
+            return /^([01]\d|2[0-3]):([0-5]\d)$/.test(v);
+          },
+          message: props => `${props.value} is not a valid time format! Use HH:mm (e.g., 18:00)`
+        }
+      }
+    },
+
+    // Explicit timezone (all employees in IST)
+    timezone: {
+      type: String,
+      default: "Asia/Kolkata",
+      immutable: true
+    },
+
     aadharNumber: { type: String, trim: true },
     panNumber: { type: String, trim: true },
 

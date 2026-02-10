@@ -132,4 +132,14 @@ router.get('/check-exists', async (req, res) => {
   }
 });
 
+// List all users (for meeting invitees etc)
+router.get('/', requireAuth, async (req, res) => {
+  try {
+    const users = await User.find({}).select('_id username email role');
+    res.json(users);
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to fetch users' });
+  }
+});
+
 export default router;

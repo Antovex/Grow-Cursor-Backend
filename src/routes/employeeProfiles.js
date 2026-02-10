@@ -86,6 +86,31 @@ router.put('/me', requireAuth, async (req, res) => {
   try {
     const userId = req.user.userId || req.user._id || req.user.id;
     const data = pickProfile(req.body || {});
+
+    // Validate standardWorkingHours if provided
+    if (req.body.standardWorkingHours) {
+      const { start, end } = req.body.standardWorkingHours;
+
+      // Validate format
+      const timeRegex = /^([01]\d|2[0-3]):([0-5]\d)$/;
+      if (!timeRegex.test(start) || !timeRegex.test(end)) {
+        return res.status(400).json({
+          error: 'Invalid time format. Use HH:mm (e.g., 09:00, 18:30)'
+        });
+      }
+
+      // Ensure start < end
+      const [startH, startM] = start.split(':').map(Number);
+      const [endH, endM] = end.split(':').map(Number);
+      if (startH * 60 + startM >= endH * 60 + endM) {
+        return res.status(400).json({
+          error: 'Start time must be before end time'
+        });
+      }
+
+      data.standardWorkingHours = { start, end };
+    }
+
     const profile = await EmployeeProfile.findOneAndUpdate(
       { user: userId },
       { $set: data, $setOnInsert: { user: userId } },
@@ -148,10 +173,36 @@ router.put('/:id', requireAuth, async (req, res) => {
     // Remove empty string values for enum fields to avoid validation errors
     if (profileData.gender === '') delete profileData.gender;
 
-    // Extract admin fields (only if non-empty)
-    const { workingMode, workingHours } = req.body;
+    // Extract and validate standardWorkingHours
+    if (req.body.standardWorkingHours) {
+      const { start, end } = req.body.standardWorkingHours;
+
+      // Validate format (HH:mm)
+      const timeRegex = /^([01]\d|2[0-3]):([0-5]\d)$/;
+      if (!timeRegex.test(start) || !timeRegex.test(end)) {
+        return res.status(400).json({
+          error: 'Invalid time format. Use HH:mm (e.g., 09:00, 18:30)'
+        });
+      }
+
+      // Ensure start < end
+      const [startH, startM] = start.split(':').map(Number);
+      const [endH, endM] = end.split(':').map(Number);
+      const startMinutes = startH * 60 + startM;
+      const endMinutes = endH * 60 + endM;
+
+      if (startMinutes >= endMinutes) {
+        return res.status(400).json({
+          error: 'Start time must be before end time'
+        });
+      }
+
+      profileData.standardWorkingHours = { start, end };
+    }
+
+    // Extract admin fields (workingMode)
+    const { workingMode } = req.body;
     if (workingMode && workingMode !== '') profileData.workingMode = workingMode;
-    if (workingHours && workingHours !== '') profileData.workingHours = workingHours;
 
     // Update EmployeeProfile
     Object.assign(profile, profileData);

@@ -123,6 +123,9 @@ app.use('/api/seller-pricing-config', sellerPricingConfigRoutes);
 app.use('/api/account-health', accountHealthRoutes);
 app.use('/api/chat-templates', chatTemplatesRoutes);
 
+import meetingRoutes from './routes/meetings.js';
+app.use('/api/meetings', meetingRoutes);
+
 
 const port = process.env.PORT || 5000;
 
