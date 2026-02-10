@@ -1272,6 +1272,23 @@ router.get('/stored-orders', async (req, res) => {
       query.orderPaymentStatus = paymentStatus;
     }
 
+    // Ship By Date Filter
+    if (req.query.shipByDate) {
+      const shipByDate = req.query.shipByDate;
+      const PST_OFFSET_HOURS = 8;
+
+      // Start of ship-by date in UTC (midnight PST = 8am UTC)
+      const startOfDay = new Date(shipByDate);
+      startOfDay.setUTCHours(PST_OFFSET_HOURS, 0, 0, 0);
+
+      // End of ship-by date in UTC (11:59:59 PM PST = 7:59:59 AM UTC next day)
+      const endOfDay = new Date(shipByDate);
+      endOfDay.setDate(endOfDay.getDate() + 1);
+      endOfDay.setUTCHours(PST_OFFSET_HOURS - 1, 59, 59, 999);
+
+      query.shipByDate = { $gte: startOfDay, $lte: endOfDay };
+    }
+
     // Exclude Low Value Orders (less than $3)
     if (req.query.excludeLowValue === 'true') {
       // Filter orders where subtotal or subtotalUSD is >= 3
@@ -6681,7 +6698,7 @@ router.patch('/orders/:orderId/manual-fields', requireAuth, async (req, res) => 
   const { orderId } = req.params;
   const updates = req.body;
 
-  const allowedFields = ['amazonAccount', 'arrivingDate', 'beforeTax', 'estimatedTax', 'azOrderId', 'amazonRefund', 'cardName', 'remark'];
+  const allowedFields = ['amazonAccount', 'arrivingDate', 'beforeTax', 'estimatedTax', 'azOrderId', 'amazonRefund', 'cardName', 'remark', 'alreadyInUse'];
   const updateData = {};
 
   Object.keys(updates).forEach(key => {
@@ -7347,6 +7364,253 @@ router.post('/orders/send-auto-messages', requireAuth, requireRole('fulfillmenta
     });
   } catch (err) {
     console.error('Error sending auto-messages:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// =====================================================
+// AWAITING SHEET SUMMARY - Order counts by seller (no tracking)
+// =====================================================
+router.get('/awaiting-sheet-summary', requireAuth, requireRole('fulfillmentadmin', 'superadmin', 'hoc', 'compliancemanager'), async (req, res) => {
+  try {
+    const { date, marketplace } = req.query;
+
+    if (!date) {
+      return res.status(400).json({ error: 'Date is required (YYYY-MM-DD format)' });
+    }
+
+    // Build date range for the selected day (PST timezone like other endpoints)
+    const PST_OFFSET_HOURS = 8;
+    const startOfDay = new Date(date);
+    startOfDay.setUTCHours(PST_OFFSET_HOURS, 0, 0, 0);
+
+    const endOfDay = new Date(date);
+    endOfDay.setDate(endOfDay.getDate() + 1);
+    endOfDay.setUTCHours(PST_OFFSET_HOURS - 1, 59, 59, 999);
+
+    // Base match conditions for the date and cancel state
+    const baseMatch = {
+      shipByDate: { $gte: startOfDay, $lte: endOfDay },
+      cancelState: { $in: ['NONE_REQUESTED', 'IN_PROGRESS', null, ''] }
+    };
+
+    // Add marketplace filter if provided
+    if (marketplace && marketplace !== '') {
+      baseMatch.purchaseMarketplaceId = marketplace === 'EBAY_CA' ? { $in: ['EBAY_CA', 'EBAY_ENCA'] } : marketplace;
+    }
+
+    // Aggregation pipeline - group by seller with conditional counts
+    const summary = await Order.aggregate([
+      {
+        $match: baseMatch
+      },
+      // Group by seller with conditional counts
+      {
+        $group: {
+          _id: '$seller',
+          // Count orders without tracking number
+          trackingIdCount: {
+            $sum: {
+              $cond: [
+                {
+                  $or: [
+                    { $eq: [{ $ifNull: ['$trackingNumber', ''] }, ''] },
+                    { $eq: ['$trackingNumber', null] }
+                  ]
+                },
+                1,
+                0
+              ]
+            }
+          },
+          // Count orders with remark = 'Delivered'
+          deliveredCount: {
+            $sum: {
+              $cond: [{ $eq: ['$remark', 'Delivered'] }, 1, 0]
+            }
+          },
+          // Count orders with remark = 'In-transit'
+          inTransitCount: {
+            $sum: {
+              $cond: [{ $eq: ['$remark', 'In-transit'] }, 1, 0]
+            }
+          },
+          // Count orders with remark = 'Not yet shipped' and no tracking number
+          notYetShippedCount: {
+            $sum: {
+              $cond: [
+                {
+                  $and: [
+                    { $eq: ['$remark', 'Not yet shipped'] },
+                    {
+                      $or: [
+                        { $eq: [{ $ifNull: ['$trackingNumber', ''] }, ''] },
+                        { $eq: ['$trackingNumber', null] }
+                      ]
+                    }
+                  ]
+                },
+                1,
+                0
+              ]
+            }
+          },
+          // Total orders count (for Upload Tracking column)
+          uploadTrackingCount: { $sum: 1 },
+          // Count orders with alreadyInUse = 'Yes' and no tracking number
+          alreadyInUseCount: {
+            $sum: {
+              $cond: [
+                {
+                  $and: [
+                    { $eq: ['$alreadyInUse', 'Yes'] },
+                    {
+                      $or: [
+                        { $eq: [{ $ifNull: ['$trackingNumber', ''] }, ''] },
+                        { $eq: ['$trackingNumber', null] }
+                      ]
+                    }
+                  ]
+                },
+                1,
+                0
+              ]
+            }
+          },
+          // Count orders where notes contains 'amazon' (case insensitive) and no tracking
+          amazonCount: {
+            $sum: {
+              $cond: [
+                {
+                  $and: [
+                    {
+                      $or: [
+                        { $eq: [{ $ifNull: ['$trackingNumber', ''] }, ''] },
+                        { $eq: ['$trackingNumber', null] }
+                      ]
+                    },
+                    {
+                      $regexMatch: { input: { $ifNull: ['$notes', ''] }, regex: /amazon/i }
+                    }
+                  ]
+                },
+                1,
+                0
+              ]
+            }
+          },
+          // Count orders where notes starts with '1z' or '9' and no tracking
+          upsUspsCount: {
+            $sum: {
+              $cond: [
+                {
+                  $and: [
+                    {
+                      $or: [
+                        { $eq: [{ $ifNull: ['$trackingNumber', ''] }, ''] },
+                        { $eq: ['$trackingNumber', null] }
+                      ]
+                    },
+                    {
+                      $or: [
+                        { $regexMatch: { input: { $ifNull: ['$notes', ''] }, regex: /^1z/i } },
+                        { $regexMatch: { input: { $ifNull: ['$notes', ''] }, regex: /^9/ } }
+                      ]
+                    }
+                  ]
+                },
+                1,
+                0
+              ]
+            }
+          },
+          // Count orders where notes is blank/null and no tracking
+          blankCount: {
+            $sum: {
+              $cond: [
+                {
+                  $and: [
+                    {
+                      $or: [
+                        { $eq: [{ $ifNull: ['$trackingNumber', ''] }, ''] },
+                        { $eq: ['$trackingNumber', null] }
+                      ]
+                    },
+                    {
+                      $or: [
+                        { $eq: [{ $ifNull: ['$notes', ''] }, ''] },
+                        { $eq: ['$notes', null] }
+                      ]
+                    }
+                  ]
+                },
+                1,
+                0
+              ]
+            }
+          }
+        }
+      },
+      // Lookup seller info
+      {
+        $lookup: {
+          from: 'sellers',
+          localField: '_id',
+          foreignField: '_id',
+          as: 'sellerDoc'
+        }
+      },
+      { $unwind: { path: '$sellerDoc', preserveNullAndEmptyArrays: true } },
+      // Lookup user for username
+      {
+        $lookup: {
+          from: 'users',
+          localField: 'sellerDoc.user',
+          foreignField: '_id',
+          as: 'userDoc'
+        }
+      },
+      { $unwind: { path: '$userDoc', preserveNullAndEmptyArrays: true } },
+      {
+        $project: {
+          sellerId: '$_id',
+          sellerName: { $ifNull: ['$userDoc.username', '$userDoc.email', 'Unknown'] },
+          trackingIdCount: 1,
+          deliveredCount: 1,
+          inTransitCount: 1,
+          uploadTrackingCount: 1,
+          alreadyInUseCount: 1,
+          amazonCount: 1,
+          upsUspsCount: 1,
+          blankCount: 1,
+          notYetShippedCount: 1,
+          _id: 0
+        }
+      },
+      { $sort: { trackingIdCount: -1 } } // Sort by tracking ID count descending
+    ]);
+
+    // Calculate totals
+    const totals = summary.reduce((acc, item) => ({
+      trackingId: acc.trackingId + item.trackingIdCount,
+      delivered: acc.delivered + item.deliveredCount,
+      inTransit: acc.inTransit + item.inTransitCount,
+      notYetShipped: acc.notYetShipped + item.notYetShippedCount,
+      uploadTracking: acc.uploadTracking + item.uploadTrackingCount,
+      alreadyInUse: acc.alreadyInUse + item.alreadyInUseCount,
+      amazon: acc.amazon + item.amazonCount,
+      upsUsps: acc.upsUsps + item.upsUspsCount,
+      blank: acc.blank + item.blankCount
+    }), { trackingId: 0, delivered: 0, inTransit: 0, notYetShipped: 0, uploadTracking: 0, alreadyInUse: 0, amazon: 0, upsUsps: 0, blank: 0 });
+
+    res.json({
+      date,
+      summary,
+      totals,
+      totalSellers: summary.length
+    });
+  } catch (err) {
+    console.error('Error fetching awaiting sheet summary:', err);
     res.status(500).json({ error: err.message });
   }
 });
