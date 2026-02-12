@@ -21,6 +21,7 @@ const OrderSchema = new mongoose.Schema(
     salesRecordReference: String,
     totalFeeBasisAmount: Object,
     totalMarketplaceFee: Object,
+    fulfillmentHrefs: [String], // Array of fulfillment URLs
     // Denormalized fields for easy display
     dateSold: Date,
     shipByDate: Date,

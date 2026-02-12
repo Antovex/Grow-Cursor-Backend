@@ -745,12 +745,18 @@ async function extractTrackingNumber(fulfillmentHrefs, accessToken) {
       },
     });
     // Extract tracking number from the fulfillment response
+    // Check multiple possible locations in the response
     const trackingNumber = response.data?.shipmentTrackingNumber ||
       response.data?.lineItems?.[0]?.shipmentTrackingNumber ||
+      response.data?.shippingCarrierCode && response.data?.trackingNumber ||
       null;
+
+    if (!trackingNumber) {
+      console.log(`  ⚠️ Fulfillment response has no tracking. Keys: ${Object.keys(response.data || {}).join(', ')}`);
+    }
     return trackingNumber;
   } catch (err) {
-    console.error('Failed to extract tracking number:', err.message);
+    console.error(`  ❌ Failed to extract tracking number: ${err.message} (status: ${err.response?.status})`);
     return null;
   }
 }
@@ -3431,6 +3437,200 @@ router.post('/poll-order-updates', requireAuth, requireRole('fulfillmentadmin', 
 
   } catch (err) {
     console.error('Error polling order updates:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Resync recent orders (last 10 days) - catches silent eBay changes where lastModifiedDate wasn't updated
+router.post('/resync-recent', requireAuth, requireRole('fulfillmentadmin', 'superadmin', 'compliancemanager', 'hoc'), async (req, res) => {
+  try {
+    // Fields that should NOT be overwritten (manually set by team)
+    const MANUAL_FIELDS = new Set([
+      'amazonAccount', 'beforeTax', 'estimatedTax', 'beforeTaxUSD', 'estimatedTaxUSD',
+      'amazonTotal', 'amazonTotalINR', 'marketplaceFee', 'igst', 'totalCC', 'amazonExchangeRate',
+      'fulfillmentNotes', 'remark', 'messagingStatus', 'itemStatus', 'resolvedFrom',
+      'arrivingDate', 'adFeeGeneral', 'adFeeGeneralUSD',
+      'orderEarnings', 'tds', 'tid', 'net', 'pBalanceINR', 'ebayExchangeRate',
+      '_id', '__v', 'createdAt', 'updatedAt'
+    ]);
+
+    // Helper to normalize dates for comparison (ignore milliseconds)
+    function normalizeDateForComparison(date) {
+      if (!date) return null;
+      return Math.floor(new Date(date).getTime() / 1000);
+    }
+
+    const sellers = await Seller.find({ 'ebayTokens.access_token': { $exists: true, $ne: null } })
+      .populate('user', 'username email');
+
+    if (sellers.length === 0) {
+      return res.json({
+        message: 'No sellers with connected eBay accounts found',
+        pollResults: [],
+        totalPolled: 0,
+        totalUpdated: 0,
+        totalNew: 0
+      });
+    }
+
+    const nowUTC = Date.now();
+    const days = Math.min(Math.max(parseInt(req.body.days) || 10, 1), 30); // Default 10, max 30
+    const sinceDate = new Date(nowUTC - days * 24 * 60 * 60 * 1000);
+
+    console.log(`\n========== RESYNC RECENT ORDERS (${days} DAYS) FOR ${sellers.length} SELLERS ==========`);
+    console.log(`UTC Time: ${new Date(nowUTC).toISOString()}`);
+    console.log(`Checking orders created since: ${sinceDate.toISOString()}`);
+
+    const pollingPromises = sellers.map(async (seller) => {
+      const sellerName = seller.user?.username || seller.user?.email || seller._id.toString();
+
+      try {
+        console.log(`\n[${sellerName}] Starting resync...`);
+
+        // Token refresh
+        const fetchedAt = seller.ebayTokens.fetchedAt ? new Date(seller.ebayTokens.fetchedAt).getTime() : 0;
+        const expiresInMs = (seller.ebayTokens.expires_in || 0) * 1000;
+        let accessToken = seller.ebayTokens.access_token;
+
+        if (fetchedAt && (nowUTC - fetchedAt > expiresInMs - 2 * 60 * 1000)) {
+          console.log(`[${sellerName}] Refreshing token...`);
+          const refreshRes = await axios.post(
+            'https://api.ebay.com/identity/v1/oauth2/token',
+            qs.stringify({
+              grant_type: 'refresh_token',
+              refresh_token: seller.ebayTokens.refresh_token,
+              scope: EBAY_OAUTH_SCOPES,
+            }),
+            {
+              headers: {
+                'Content-Type': 'application/x-www-form-urlencoded',
+                Authorization: 'Basic ' + Buffer.from(`${process.env.EBAY_CLIENT_ID}:${process.env.EBAY_CLIENT_SECRET}`).toString('base64'),
+              },
+            }
+          );
+          seller.ebayTokens.access_token = refreshRes.data.access_token;
+          seller.ebayTokens.expires_in = refreshRes.data.expires_in;
+          seller.ebayTokens.fetchedAt = new Date(nowUTC);
+          await seller.save();
+          accessToken = refreshRes.data.access_token;
+        }
+
+        // Fetch all orders created in last 10 days
+        const currentTimeUTC = new Date(nowUTC);
+        const filter = `creationdate:[${sinceDate.toISOString()}..${currentTimeUTC.toISOString()}]`;
+        console.log(`[${sellerName}] Filter: ${filter}`);
+
+        const ebayOrders = await fetchAllOrdersWithPagination(accessToken, filter, sellerName);
+        console.log(`[${sellerName}] Fetched ${ebayOrders.length} orders from eBay`);
+
+        const updatedOrders = [];
+        const newOrders = [];
+
+        for (const ebayOrder of ebayOrders) {
+          const existingOrder = await Order.findOne({
+            orderId: ebayOrder.orderId,
+            seller: seller._id
+          });
+
+          if (existingOrder) {
+            // Build fresh order data from eBay
+            const orderData = await buildOrderData(ebayOrder, seller._id, accessToken);
+
+            // Only apply eBay-sourced fields (skip manual fields)
+            let hasChanges = false;
+            const changedFields = [];
+
+            for (const [key, value] of Object.entries(orderData)) {
+              if (MANUAL_FIELDS.has(key)) continue;
+              if (key === 'seller') continue;
+
+              // Compare values
+              const oldVal = existingOrder[key];
+              const newVal = value;
+              let changed = false;
+
+              if (oldVal === null || oldVal === undefined) {
+                changed = newVal !== null && newVal !== undefined;
+              } else if (key === 'creationDate' || key === 'lastModifiedDate' || key === 'dateSold' || key === 'shipByDate' || key === 'estimatedDelivery') {
+                // Date comparison - normalize to seconds
+                changed = normalizeDateForComparison(oldVal) !== normalizeDateForComparison(newVal);
+              } else if (typeof newVal === 'object' && newVal !== null) {
+                changed = JSON.stringify(oldVal) !== JSON.stringify(newVal);
+              } else {
+                changed = oldVal !== newVal;
+              }
+
+              if (changed) {
+                existingOrder[key] = value;
+                hasChanges = true;
+                changedFields.push(key);
+              }
+            }
+
+            if (hasChanges) {
+              await existingOrder.save();
+              updatedOrders.push({
+                orderId: existingOrder.orderId,
+                changedFields
+              });
+              console.log(`  🔄 RESYNCED: ${ebayOrder.orderId} - ${changedFields.join(', ')}`);
+            }
+          } else {
+            // New order not in DB - create it
+            const orderData = await buildOrderData(ebayOrder, seller._id, accessToken);
+            const newOrder = await Order.create(orderData);
+            newOrders.push(newOrder.orderId);
+            console.log(`  🆕 NEW (resync): ${ebayOrder.orderId}`);
+          }
+        }
+
+        console.log(`[${sellerName}] ✅ Resync complete: ${updatedOrders.length} updated, ${newOrders.length} new`);
+
+        return {
+          sellerId: seller._id,
+          sellerName,
+          success: true,
+          totalFetched: ebayOrders.length,
+          updatedOrders,
+          newOrders,
+          totalUpdated: updatedOrders.length,
+          totalNew: newOrders.length
+        };
+
+      } catch (sellerErr) {
+        console.error(`[${sellerName}] ❌ Resync error:`, sellerErr.message);
+        return {
+          sellerId: seller._id,
+          sellerName,
+          success: false,
+          error: sellerErr.message
+        };
+      }
+    });
+
+    const results = await Promise.allSettled(pollingPromises);
+    const pollResults = results.map(result =>
+      result.status === 'fulfilled' ? result.value : { success: false, error: result.reason?.message || 'Unknown error' }
+    );
+
+    const totalUpdated = pollResults.reduce((sum, r) => sum + (r.totalUpdated || 0), 0);
+    const totalNew = pollResults.reduce((sum, r) => sum + (r.totalNew || 0), 0);
+
+    res.json({
+      message: 'Resync complete',
+      pollResults,
+      totalPolled: sellers.length,
+      totalUpdated,
+      totalNew
+    });
+
+    console.log('\n========== RESYNC SUMMARY ==========');
+    console.log(`Total sellers: ${sellers.length}`);
+    console.log(`Total updated: ${totalUpdated}`);
+    console.log(`Total new: ${totalNew}`);
+
+  } catch (err) {
+    console.error('Error in resync:', err);
     res.status(500).json({ error: err.message });
   }
 });
