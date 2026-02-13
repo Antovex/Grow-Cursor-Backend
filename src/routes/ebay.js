@@ -22,7 +22,118 @@ import ConversationMeta from '../models/ConversationMeta.js';
 import ExchangeRate from '../models/ExchangeRate.js';
 import { parseStringPromise } from 'xml2js';
 import imageCache from '../lib/imageCache.js';
+import multer from 'multer';
+
+const upload = multer({ storage: multer.memoryStorage() });
 const router = express.Router();
+
+// ============================================
+// UPLOAD FEED TO EBAY
+// ============================================
+router.post('/feed/upload', requireAuth, upload.single('file'), async (req, res) => {
+  try {
+    const { sellerId, feedType = 'FX_LISTING', schemaVersion = '1.0' } = req.body;
+    const file = req.file;
+
+    if (!file) {
+      return res.status(400).json({ error: 'No file uploaded' });
+    }
+
+    if (!sellerId) {
+      return res.status(400).json({ error: 'Missing sellerId' });
+    }
+
+    console.log(`[Feed Upload] Starting upload for seller ${sellerId}, feedType=${feedType}`);
+
+    // 1. Get Seller & Token
+    const seller = await Seller.findById(sellerId);
+    if (!seller) {
+      return res.status(404).json({ error: 'Seller not found' });
+    }
+
+    const accessToken = await ensureValidToken(seller);
+
+    // 2. Create Task
+    // POST https://api.ebay.com/sell/feed/v1/task
+    console.log(`[Feed Upload] Creating task...`);
+    const createTaskRes = await axios.post(
+      'https://api.ebay.com/sell/feed/v1/task',
+      {
+        feedType: feedType,
+        schemaVersion: schemaVersion
+      },
+      {
+        headers: {
+          'Authorization': `Bearer ${accessToken}`,
+          'Content-Type': 'application/json',
+          'X-EBAY-C-MARKETPLACE-ID': 'EBAY_US' // Default to US, make configurable if needed
+        }
+      }
+    );
+
+    // Task location is in "location" header, but ID is usually part of the URL
+    // The response body is empty for 202, but some docs say it returns ID in location header
+    // The documentation says: "The location response header contains the URL to the newly created task. The URL includes the eBay-assigned task ID"
+    const locationHeader = createTaskRes.headers.location;
+    if (!locationHeader) {
+      throw new Error('Failed to get task location from eBay');
+    }
+
+    const taskId = locationHeader.split('/').pop();
+    console.log(`[Feed Upload] Task created with ID: ${taskId}`);
+
+    // 3. Upload File
+    // POST https://api.ebay.com/sell/feed/v1/task/{task_id}/upload_file
+    console.log(`[Feed Upload] Uploading file to task ${taskId}...`);
+
+    const formData = new FormData();
+    // 'file' is the required key name for the file content
+    formData.append('file', file.buffer, {
+      filename: file.originalname,
+      contentType: file.mimetype,
+    });
+    // 'fileName', 'name', 'type' might be required as extra fields based on some examples,
+    // but the official docs say: "This call does not have a JSON Request payload but uploads the file as form-data."
+    // and "key-value pair name: 'file'".
+    // The user's example showed payload = {"fileName": ..., "name": "file", "type": "form-data"}
+    // valid form-data keys: fileName, name, type.
+    formData.append('fileName', file.originalname);
+    formData.append('name', 'file');
+    formData.append('type', 'form-data');
+
+
+    const uploadRes = await axios.post(
+      `https://api.ebay.com/sell/feed/v1/task/${taskId}/upload_file`,
+      formData,
+      {
+        headers: {
+          'Authorization': `Bearer ${accessToken}`,
+          ...formData.getHeaders()
+        }
+      }
+    );
+
+    console.log(`[Feed Upload] File uploaded successfully. Status: ${uploadRes.status}`);
+
+    res.json({
+      success: true,
+      taskId: taskId,
+      message: 'File uploaded and processing started',
+      uploadStatus: uploadRes.status
+    });
+
+  } catch (error) {
+    console.error('[Feed Upload] Error:', error.message);
+    if (error.response) {
+      console.error('[Feed Upload] eBay Response:', error.response.data);
+      console.error('[Feed Upload] eBay Status:', error.response.status);
+    }
+    res.status(500).json({
+      error: 'Failed to upload feed',
+      details: error.response?.data || error.message
+    });
+  }
+});
 
 // ============================================
 // EBAY OAUTH SCOPES - Single source of truth
