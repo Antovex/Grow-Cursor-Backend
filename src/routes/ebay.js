@@ -23,6 +23,7 @@ import ExchangeRate from '../models/ExchangeRate.js';
 import { parseStringPromise } from 'xml2js';
 import imageCache from '../lib/imageCache.js';
 import multer from 'multer';
+import FeedUpload from '../models/FeedUpload.js';
 
 const upload = multer({ storage: multer.memoryStorage() });
 const router = express.Router();
@@ -115,6 +116,16 @@ router.post('/feed/upload', requireAuth, upload.single('file'), async (req, res)
 
     console.log(`[Feed Upload] File uploaded successfully. Status: ${uploadRes.status}`);
 
+    // Create local record
+    await FeedUpload.create({
+      seller: seller._id,
+      taskId: taskId,
+      fileName: file.originalname,
+      feedType: feedType,
+      schemaVersion: schemaVersion,
+      status: 'CREATED' // Initial status
+    });
+
     res.json({
       success: true,
       taskId: taskId,
@@ -130,6 +141,104 @@ router.post('/feed/upload', requireAuth, upload.single('file'), async (req, res)
     }
     res.status(500).json({
       error: 'Failed to upload feed',
+      details: error.response?.data || error.message
+    });
+  }
+});
+
+// ============================================
+// GET FEED TASKS STATUS
+// ============================================
+router.get('/feed/tasks', requireAuth, async (req, res) => {
+  try {
+    const { sellerId, limit = 10, offset = 0 } = req.query;
+
+    if (!sellerId) {
+      return res.status(400).json({ error: 'Missing sellerId' });
+    }
+
+    // 1. Get Seller & Token
+    const seller = await Seller.findById(sellerId);
+    if (!seller) {
+      return res.status(404).json({ error: 'Seller not found' });
+    }
+
+    const accessToken = await ensureValidToken(seller);
+
+    // 2. Fetch Tasks from eBay
+    // GET https://api.ebay.com/sell/feed/v1/task
+    // 2. Fetch Tasks from Local DB
+    console.log(`[Feed Tasks] Fetching tasks for seller ${sellerId} from DB...`);
+
+    // Calculate skip based on offset/limit
+    const skip = parseInt(offset) || 0;
+    const limitNum = parseInt(limit) || 10;
+
+    const dbTasks = await FeedUpload.find({ seller: sellerId })
+      .sort({ creationDate: -1 })
+      .skip(skip)
+      .limit(limitNum);
+
+    const total = await FeedUpload.countDocuments({ seller: sellerId });
+
+    // 3. Sync Status with eBay for Incomplete Tasks
+    // We only need to check status if it's not COMPLETED or FAILURE
+    const tasksToSync = dbTasks.filter(t =>
+      t.status !== 'COMPLETED' &&
+      t.status !== 'COMPLETED_WITH_ERROR' &&
+      t.status !== 'FAILURE'
+    );
+
+    if (tasksToSync.length > 0) {
+      console.log(`[Feed Tasks] Syncing ${tasksToSync.length} tasks with eBay...`);
+
+      for (const task of tasksToSync) {
+        try {
+          // GET https://api.ebay.com/sell/feed/v1/task/{task_id}
+          const taskRes = await axios.get(
+            `https://api.ebay.com/sell/feed/v1/task/${task.taskId}`,
+            {
+              headers: {
+                'Authorization': `Bearer ${accessToken}`,
+                'Content-Type': 'application/json',
+                'X-EBAY-C-MARKETPLACE-ID': 'EBAY_US'
+              }
+            }
+          );
+
+          const ebayTask = taskRes.data;
+
+          // Update local DB if status changed
+          if (ebayTask.status !== task.status || ebayTask.uploadSummary) {
+            task.status = ebayTask.status;
+            if (ebayTask.uploadSummary) {
+              task.uploadSummary = {
+                successCount: ebayTask.uploadSummary.successCount,
+                failureCount: ebayTask.uploadSummary.failureCount
+              };
+            }
+            task.lastUpdated = new Date();
+            await task.save();
+          }
+        } catch (err) {
+          console.error(`[Feed Tasks] Failed to sync task ${task.taskId}:`, err.message);
+        }
+      }
+    }
+
+    res.json({
+      success: true,
+      tasks: dbTasks,
+      total: total
+    });
+
+  } catch (error) {
+    console.error('[Feed Tasks] Error:', error.message);
+    if (error.response) {
+      console.error('[Feed Tasks] eBay Response:', error.response.data);
+    }
+    res.status(500).json({
+      error: 'Failed to fetch feed tasks',
       details: error.response?.data || error.message
     });
   }
