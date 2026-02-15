@@ -2352,7 +2352,7 @@ router.post('/orders/:orderId/upload-tracking', async (req, res) => {
     order.trackingNumber = trackingNumber.trim();
     order.manualTrackingNumber = trackingNumber.trim();
     order.orderFulfillmentStatus = 'FULFILLED';
-    order.lastModifiedDate = new Date().toISOString();
+
     await order.save();
 
     console.log(`[Upload Tracking] 💾 Database updated successfully for order ${ebayOrderId}`);
@@ -2554,7 +2554,7 @@ router.post('/orders/:orderId/upload-tracking-multiple', async (req, res) => {
       order.trackingNumber = allTrackingNumbers;
       order.manualTrackingNumber = allTrackingNumbers;
       order.orderFulfillmentStatus = isFulfilled ? 'FULFILLED' : order.orderFulfillmentStatus;
-      order.lastModifiedDate = new Date().toISOString();
+
       await order.save();
 
       console.log(`[Upload Multiple Tracking] 💾 Database updated with ${trackingData.length} tracking numbers`);
