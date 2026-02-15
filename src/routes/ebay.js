@@ -3516,23 +3516,7 @@ router.post('/poll-order-updates', requireAuth, requireRole('fulfillmentadmin', 
                 // ONLY NOW fetch full order data (includes expensive tracking lookup)
                 const orderData = await buildOrderData(ebayOrder, seller._id, accessToken);
 
-                // Define fields that should trigger notifications
-                const notifiableFields = [
-                  'cancelState',
-                  'cancelStatus',
-                  'orderPaymentStatus',
-                  'refunds',
-                  'orderFulfillmentStatus',
-                  'trackingNumber',
-                  'shippingFullName',
-                  'shippingAddressLine1',
-                  'shippingAddressLine2',
-                  'shippingCity',
-                  'shippingState',
-                  'shippingPostalCode',
-                  'shippingCountry'
-                  // NOTE: buyerCheckoutNotes is NOT included - updates DB silently
-                ];
+
 
                 // Detect changed fields with smart comparison
                 const changedFields = [];
@@ -3542,10 +3526,7 @@ router.post('/poll-order-updates', requireAuth, requireRole('fulfillmentadmin', 
                   }
                 }
 
-                // Filter to only notifiable fields (exclude lastModifiedDate)
-                const notifiableChanges = changedFields.filter(f =>
-                  notifiableFields.includes(f) && f !== 'lastModifiedDate'
-                );
+
 
                 // Always save ALL changes to DB (even non-notifiable)
                 Object.assign(existingOrder, orderData);
@@ -3590,11 +3571,11 @@ router.post('/poll-order-updates', requireAuth, requireRole('fulfillmentadmin', 
                   }
                 }
 
-                // Only add to notification list if there are notifiable changes
-                if (notifiableChanges.length > 0) {
+                // Add to list if there are ANY changes
+                if (changedFields.length > 0) {
                   // Check if shipping address changed
                   const shippingFields = ['shippingFullName', 'shippingAddressLine1', 'shippingCity', 'shippingState', 'shippingPostalCode'];
-                  const shippingChanged = notifiableChanges.some(f => shippingFields.includes(f));
+                  const shippingChanged = changedFields.some(f => shippingFields.includes(f));
 
                   if (shippingChanged) {
                     console.log(`  🏠 SHIPPING ADDRESS CHANGED: ${ebayOrder.orderId}`);
@@ -3602,12 +3583,9 @@ router.post('/poll-order-updates', requireAuth, requireRole('fulfillmentadmin', 
 
                   updatedOrders.push({
                     orderId: existingOrder.orderId,
-                    changedFields: notifiableChanges
+                    changedFields: changedFields
                   });
-                  console.log(`  🔔 NOTIFY: ${ebayOrder.orderId} - ${notifiableChanges.join(', ')}`);
-                } else {
-                  // Changes were made but not notifiable (e.g., buyerCheckoutNotes, dates, etc.)
-                  console.log(`  ✅ UPDATED (silent): ${ebayOrder.orderId} - ${changedFields.join(', ')}`);
+                  console.log(`  🔔 NOTIFY: ${ebayOrder.orderId} - ${changedFields.join(', ')}`);
                 }
               }
             }
