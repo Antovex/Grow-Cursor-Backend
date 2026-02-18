@@ -7231,7 +7231,21 @@ router.patch('/orders/:orderId/manual-fields', requireAuth, async (req, res) => 
 
   Object.keys(updates).forEach(key => {
     if (allowedFields.includes(key)) {
-      updateData[key] = updates[key];
+      if (key === 'remark') {
+        const rawRemark = updates[key];
+        if (
+          rawRemark === null ||
+          rawRemark === undefined ||
+          String(rawRemark).trim() === '' ||
+          String(rawRemark).trim().toLowerCase() === 'select'
+        ) {
+          updateData[key] = null;
+        } else {
+          updateData[key] = String(rawRemark).trim();
+        }
+      } else {
+        updateData[key] = updates[key];
+      }
     }
   });
 
