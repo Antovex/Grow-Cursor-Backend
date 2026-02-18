@@ -7042,7 +7042,14 @@ router.get('/conversation-management/list', requireAuth, async (req, res) => {
 
   try {
     let query = {};
-    if (status) query.status = status;
+    if (status) {
+      const statuses = String(status)
+        .split(',')
+        .map(s => s.trim())
+        .filter(Boolean);
+      if (statuses.length === 1) query.status = statuses[0];
+      else if (statuses.length > 1) query.status = { $in: statuses };
+    }
 
     const list = await ConversationMeta.aggregate([
       { $match: query },
@@ -7102,6 +7109,83 @@ router.get('/conversation-management/list', requireAuth, async (req, res) => {
               "$buyerUsername"
             ]
           }
+        }
+      },
+
+      // 5. LOOKUP MESSAGE TIMESTAMPS FOR SLA / REPLY TIMERS
+      {
+        $lookup: {
+          from: 'messages',
+          let: {
+            sellerId: '$sellerId',
+            metaOrderId: '$orderId',
+            metaBuyerUsername: '$buyerUsername',
+            metaItemId: '$itemId'
+          },
+          pipeline: [
+            {
+              $match: {
+                $expr: {
+                  $and: [
+                    { $eq: ['$seller', '$$sellerId'] },
+                    {
+                      $cond: [
+                        { $ne: ['$$metaOrderId', null] },
+                        { $eq: ['$orderId', '$$metaOrderId'] },
+                        {
+                          $and: [
+                            { $eq: ['$buyerUsername', '$$metaBuyerUsername'] },
+                            { $eq: ['$itemId', '$$metaItemId'] },
+                            { $eq: [{ $ifNull: ['$orderId', null] }, null] }
+                          ]
+                        }
+                      ]
+                    }
+                  ]
+                }
+              }
+            },
+            {
+              $group: {
+                _id: null,
+                lastBuyerMessageAt: {
+                  $max: {
+                    $cond: [{ $eq: ['$sender', 'BUYER'] }, '$messageDate', null]
+                  }
+                },
+                lastSellerMessageAt: {
+                  $max: {
+                    $cond: [{ $eq: ['$sender', 'SELLER'] }, '$messageDate', null]
+                  }
+                }
+              }
+            },
+            {
+              $project: {
+                _id: 0,
+                lastBuyerMessageAt: 1,
+                lastSellerMessageAt: 1
+              }
+            }
+          ],
+          as: 'messageTimes'
+        }
+      },
+      {
+        $unwind: {
+          path: '$messageTimes',
+          preserveNullAndEmptyArrays: true
+        }
+      },
+      {
+        $addFields: {
+          lastBuyerMessageAt: '$messageTimes.lastBuyerMessageAt',
+          lastSellerMessageAt: '$messageTimes.lastSellerMessageAt'
+        }
+      },
+      {
+        $project: {
+          messageTimes: 0
         }
       }
     ]);
