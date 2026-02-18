@@ -1402,7 +1402,7 @@ router.get('/order/:orderId', requireAuth, requireRole('fulfillmentadmin', 'supe
 
 // Get stored orders from database with pagination support
 router.get('/stored-orders', async (req, res) => {
-  const { sellerId, page = 1, limit = 50, searchOrderId, searchBuyerName, searchItemId, searchMarketplace, paymentStatus, startDate, endDate, awaitingShipment, hasFulfillmentNotes, amazonArriving, arrivalSort, amazonAccount, arrivalStartDate, arrivalEndDate } = req.query;
+  const { sellerId, page = 1, limit = 50, searchOrderId, searchBuyerName, searchItemId, searchMarketplace, paymentStatus, startDate, endDate, awaitingShipment, hasFulfillmentNotes, amazonArriving, arrivalSort, amazonAccount, arrivalStartDate, arrivalEndDate, productName } = req.query;
 
   try {
     let query = {};
@@ -1468,6 +1468,26 @@ router.get('/stored-orders', async (req, res) => {
         { 'lineItems.legacyItemId': { $regex: searchItemId, $options: 'i' } },
         { itemNumber: { $regex: searchItemId, $options: 'i' } }
       ];
+    }
+
+    if (productName) {
+      const productClause = {
+        $or: [
+          { productName: { $regex: productName, $options: 'i' } },
+          { 'lineItems.title': { $regex: productName, $options: 'i' } }
+        ]
+      };
+
+      if (query.$or) {
+        if (!query.$and) query.$and = [];
+        query.$and.push({ $or: query.$or });
+        delete query.$or;
+        query.$and.push(productClause);
+      } else if (query.$and) {
+        query.$and.push(productClause);
+      } else {
+        query.$or = productClause.$or;
+      }
     }
 
     // Timezone-Aware Date Range Logic
@@ -2352,7 +2372,7 @@ router.post('/orders/:orderId/upload-tracking', async (req, res) => {
     order.trackingNumber = trackingNumber.trim();
     order.manualTrackingNumber = trackingNumber.trim();
     order.orderFulfillmentStatus = 'FULFILLED';
-    order.lastModifiedDate = new Date().toISOString();
+
     await order.save();
 
     console.log(`[Upload Tracking] 💾 Database updated successfully for order ${ebayOrderId}`);
@@ -2554,7 +2574,7 @@ router.post('/orders/:orderId/upload-tracking-multiple', async (req, res) => {
       order.trackingNumber = allTrackingNumbers;
       order.manualTrackingNumber = allTrackingNumbers;
       order.orderFulfillmentStatus = isFulfilled ? 'FULFILLED' : order.orderFulfillmentStatus;
-      order.lastModifiedDate = new Date().toISOString();
+
       await order.save();
 
       console.log(`[Upload Multiple Tracking] 💾 Database updated with ${trackingData.length} tracking numbers`);
@@ -3516,23 +3536,7 @@ router.post('/poll-order-updates', requireAuth, requireRole('fulfillmentadmin', 
                 // ONLY NOW fetch full order data (includes expensive tracking lookup)
                 const orderData = await buildOrderData(ebayOrder, seller._id, accessToken);
 
-                // Define fields that should trigger notifications
-                const notifiableFields = [
-                  'cancelState',
-                  'cancelStatus',
-                  'orderPaymentStatus',
-                  'refunds',
-                  'orderFulfillmentStatus',
-                  'trackingNumber',
-                  'shippingFullName',
-                  'shippingAddressLine1',
-                  'shippingAddressLine2',
-                  'shippingCity',
-                  'shippingState',
-                  'shippingPostalCode',
-                  'shippingCountry'
-                  // NOTE: buyerCheckoutNotes is NOT included - updates DB silently
-                ];
+
 
                 // Detect changed fields with smart comparison
                 const changedFields = [];
@@ -3542,10 +3546,7 @@ router.post('/poll-order-updates', requireAuth, requireRole('fulfillmentadmin', 
                   }
                 }
 
-                // Filter to only notifiable fields (exclude lastModifiedDate)
-                const notifiableChanges = changedFields.filter(f =>
-                  notifiableFields.includes(f) && f !== 'lastModifiedDate'
-                );
+
 
                 // Always save ALL changes to DB (even non-notifiable)
                 Object.assign(existingOrder, orderData);
@@ -3590,11 +3591,11 @@ router.post('/poll-order-updates', requireAuth, requireRole('fulfillmentadmin', 
                   }
                 }
 
-                // Only add to notification list if there are notifiable changes
-                if (notifiableChanges.length > 0) {
+                // Add to list if there are ANY changes
+                if (changedFields.length > 0) {
                   // Check if shipping address changed
                   const shippingFields = ['shippingFullName', 'shippingAddressLine1', 'shippingCity', 'shippingState', 'shippingPostalCode'];
-                  const shippingChanged = notifiableChanges.some(f => shippingFields.includes(f));
+                  const shippingChanged = changedFields.some(f => shippingFields.includes(f));
 
                   if (shippingChanged) {
                     console.log(`  🏠 SHIPPING ADDRESS CHANGED: ${ebayOrder.orderId}`);
@@ -3602,12 +3603,9 @@ router.post('/poll-order-updates', requireAuth, requireRole('fulfillmentadmin', 
 
                   updatedOrders.push({
                     orderId: existingOrder.orderId,
-                    changedFields: notifiableChanges
+                    changedFields: changedFields
                   });
-                  console.log(`  🔔 NOTIFY: ${ebayOrder.orderId} - ${notifiableChanges.join(', ')}`);
-                } else {
-                  // Changes were made but not notifiable (e.g., buyerCheckoutNotes, dates, etc.)
-                  console.log(`  ✅ UPDATED (silent): ${ebayOrder.orderId} - ${changedFields.join(', ')}`);
+                  console.log(`  🔔 NOTIFY: ${ebayOrder.orderId} - ${changedFields.join(', ')}`);
                 }
               }
             }
@@ -8053,6 +8051,178 @@ router.get('/awaiting-sheet-summary', requireAuth, requireRole('fulfillmentadmin
   } catch (err) {
     console.error('Error fetching awaiting sheet summary:', err);
     res.status(500).json({ error: err.message });
+  }
+});
+
+
+// ============================================
+// GET ALL SELLING PRIVILEGES (BULK)
+// ============================================
+router.get('/selling/summary/all', requireAuth, async (req, res) => {
+  try {
+    const sellers = await Seller.find({}).populate('user');
+    console.log(`[Selling Limits] Fetching limits for ${sellers.length} sellers...`);
+
+    const results = await Promise.all(sellers.map(async (seller) => {
+      try {
+        const accessToken = await ensureValidToken(seller);
+
+        const xmlRequest = `<?xml version="1.0" encoding="utf-8"?>
+<GetMyeBaySellingRequest xmlns="urn:ebay:apis:eBLBaseComponents">
+  <RequesterCredentials>
+    <eBayAuthToken>${accessToken}</eBayAuthToken>
+  </RequesterCredentials>
+  <SellingSummary>
+    <Include>true</Include>
+  </SellingSummary>
+  <DetailLevel>ReturnAll</DetailLevel>
+  <Version>1173</Version>
+</GetMyeBaySellingRequest>`;
+
+        const response = await axios.post(
+          'https://api.ebay.com/ws/api.dll',
+          xmlRequest,
+          {
+            headers: {
+              'X-EBAY-API-CALL-NAME': 'GetMyeBaySelling',
+              'X-EBAY-API-SITEID': '0',
+              'X-EBAY-API-COMPATIBILITY-LEVEL': '1173',
+              'Content-Type': 'text/xml'
+            }
+          }
+        );
+
+        const result = await parseStringPromise(response.data, { explicitArray: false });
+
+        if (result.GetMyeBaySellingResponse.Ack === 'Failure') {
+          return {
+            sellerId: seller._id,
+            sellerName: seller.user?.username || seller.sellerId || 'Unknown',
+            error: result.GetMyeBaySellingResponse.Errors?.LongMessage || 'eBay API Error'
+          };
+        }
+
+        const summary = result.GetMyeBaySellingResponse.Summary;
+
+        return {
+          sellerId: seller._id,
+          sellerName: seller.user?.username || seller.sellerId || 'Unknown',
+          quantityLimitRemaining: summary?.QuantityLimitRemaining,
+          amountLimitRemaining: summary?.AmountLimitRemaining?._,
+          amountLimitCurrency: summary?.AmountLimitRemaining?.$?.currencyID,
+          activeAuctionCount: summary?.ActiveAuctionCount,
+          auctionSellingCount: summary?.AuctionSellingCount,
+          totalSoldCount: summary?.TotalSoldCount,
+          totalSoldValue: summary?.TotalSoldValue?._,
+          totalSoldValueCurrency: summary?.TotalSoldValue?.$?.currencyID,
+        };
+
+      } catch (err) {
+        console.error(`[Selling Limits] Failed for seller ${seller._id}:`, err.message);
+        return {
+          sellerId: seller._id,
+          sellerName: seller.user?.username || seller.sellerId || 'Unknown',
+          error: err.message
+        };
+      }
+    }));
+
+    res.json({
+      success: true,
+      data: results
+    });
+
+  } catch (error) {
+    console.error('[Selling Summary All] Error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================
+// GET SELLING PRIVILEGES / LIMITS
+// ============================================
+router.get('/selling/summary', requireAuth, async (req, res) => {
+  try {
+    const { sellerId } = req.query;
+
+    if (!sellerId) {
+      return res.status(400).json({ error: 'Missing sellerId' });
+    }
+
+    // 1. Get Seller & Token
+    const seller = await Seller.findById(sellerId);
+    if (!seller) {
+      return res.status(404).json({ error: 'Seller not found' });
+    }
+
+    const accessToken = await ensureValidToken(seller);
+
+    // 2. Prepare Trading API Request
+    const xmlRequest = `<?xml version="1.0" encoding="utf-8"?>
+<GetMyeBaySellingRequest xmlns="urn:ebay:apis:eBLBaseComponents">
+  <RequesterCredentials>
+    <eBayAuthToken>${accessToken}</eBayAuthToken>
+  </RequesterCredentials>
+  <SellingSummary>
+    <Include>true</Include>
+  </SellingSummary>
+  <DetailLevel>ReturnAll</DetailLevel>
+  <Version>1173</Version>
+</GetMyeBaySellingRequest>`;
+
+    // 3. Call eBay Trading API
+    const response = await axios.post(
+      'https://api.ebay.com/ws/api.dll',
+      xmlRequest,
+      {
+        headers: {
+          'X-EBAY-API-CALL-NAME': 'GetMyeBaySelling',
+          'X-EBAY-API-SITEID': '0',
+          'X-EBAY-API-COMPATIBILITY-LEVEL': '1173',
+          'Content-Type': 'text/xml'
+        }
+      }
+    );
+
+    // 4. Parse XML Response
+    const result = await parseStringPromise(response.data, { explicitArray: false });
+
+    if (result.GetMyeBaySellingResponse.Ack === 'Failure') {
+      const errors = result.GetMyeBaySellingResponse.Errors;
+      const errorMsg = Array.isArray(errors) ? errors[0].LongMessage : errors.LongMessage;
+      throw new Error(`eBay API Error: ${errorMsg}`);
+    }
+
+    const summary = result.GetMyeBaySellingResponse.Summary;
+
+    // Extract Relevant Limits
+    const limits = {
+      quantityLimitRemaining: summary?.QuantityLimitRemaining,
+      amountLimitRemaining: summary?.AmountLimitRemaining?._, // currencyID is in attribute
+      amountLimitCurrency: summary?.AmountLimitRemaining?.$?.currencyID,
+      activeAuctionCount: summary?.ActiveAuctionCount,
+      auctionSellingCount: summary?.AuctionSellingCount,
+      totalSoldCount: summary?.TotalSoldCount,
+      totalSoldValue: summary?.TotalSoldValue?._,
+      totalSoldValueCurrency: summary?.TotalSoldValue?.$?.currencyID,
+    };
+
+    res.json({
+      success: true,
+      sellerId,
+      limits,
+      rawSummary: summary
+    });
+
+  } catch (error) {
+    console.error('[Selling Summary] Error:', error.message);
+    if (error.response) {
+      console.error('[Selling Summary] eBay Response:', error.response.data);
+    }
+    res.status(500).json({
+      error: 'Failed to fetch selling limits',
+      details: error.response?.data || error.message
+    });
   }
 });
 

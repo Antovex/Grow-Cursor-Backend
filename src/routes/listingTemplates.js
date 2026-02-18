@@ -97,6 +97,44 @@ router.put('/action-field/:templateId', requireAuth, async (req, res) => {
   }
 });
 
+// Bulk reset overrides for a template (apply base template to all sellers)
+router.delete('/:id/bulk-reset-overrides', requireAuth, async (req, res) => {
+  try {
+    const { id: templateId } = req.params;
+    
+    // Verify template exists
+    const template = await ListingTemplate.findById(templateId);
+    if (!template) {
+      return res.status(404).json({ error: 'Template not found' });
+    }
+    
+    // Get affected sellers before deletion for logging
+    const affectedOverrides = await TemplateOverride.find({ 
+      baseTemplateId: templateId 
+    }).select('sellerId');
+    
+    const affectedSellerIds = affectedOverrides.map(o => o.sellerId);
+    
+    // Perform bulk deletion
+    const result = await TemplateOverride.deleteMany({ 
+      baseTemplateId: templateId 
+    });
+    
+    console.log(`[BULK RESET] Template "${template.name}" (${templateId}): Deleted ${result.deletedCount} overrides for sellers:`, affectedSellerIds);
+    
+    res.json({ 
+      success: true,
+      deletedCount: result.deletedCount,
+      affectedSellers: affectedSellerIds,
+      templateName: template.name,
+      message: `Successfully reset ${result.deletedCount} seller customizations. All sellers will now use the base template.`
+    });
+  } catch (error) {
+    console.error('Error in bulk reset overrides:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // Get all templates
 router.get('/', requireAuth, async (req, res) => {
   try {
@@ -161,6 +199,75 @@ router.post('/', requireAuth, async (req, res) => {
     res.status(201).json(template);
   } catch (error) {
     console.error('Error creating template:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Duplicate template
+router.post('/:id/duplicate', requireAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    // Find the source template
+    const sourceTemplate = await ListingTemplate.findById(id);
+    
+    if (!sourceTemplate) {
+      return res.status(404).json({ error: 'Template not found' });
+    }
+    
+    // Generate unique name with (Copy) suffix
+    let duplicateName = `${sourceTemplate.name} (Copy)`;
+    let copyNumber = 2;
+    
+    // Check if name already exists and increment counter
+    while (await ListingTemplate.findOne({ name: duplicateName })) {
+      duplicateName = `${sourceTemplate.name} (Copy ${copyNumber})`;
+      copyNumber++;
+    }
+    
+    // Create duplicate with all configurations
+    const duplicateData = {
+      name: duplicateName,
+      description: sourceTemplate.description,
+      category: sourceTemplate.category,
+      ebayCategory: sourceTemplate.ebayCategory,
+      customColumns: sourceTemplate.customColumns ? JSON.parse(JSON.stringify(sourceTemplate.customColumns)) : [],
+      asinAutomation: sourceTemplate.asinAutomation ? {
+        enabled: sourceTemplate.asinAutomation.enabled,
+        fieldConfigs: sourceTemplate.asinAutomation.fieldConfigs ? 
+          JSON.parse(JSON.stringify(sourceTemplate.asinAutomation.fieldConfigs)) : []
+      } : { enabled: false, fieldConfigs: [] },
+      pricingConfig: sourceTemplate.pricingConfig ? {
+        enabled: sourceTemplate.pricingConfig.enabled,
+        spentRate: sourceTemplate.pricingConfig.spentRate,
+        payoutRate: sourceTemplate.pricingConfig.payoutRate,
+        desiredProfit: sourceTemplate.pricingConfig.desiredProfit,
+        fixedFee: sourceTemplate.pricingConfig.fixedFee,
+        saleTax: sourceTemplate.pricingConfig.saleTax,
+        ebayFee: sourceTemplate.pricingConfig.ebayFee,
+        adsFee: sourceTemplate.pricingConfig.adsFee,
+        tdsFee: sourceTemplate.pricingConfig.tdsFee,
+        shippingCost: sourceTemplate.pricingConfig.shippingCost,
+        taxRate: sourceTemplate.pricingConfig.taxRate,
+        profitTiers: sourceTemplate.pricingConfig.profitTiers ? {
+          enabled: sourceTemplate.pricingConfig.profitTiers.enabled,
+          tiers: sourceTemplate.pricingConfig.profitTiers.tiers ? 
+            JSON.parse(JSON.stringify(sourceTemplate.pricingConfig.profitTiers.tiers)) : []
+        } : { enabled: false, tiers: [] }
+      } : { enabled: false },
+      coreFieldDefaults: sourceTemplate.coreFieldDefaults ? 
+        JSON.parse(JSON.stringify(sourceTemplate.coreFieldDefaults)) : {},
+      customActionField: sourceTemplate.customActionField,
+      createdBy: req.user.userId
+    };
+    
+    const duplicateTemplate = new ListingTemplate(duplicateData);
+    await duplicateTemplate.save();
+    await duplicateTemplate.populate('createdBy', 'name email');
+    
+    res.status(201).json(duplicateTemplate);
+  } catch (error) {
+    console.error('Error duplicating template:', error);
     res.status(500).json({ error: error.message });
   }
 });
