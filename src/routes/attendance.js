@@ -5,6 +5,10 @@ import User from '../models/User.js';
 
 const router = Router();
 
+// Nomenclature note:
+// This route file uses the legacy name `attendance` for compatibility,
+// but the feature behavior is WORKING HOURS TRACKING (start/pause/resume/stop timer + reports).
+
 // Helper function to get today's date string (YYYY-MM-DD)
 function getTodayDateString() {
     const now = new Date();
@@ -103,7 +107,7 @@ router.post('/resume', requireAuth, async (req, res) => {
         const attendance = await Attendance.findOne({ user: userId, date: today });
 
         if (!attendance) {
-            return res.status(404).json({ error: 'No attendance record found' });
+            return res.status(404).json({ error: 'No working hours record found' });
         }
 
         if (attendance.status !== 'paused') {
@@ -271,7 +275,7 @@ router.post('/admin/force-stop/:attendanceId', requireAuth, requireRole('superad
         const attendance = await Attendance.findById(attendanceId).populate('user', 'username email');
 
         if (!attendance) {
-            return res.status(404).json({ error: 'Attendance record not found' });
+            return res.status(404).json({ error: 'Working hours record not found' });
         }
 
         if (attendance.status === 'completed') {
@@ -316,7 +320,7 @@ router.put('/admin/edit-hours/:attendanceId', requireAuth, requireRole('superadm
         const attendance = await Attendance.findById(attendanceId).populate('user', 'username email');
 
         if (!attendance) {
-            return res.status(404).json({ error: 'Attendance record not found' });
+            return res.status(404).json({ error: 'Working hours record not found' });
         }
 
         // Update total work time
@@ -330,8 +334,8 @@ router.put('/admin/edit-hours/:attendanceId', requireAuth, requireRole('superadm
             attendance
         });
     } catch (error) {
-        console.error('Error editing attendance hours:', error);
-        res.status(500).json({ error: 'Failed to edit attendance hours' });
+        console.error('Error editing working hours:', error);
+        res.status(500).json({ error: 'Failed to edit working hours' });
     }
 });
 
@@ -343,7 +347,7 @@ router.delete('/admin/:attendanceId', requireAuth, requireRole('superadmin', 'hr
         const attendance = await Attendance.findById(attendanceId).populate('user', 'username email');
 
         if (!attendance) {
-            return res.status(404).json({ error: 'Attendance record not found' });
+            return res.status(404).json({ error: 'Working hours record not found' });
         }
 
         const deletedInfo = {
@@ -354,15 +358,15 @@ router.delete('/admin/:attendanceId', requireAuth, requireRole('superadmin', 'hr
 
         await Attendance.findByIdAndDelete(attendanceId);
 
-        console.log(`Admin deleted attendance record for user ${deletedInfo.user} on ${deletedInfo.date}`);
+        console.log(`Admin deleted working hours record for user ${deletedInfo.user} on ${deletedInfo.date}`);
 
         res.json({
-            message: `Attendance record deleted for ${deletedInfo.user} on ${deletedInfo.date}`,
+            message: `Working hours record deleted for ${deletedInfo.user} on ${deletedInfo.date}`,
             deletedRecord: deletedInfo
         });
     } catch (error) {
-        console.error('Error deleting attendance record:', error);
-        res.status(500).json({ error: 'Failed to delete attendance record' });
+        console.error('Error deleting working hours record:', error);
+        res.status(500).json({ error: 'Failed to delete working hours record' });
     }
 });
 

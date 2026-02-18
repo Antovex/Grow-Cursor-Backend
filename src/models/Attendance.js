@@ -1,5 +1,9 @@
 import mongoose from 'mongoose';
 
+// Nomenclature note:
+// Model name `Attendance` is legacy; stored data represents WORKING HOURS sessions.
+// Keep this name to avoid breaking existing references and production data compatibility.
+
 const AttendanceSchema = new mongoose.Schema(
     {
         user: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true },
