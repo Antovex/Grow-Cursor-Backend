@@ -8054,6 +8054,178 @@ router.get('/awaiting-sheet-summary', requireAuth, requireRole('fulfillmentadmin
   }
 });
 
+
+// ============================================
+// GET ALL SELLING PRIVILEGES (BULK)
+// ============================================
+router.get('/selling/summary/all', requireAuth, async (req, res) => {
+  try {
+    const sellers = await Seller.find({}).populate('user');
+    console.log(`[Selling Limits] Fetching limits for ${sellers.length} sellers...`);
+
+    const results = await Promise.all(sellers.map(async (seller) => {
+      try {
+        const accessToken = await ensureValidToken(seller);
+
+        const xmlRequest = `<?xml version="1.0" encoding="utf-8"?>
+<GetMyeBaySellingRequest xmlns="urn:ebay:apis:eBLBaseComponents">
+  <RequesterCredentials>
+    <eBayAuthToken>${accessToken}</eBayAuthToken>
+  </RequesterCredentials>
+  <SellingSummary>
+    <Include>true</Include>
+  </SellingSummary>
+  <DetailLevel>ReturnAll</DetailLevel>
+  <Version>1173</Version>
+</GetMyeBaySellingRequest>`;
+
+        const response = await axios.post(
+          'https://api.ebay.com/ws/api.dll',
+          xmlRequest,
+          {
+            headers: {
+              'X-EBAY-API-CALL-NAME': 'GetMyeBaySelling',
+              'X-EBAY-API-SITEID': '0',
+              'X-EBAY-API-COMPATIBILITY-LEVEL': '1173',
+              'Content-Type': 'text/xml'
+            }
+          }
+        );
+
+        const result = await parseStringPromise(response.data, { explicitArray: false });
+
+        if (result.GetMyeBaySellingResponse.Ack === 'Failure') {
+          return {
+            sellerId: seller._id,
+            sellerName: seller.user?.username || seller.sellerId || 'Unknown',
+            error: result.GetMyeBaySellingResponse.Errors?.LongMessage || 'eBay API Error'
+          };
+        }
+
+        const summary = result.GetMyeBaySellingResponse.Summary;
+
+        return {
+          sellerId: seller._id,
+          sellerName: seller.user?.username || seller.sellerId || 'Unknown',
+          quantityLimitRemaining: summary?.QuantityLimitRemaining,
+          amountLimitRemaining: summary?.AmountLimitRemaining?._,
+          amountLimitCurrency: summary?.AmountLimitRemaining?.$?.currencyID,
+          activeAuctionCount: summary?.ActiveAuctionCount,
+          auctionSellingCount: summary?.AuctionSellingCount,
+          totalSoldCount: summary?.TotalSoldCount,
+          totalSoldValue: summary?.TotalSoldValue?._,
+          totalSoldValueCurrency: summary?.TotalSoldValue?.$?.currencyID,
+        };
+
+      } catch (err) {
+        console.error(`[Selling Limits] Failed for seller ${seller._id}:`, err.message);
+        return {
+          sellerId: seller._id,
+          sellerName: seller.user?.username || seller.sellerId || 'Unknown',
+          error: err.message
+        };
+      }
+    }));
+
+    res.json({
+      success: true,
+      data: results
+    });
+
+  } catch (error) {
+    console.error('[Selling Summary All] Error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================
+// GET SELLING PRIVILEGES / LIMITS
+// ============================================
+router.get('/selling/summary', requireAuth, async (req, res) => {
+  try {
+    const { sellerId } = req.query;
+
+    if (!sellerId) {
+      return res.status(400).json({ error: 'Missing sellerId' });
+    }
+
+    // 1. Get Seller & Token
+    const seller = await Seller.findById(sellerId);
+    if (!seller) {
+      return res.status(404).json({ error: 'Seller not found' });
+    }
+
+    const accessToken = await ensureValidToken(seller);
+
+    // 2. Prepare Trading API Request
+    const xmlRequest = `<?xml version="1.0" encoding="utf-8"?>
+<GetMyeBaySellingRequest xmlns="urn:ebay:apis:eBLBaseComponents">
+  <RequesterCredentials>
+    <eBayAuthToken>${accessToken}</eBayAuthToken>
+  </RequesterCredentials>
+  <SellingSummary>
+    <Include>true</Include>
+  </SellingSummary>
+  <DetailLevel>ReturnAll</DetailLevel>
+  <Version>1173</Version>
+</GetMyeBaySellingRequest>`;
+
+    // 3. Call eBay Trading API
+    const response = await axios.post(
+      'https://api.ebay.com/ws/api.dll',
+      xmlRequest,
+      {
+        headers: {
+          'X-EBAY-API-CALL-NAME': 'GetMyeBaySelling',
+          'X-EBAY-API-SITEID': '0',
+          'X-EBAY-API-COMPATIBILITY-LEVEL': '1173',
+          'Content-Type': 'text/xml'
+        }
+      }
+    );
+
+    // 4. Parse XML Response
+    const result = await parseStringPromise(response.data, { explicitArray: false });
+
+    if (result.GetMyeBaySellingResponse.Ack === 'Failure') {
+      const errors = result.GetMyeBaySellingResponse.Errors;
+      const errorMsg = Array.isArray(errors) ? errors[0].LongMessage : errors.LongMessage;
+      throw new Error(`eBay API Error: ${errorMsg}`);
+    }
+
+    const summary = result.GetMyeBaySellingResponse.Summary;
+
+    // Extract Relevant Limits
+    const limits = {
+      quantityLimitRemaining: summary?.QuantityLimitRemaining,
+      amountLimitRemaining: summary?.AmountLimitRemaining?._, // currencyID is in attribute
+      amountLimitCurrency: summary?.AmountLimitRemaining?.$?.currencyID,
+      activeAuctionCount: summary?.ActiveAuctionCount,
+      auctionSellingCount: summary?.AuctionSellingCount,
+      totalSoldCount: summary?.TotalSoldCount,
+      totalSoldValue: summary?.TotalSoldValue?._,
+      totalSoldValueCurrency: summary?.TotalSoldValue?.$?.currencyID,
+    };
+
+    res.json({
+      success: true,
+      sellerId,
+      limits,
+      rawSummary: summary
+    });
+
+  } catch (error) {
+    console.error('[Selling Summary] Error:', error.message);
+    if (error.response) {
+      console.error('[Selling Summary] eBay Response:', error.response.data);
+    }
+    res.status(500).json({
+      error: 'Failed to fetch selling limits',
+      details: error.response?.data || error.message
+    });
+  }
+});
+
 // Export for optional external schedulers
 export { sendPolicyMessage, processPendingPolicyMessages, getPolicyEligibilityDate };
 
