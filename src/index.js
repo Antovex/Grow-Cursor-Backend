@@ -56,6 +56,8 @@ import remarkTemplatesRoutes from './routes/remarkTemplates.js';
 import extraExpensesRoutes from './routes/extraExpenses.js';
 import leavesRoutes from './routes/leaves.js';
 import asinDirectoryRoutes from './routes/asinDirectory.js';
+import attendanceRoutes from './routes/attendance.js';
+import { initializeScheduledJobs } from './scheduledJobs.js';
 
 const app = express();
 
@@ -130,6 +132,10 @@ app.use('/api/remark-templates', remarkTemplatesRoutes);
 app.use('/api/extra-expenses', extraExpensesRoutes);
 app.use('/api/leaves', leavesRoutes);
 app.use('/api/asin-directory', asinDirectoryRoutes);
+// Nomenclature note:
+// `/api/attendance` is a legacy endpoint name kept for compatibility;
+// it serves working-hours tracking behavior (timer sessions), not traditional attendance management.
+app.use('/api/attendance', attendanceRoutes);
 
 
 const port = process.env.PORT || 5000;
@@ -148,6 +154,9 @@ connectToDatabase()
     } catch (e) {
       console.error('Failed to create sparse unique index on email:', e?.message || e);
     }
+
+    // Initialize scheduled jobs (e.g., daily timer auto-stop)
+    initializeScheduledJobs();
 
     app.listen(port, () => {
       console.log(`API listening on :${port}`);
