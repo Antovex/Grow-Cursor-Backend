@@ -2810,6 +2810,10 @@ router.post('/poll-all-sellers', requireAuth, requireRole('fulfillmentadmin', 's
                 newOrders.push(newOrder);
                 console.log(`  🆕 NEW: ${ebayOrder.orderId}`);
                 await sendAutoWelcomeMessage(seller, newOrder);
+
+                // Fire-and-forget: Update listing quantity to 1
+                updateListingQuantityOnOrder(ebayOrder, accessToken, sellerName)
+                  .catch(err => console.error(`[Quantity Update] Background error for ${ebayOrder.orderId}:`, err.message));
               } else {
                 // Order exists, check if needs update
                 const ebayModTime = new Date(ebayOrder.lastModifiedDate).getTime();
@@ -3177,6 +3181,10 @@ router.post('/poll-new-orders', requireAuth, requireRole('fulfillmentadmin', 'su
               newOrders.push(newOrder);
               console.log(`  🆕 NEW: ${ebayOrder.orderId}`);
               await sendAutoWelcomeMessage(seller, newOrder);
+
+              // Fire-and-forget: Update listing quantity to 1
+              updateListingQuantityOnOrder(ebayOrder, accessToken, sellerName)
+                .catch(err => console.error(`[Quantity Update] Background error for ${ebayOrder.orderId}:`, err.message));
 
               // Fetch ad fee from eBay Finances API
               try {
@@ -3949,6 +3957,144 @@ async function fetchAllOrdersWithPagination(accessToken, filter, sellerName) {
 
   console.log(`[${sellerName}] ✅ Pagination complete: ${allOrders.length} orders`);
   return allOrders;
+}
+
+// ============================================
+// HELPER: Update Listing Quantity to 1 on New Order
+// ============================================
+// When a new order arrives, set availableQuantity to 1 for each line item's listing.
+// Uses Inventory API (REST) for items with SKU, Trading API (XML) for items with only legacyItemId.
+async function updateListingQuantityOnOrder(ebayOrder, accessToken, sellerName) {
+  const lineItems = ebayOrder.lineItems || [];
+  if (lineItems.length === 0) return;
+
+  const orderId = ebayOrder.orderId;
+  console.log(`[Quantity Update] Processing ${lineItems.length} line item(s) for order ${orderId}`);
+
+  for (const lineItem of lineItems) {
+    const sku = lineItem.sku;
+    const legacyItemId = lineItem.legacyItemId;
+    const title = lineItem.title || 'Unknown';
+
+    try {
+      if (sku) {
+        // ========== INVENTORY API (REST) - For items with SKU ==========
+        console.log(`[Quantity Update] Using Inventory API for SKU: ${sku} (${title})`);
+
+        // Step 1: Get offers for this SKU
+        const offersRes = await axios.get(
+          `https://api.ebay.com/sell/inventory/v1/offer`,
+          {
+            headers: {
+              'Authorization': `Bearer ${accessToken}`,
+              'Content-Type': 'application/json',
+              'Accept': 'application/json'
+            },
+            params: {
+              sku: sku,
+              marketplace_id: 'EBAY_US',
+              limit: 10
+            }
+          }
+        );
+
+        const offers = offersRes.data?.offers || [];
+        if (offers.length === 0) {
+          console.log(`[Quantity Update] ⚠️ No offers found for SKU: ${sku}`);
+          continue;
+        }
+
+        // Step 2: Update each offer's availableQuantity to 1
+        for (const offer of offers) {
+          const offerId = offer.offerId;
+          try {
+            // Build the update payload with all required fields from the existing offer
+            const updatePayload = {
+              availableQuantity: 1,
+              categoryId: offer.categoryId,
+              listingDescription: offer.listingDescription,
+              listingPolicies: offer.listingPolicies,
+              merchantLocationKey: offer.merchantLocationKey,
+              pricingSummary: offer.pricingSummary,
+            };
+
+            // Include optional fields if they exist
+            if (offer.listingDuration) updatePayload.listingDuration = offer.listingDuration;
+            if (offer.tax) updatePayload.tax = offer.tax;
+            if (offer.storeCategoryNames) updatePayload.storeCategoryNames = offer.storeCategoryNames;
+            if (offer.quantityLimitPerBuyer) updatePayload.quantityLimitPerBuyer = offer.quantityLimitPerBuyer;
+            if (offer.secondaryCategoryId) updatePayload.secondaryCategoryId = offer.secondaryCategoryId;
+            if (offer.charity) updatePayload.charity = offer.charity;
+            if (offer.hideBuyerDetails !== undefined) updatePayload.hideBuyerDetails = offer.hideBuyerDetails;
+            if (offer.includeCatalogProductDetails !== undefined) updatePayload.includeCatalogProductDetails = offer.includeCatalogProductDetails;
+            if (offer.lotSize) updatePayload.lotSize = offer.lotSize;
+            if (offer.regulatory) updatePayload.regulatory = offer.regulatory;
+            if (offer.extendedProducerResponsibility) updatePayload.extendedProducerResponsibility = offer.extendedProducerResponsibility;
+
+            await axios.put(
+              `https://api.ebay.com/sell/inventory/v1/offer/${offerId}`,
+              updatePayload,
+              {
+                headers: {
+                  'Authorization': `Bearer ${accessToken}`,
+                  'Content-Type': 'application/json',
+                  'Content-Language': 'en-US',
+                  'Accept': 'application/json'
+                }
+              }
+            );
+
+            console.log(`[Quantity Update] ✅ Set quantity to 1 for offer ${offerId} (SKU: ${sku})`);
+          } catch (updateErr) {
+            console.error(`[Quantity Update] ❌ Failed to update offer ${offerId} (SKU: ${sku}):`, updateErr.response?.data || updateErr.message);
+          }
+        }
+      } else if (legacyItemId) {
+        // ========== TRADING API (XML) - For items without SKU ==========
+        console.log(`[Quantity Update] Using Trading API for ItemID: ${legacyItemId} (${title})`);
+
+        const xmlRequest = `<?xml version="1.0" encoding="utf-8"?>
+<ReviseInventoryStatusRequest xmlns="urn:ebay:apis:eBLBaseComponents">
+  <RequesterCredentials>
+    <eBayAuthToken>${accessToken}</eBayAuthToken>
+  </RequesterCredentials>
+  <InventoryStatus>
+    <ItemID>${legacyItemId}</ItemID>
+    <Quantity>1</Quantity>
+  </InventoryStatus>
+</ReviseInventoryStatusRequest>`;
+
+        const tradingRes = await axios.post(
+          'https://api.ebay.com/ws/api.dll',
+          xmlRequest,
+          {
+            headers: {
+              'X-EBAY-API-SITEID': '0',
+              'X-EBAY-API-COMPATIBILITY-LEVEL': '1271',
+              'X-EBAY-API-CALL-NAME': 'ReviseInventoryStatus',
+              'X-EBAY-API-IAF-TOKEN': accessToken,
+              'Content-Type': 'text/xml'
+            }
+          }
+        );
+
+        // Parse XML response to check for errors
+        const parsed = await parseStringPromise(tradingRes.data, { explicitArray: false });
+        const ack = parsed?.ReviseInventoryStatusResponse?.Ack;
+
+        if (ack === 'Success' || ack === 'Warning') {
+          console.log(`[Quantity Update] ✅ Set quantity to 1 for ItemID: ${legacyItemId} (Trading API)`);
+        } else {
+          const errorMsg = parsed?.ReviseInventoryStatusResponse?.Errors?.ShortMessage || 'Unknown error';
+          console.error(`[Quantity Update] ❌ Trading API error for ItemID ${legacyItemId}: ${errorMsg}`);
+        }
+      } else {
+        console.log(`[Quantity Update] ⚠️ Line item has no SKU or ItemID, skipping: ${title}`);
+      }
+    } catch (err) {
+      console.error(`[Quantity Update] ❌ Error updating quantity for ${sku || legacyItemId || title}:`, err.response?.data || err.message);
+    }
+  }
 }
 
 // Helper function to build order data object for insert/update
