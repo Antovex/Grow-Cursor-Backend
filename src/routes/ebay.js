@@ -6864,7 +6864,79 @@ router.post('/update-listing', requireAuth, async (req, res) => {
 });
 
 
-// 4.5. GET EBAY API USAGE STATS
+// ============================================
+// HELPER: Fetch eBay Developer Analytics Rate Limits
+// Cached for 5 minutes to avoid inflating the developer API usage counter.
+// eBay rate limits are APP-LEVEL (per Client ID), not per-seller.
+// All sellers share the same pool — fetching with any seller token gives the same result.
+// ============================================
+let _rateLimitCache = null;
+let _rateLimitCacheTime = 0;
+const RATE_LIMIT_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+
+async function fetchEbayRateLimits(accessToken, forceRefresh = false) {
+  const now = Date.now();
+  if (!forceRefresh && _rateLimitCache && (now - _rateLimitCacheTime) < RATE_LIMIT_CACHE_TTL_MS) {
+    console.log('[Rate Limits] Returning cached result');
+    return _rateLimitCache;
+  }
+
+  try {
+    const response = await axios.get(
+      'https://api.ebay.com/developer/analytics/v1_beta/rate_limit',
+      {
+        headers: {
+          'Authorization': `Bearer ${accessToken}`,
+          'Content-Type': 'application/json',
+          'X-EBAY-C-MARKETPLACE-ID': 'EBAY_US'
+        }
+      }
+    );
+
+    const rateLimitData = response.data?.rateLimits || [];
+
+    // Build per-context entries, each with their individual resources listed.
+    // Note: eBay uses a SHARED pool per context — all resources draw from the same bucket.
+    // The used/limit/remaining is the same for every resource in a context.
+    const contexts = [];
+    for (const api of rateLimitData) {
+      const ctx = api.apiContext || 'Other';
+      const firstResource = api.resources?.[0];
+      const firstRate = firstResource?.rates?.[0];
+      if (!firstRate) continue;
+
+      const used = (firstRate.limit || 0) - (firstRate.remaining || 0);
+      const usagePercent = firstRate.limit > 0
+        ? Math.round((used / firstRate.limit) * 100)
+        : 0;
+
+      // Collect all resource names
+      const resources = (api.resources || []).map(r => r.name).filter(Boolean);
+
+      contexts.push({
+        apiContext: ctx,
+        apiName: api.apiName,
+        apiVersion: api.apiVersion,
+        limit: firstRate.limit,
+        remaining: firstRate.remaining,
+        reset: firstRate.reset,
+        used,
+        usagePercent,
+        resources  // individual resource names that share this pool
+      });
+    }
+
+    const result = { success: true, rateLimits: contexts, fetchedAt: new Date().toISOString() };
+    _rateLimitCache = result;
+    _rateLimitCacheTime = now;
+    return result;
+  } catch (err) {
+    console.error('[Rate Limits] Error fetching from eBay:', err.message);
+    return { success: false, error: err.message, rateLimits: [] };
+  }
+}
+
+// 4.5. GET EBAY API USAGE STATS (single seller — for compatibility dashboard badge)
 router.get('/api-usage-stats', requireAuth, async (req, res) => {
   const { sellerId } = req.query;
 
@@ -6879,15 +6951,68 @@ router.get('/api-usage-stats', requireAuth, async (req, res) => {
     }
 
     const token = await ensureValidToken(seller);
-    const stats = await getCachedUsageStats(sellerId, token);
+    const stats = await fetchEbayRateLimits(token);
 
-    res.json(stats);
+    // Compute a simple summary for the compatibility dashboard badge
+    let used = 0, limit = 1, remaining = 0, hoursUntilReset = 24;
+    if (stats.rateLimits.length > 0) {
+      const mostUsed = stats.rateLimits.reduce((a, b) => (a.usagePercent > b.usagePercent ? a : b));
+      used = mostUsed.used;
+      limit = mostUsed.limit;
+      remaining = mostUsed.remaining;
+      if (mostUsed.reset) {
+        const resetTime = new Date(mostUsed.reset);
+        hoursUntilReset = Math.max(0, Math.ceil((resetTime - Date.now()) / (1000 * 60 * 60)));
+      }
+    }
+
+    res.json({ success: stats.success, used, limit, remaining, hoursUntilReset, rateLimits: stats.rateLimits });
   } catch (err) {
     console.error('Error fetching API usage stats:', err.message);
-    res.status(500).json({
-      error: 'Failed to fetch API usage stats',
-      success: false
+    res.status(500).json({ error: 'Failed to fetch API usage stats', success: false });
+  }
+});
+
+// 4.6. GET EBAY API USAGE STATS (app-level — same for all sellers)
+// Calls eBay ONCE (not once per seller) since limits are app-level.
+// Uses a 5-minute cache to avoid inflating developer API usage.
+router.get('/api-usage-stats/all', requireAuth, async (req, res) => {
+  try {
+    const forceRefresh = req.query.refresh === 'true';
+
+    // Get any one seller to use their token — result is the same for all
+    const sellers = await Seller.find({}).populate('user');
+    if (sellers.length === 0) {
+      return res.json({ success: true, rateLimits: [], sellers: [], fetchedAt: null });
+    }
+
+    // Try each seller until we get a valid token
+    let stats = null;
+    for (const seller of sellers) {
+      try {
+        const token = await ensureValidToken(seller);
+        stats = await fetchEbayRateLimits(token, forceRefresh);
+        if (stats.success) break;
+      } catch (err) {
+        console.warn(`[API Usage] Skipping seller ${seller._id}: ${err.message}`);
+      }
+    }
+
+    if (!stats) stats = { success: false, error: 'No valid seller token found', rateLimits: [] };
+
+    res.json({
+      success: stats.success,
+      rateLimits: stats.rateLimits,
+      fetchedAt: stats.fetchedAt || null,
+      cached: !forceRefresh,
+      sellers: sellers.map(s => ({
+        _id: s._id,
+        name: s.user?.username || s.user?.email || 'Unknown'
+      }))
     });
+  } catch (err) {
+    console.error('[API Usage All] Error:', err.message);
+    res.status(500).json({ error: err.message });
   }
 });
 
