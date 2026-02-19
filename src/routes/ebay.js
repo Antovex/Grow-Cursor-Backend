@@ -1535,6 +1535,26 @@ router.get('/stored-orders', async (req, res) => {
       query.shipByDate = { $gte: startOfDay, $lte: endOfDay };
     }
 
+    // Date Sold Specific Day Filter (req.query.dateSold)
+    // This is different from startDate/endDate range, it targets a single specific day
+    if (req.query.dateSold) {
+      const dateSold = req.query.dateSold;
+      const PST_OFFSET_HOURS = 8;
+
+      // Start of sold date in UTC (midnight PST = 8am UTC)
+      const startOfDay = new Date(dateSold);
+      startOfDay.setUTCHours(PST_OFFSET_HOURS, 0, 0, 0);
+
+      // End of sold date in UTC (11:59:59 PM PST = 7:59:59 AM UTC next day)
+      const endOfDay = new Date(dateSold);
+      endOfDay.setDate(endOfDay.getDate() + 1);
+      endOfDay.setUTCHours(PST_OFFSET_HOURS - 1, 59, 59, 999);
+
+      // If startDate/endDate were already set, this specific date filter overrides or intersects
+      // For simplicity in this specific "Awaiting Shipment" context, we'll let this take precedence if set
+      query.dateSold = { $gte: startOfDay, $lte: endOfDay };
+    }
+
     // Exclude Low Value Orders (less than $3)
     if (req.query.excludeLowValue === 'true') {
       // Filter orders where subtotal or subtotalUSD is >= 3
