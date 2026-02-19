@@ -3959,6 +3959,30 @@ async function fetchAllOrdersWithPagination(accessToken, filter, sellerName) {
   return allOrders;
 }
 
+// Item IDs that should NOT have their quantity updated when ordered
+const QUANTITY_UPDATE_EXCLUDED_ITEMS = new Set([
+  '127311585410',
+  '127311587672',
+  '127311588411',
+  '127311588863',
+  '127311596014',
+  '389381058706',
+  '389381053145',
+  '389381049342',
+  '389381045467',
+  '389381039761',
+  '317649392161',
+  '317649397683',
+  '317649395742',
+  '317649399983',
+  '317649401541',
+  '127632524706',
+  '127632525908',
+  '127632527199',
+  '127632535240',
+  '127632517576',
+]);
+
 // ============================================
 // HELPER: Update Listing Quantity to 1 on New Order
 // ============================================
@@ -3977,6 +4001,11 @@ async function updateListingQuantityOnOrder(ebayOrder, accessToken, sellerName) 
 
     if (!legacyItemId) {
       console.log(`[Quantity Update] ⚠️ Line item has no ItemID, skipping: ${title}`);
+      continue;
+    }
+
+    if (QUANTITY_UPDATE_EXCLUDED_ITEMS.has(legacyItemId)) {
+      console.log(`[Quantity Update] ⏭️ Excluded ItemID: ${legacyItemId} (${title}), skipping`);
       continue;
     }
 
