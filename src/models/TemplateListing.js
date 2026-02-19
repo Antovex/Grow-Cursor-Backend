@@ -139,6 +139,17 @@ const templateListingSchema = new mongoose.Schema({
     default: null
   },
   
+  // Duplicate tracking
+  duplicateCount: {
+    type: Number,
+    default: 0,
+    min: 0
+  },
+  lastDuplicateAttempt: {
+    type: Date,
+    default: null
+  },
+  
   // CUSTOM COLUMNS (flexible Map structure)
   customFields: {
     type: Map,
