@@ -39,8 +39,8 @@ router.get('/', requireAuth, async (req, res) => {
       // Specific batch
       filter.downloadBatchId = batchId;
     } else if (batchFilter === 'active') {
-      // Active batch only (not downloaded)
-      filter.downloadBatchId = null;
+      // Active batch: not yet downloaded OR flagged for re-download after duplicate update
+      filter.$or = [{ downloadBatchId: null }, { pendingRedownload: true }];
     } else if (batchFilter === 'all') {
       // All batches (no filter on downloadBatchId)
     }
@@ -2030,9 +2030,9 @@ router.post('/bulk-save', requireAuth, async (req, res) => {
             location: listingData.location,
             customFields: customFieldsMap,
             
-            // Reset download batch so listing re-appears in the active batch queue
-            downloadBatchId: null,
-            downloadedAt: null,
+            // Flag for re-download so listing re-appears in the active batch queue
+            // without clearing downloadBatchId (preserves download history)
+            pendingRedownload: true,
             
             duplicateCount: (existingListing.duplicateCount || 0) + 1,
             lastDuplicateAttempt: Date.now(),
@@ -2813,7 +2813,7 @@ router.get('/export-csv/:templateId', requireAuth, async (req, res) => {
     // even if they have downloadBatchId=null, ensuring consistency with UI
     const filter = { 
       templateId,
-      downloadBatchId: null, // Only active batch (not yet downloaded)
+      $or: [{ downloadBatchId: null }, { pendingRedownload: true }], // Active batch: not downloaded yet OR flagged for re-download
       status: 'active'       // Only active listings (exclude inactive/draft/sold/ended)
     };
     if (sellerId) {
@@ -2855,13 +2855,14 @@ router.get('/export-csv/:templateId', requireAuth, async (req, res) => {
     console.log('🔢 Batch number:', batchNumber);
     console.log('🆔 Batch ID:', batchId);
     
-    // Mark listings as downloaded
+    // Mark listings as downloaded (also clears pendingRedownload flag)
     const updateResult = await TemplateListing.updateMany(
       filter,
       {
         downloadBatchId: batchId,
         downloadedAt: new Date(),
-        downloadBatchNumber: batchNumber
+        downloadBatchNumber: batchNumber,
+        pendingRedownload: false
       }
     );
     
