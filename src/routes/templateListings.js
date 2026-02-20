@@ -513,6 +513,11 @@ router.get('/bulk-preview-stream', requireAuth, async (req, res) => {
               description: existingListing.description,
               startPrice: existingListing.startPrice,
               quantity: existingListing.quantity,
+              itemPhotoUrl: existingListing.itemPhotoUrl || '',
+              conditionId: existingListing.conditionId || '',
+              format: existingListing.format || '',
+              duration: existingListing.duration || '',
+              location: existingListing.location || '',
               customLabel: existingListing.customLabel,
               customFields: existingCustomFields,
               _asinReference: asin,
@@ -1043,7 +1048,12 @@ router.post('/bulk-autofill-from-asins', requireAuth, async (req, res) => {
                 title: existingListing.title,
                 description: existingListing.description,
                 startPrice: existingListing.startPrice,
-                quantity: existingListing.quantity
+                quantity: existingListing.quantity,
+                itemPhotoUrl: existingListing.itemPhotoUrl || '',
+                conditionId: existingListing.conditionId || '',
+                format: existingListing.format || '',
+                duration: existingListing.duration || '',
+                location: existingListing.location || ''
               },
               customFields: existingCustomFields
             },
@@ -2018,26 +2028,22 @@ router.post('/bulk-save', requireAuth, async (req, res) => {
             : new Map();
           
           // Update existing listing with new data
-          Object.assign(existingListing, {
-            title: listingData.title,
-            description: listingData.description,
-            startPrice: listingData.startPrice,
-            quantity: listingData.quantity,
-            itemPhotoUrl: listingData.itemPhotoUrl,
-            conditionId: listingData.conditionId,
-            format: listingData.format,
-            duration: listingData.duration,
-            location: listingData.location,
+          // Build update object - only overwrite fields that are explicitly provided
+          // (guards against undefined wiping values that weren't sent from the frontend)
+          const updateData = {
             customFields: customFieldsMap,
-            
-            // Flag for re-download so listing re-appears in the active batch queue
-            // without clearing downloadBatchId (preserves download history)
             pendingRedownload: true,
-            
             duplicateCount: (existingListing.duplicateCount || 0) + 1,
             lastDuplicateAttempt: Date.now(),
             updatedAt: Date.now()
-          });
+          };
+          const overwritableFields = ['title', 'description', 'startPrice', 'quantity', 'itemPhotoUrl', 'conditionId', 'format', 'duration', 'location'];
+          for (const field of overwritableFields) {
+            if (listingData[field] !== undefined && listingData[field] !== null && listingData[field] !== '') {
+              updateData[field] = listingData[field];
+            }
+          }
+          Object.assign(existingListing, updateData);
           
           await existingListing.save();
           
