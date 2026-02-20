@@ -2810,6 +2810,10 @@ router.post('/poll-all-sellers', requireAuth, requireRole('fulfillmentadmin', 's
                 newOrders.push(newOrder);
                 console.log(`  🆕 NEW: ${ebayOrder.orderId}`);
                 await sendAutoWelcomeMessage(seller, newOrder);
+
+                // Fire-and-forget: Update listing quantity to 1
+                updateListingQuantityOnOrder(ebayOrder, accessToken, sellerName)
+                  .catch(err => console.error(`[Quantity Update] Background error for ${ebayOrder.orderId}:`, err.message));
               } else {
                 // Order exists, check if needs update
                 const ebayModTime = new Date(ebayOrder.lastModifiedDate).getTime();
@@ -3177,6 +3181,10 @@ router.post('/poll-new-orders', requireAuth, requireRole('fulfillmentadmin', 'su
               newOrders.push(newOrder);
               console.log(`  🆕 NEW: ${ebayOrder.orderId}`);
               await sendAutoWelcomeMessage(seller, newOrder);
+
+              // Fire-and-forget: Update listing quantity to 1
+              updateListingQuantityOnOrder(ebayOrder, accessToken, sellerName)
+                .catch(err => console.error(`[Quantity Update] Background error for ${ebayOrder.orderId}:`, err.message));
 
               // Fetch ad fee from eBay Finances API
               try {
@@ -3949,6 +3957,100 @@ async function fetchAllOrdersWithPagination(accessToken, filter, sellerName) {
 
   console.log(`[${sellerName}] ✅ Pagination complete: ${allOrders.length} orders`);
   return allOrders;
+}
+
+// Item IDs that should NOT have their quantity updated when ordered
+const QUANTITY_UPDATE_EXCLUDED_ITEMS = new Set([
+  '127311585410',
+  '127311587672',
+  '127311588411',
+  '127311588863',
+  '127311596014',
+  '389381058706',
+  '389381053145',
+  '389381049342',
+  '389381045467',
+  '389381039761',
+  '317649392161',
+  '317649397683',
+  '317649395742',
+  '317649399983',
+  '317649401541',
+  '127632524706',
+  '127632525908',
+  '127632527199',
+  '127632535240',
+  '127632517576',
+]);
+
+// ============================================
+// HELPER: Update Listing Quantity to 1 on New Order
+// ============================================
+// When a new order arrives, set quantity to 1 for each line item's listing.
+// Uses Trading API (ReviseInventoryStatus) which works for ALL listing types.
+async function updateListingQuantityOnOrder(ebayOrder, accessToken, sellerName) {
+  const lineItems = ebayOrder.lineItems || [];
+  if (lineItems.length === 0) return;
+
+  const orderId = ebayOrder.orderId;
+  console.log(`[Quantity Update] Processing ${lineItems.length} line item(s) for order ${orderId}`);
+
+  for (const lineItem of lineItems) {
+    const legacyItemId = lineItem.legacyItemId;
+    const title = lineItem.title || 'Unknown';
+
+    if (!legacyItemId) {
+      console.log(`[Quantity Update] ⚠️ Line item has no ItemID, skipping: ${title}`);
+      continue;
+    }
+
+    if (QUANTITY_UPDATE_EXCLUDED_ITEMS.has(legacyItemId)) {
+      console.log(`[Quantity Update] ⏭️ Excluded ItemID: ${legacyItemId} (${title}), skipping`);
+      continue;
+    }
+
+    try {
+      console.log(`[Quantity Update] Setting quantity to 1 for ItemID: ${legacyItemId} (${title})`);
+
+      const xmlRequest = `<?xml version="1.0" encoding="utf-8"?>
+<ReviseInventoryStatusRequest xmlns="urn:ebay:apis:eBLBaseComponents">
+  <RequesterCredentials>
+    <eBayAuthToken>${accessToken}</eBayAuthToken>
+  </RequesterCredentials>
+  <InventoryStatus>
+    <ItemID>${legacyItemId}</ItemID>
+    <Quantity>1</Quantity>
+  </InventoryStatus>
+</ReviseInventoryStatusRequest>`;
+
+      const tradingRes = await axios.post(
+        'https://api.ebay.com/ws/api.dll',
+        xmlRequest,
+        {
+          headers: {
+            'X-EBAY-API-SITEID': '0',
+            'X-EBAY-API-COMPATIBILITY-LEVEL': '1271',
+            'X-EBAY-API-CALL-NAME': 'ReviseInventoryStatus',
+            'X-EBAY-API-IAF-TOKEN': accessToken,
+            'Content-Type': 'text/xml'
+          }
+        }
+      );
+
+      // Parse XML response to check for errors
+      const parsed = await parseStringPromise(tradingRes.data, { explicitArray: false });
+      const ack = parsed?.ReviseInventoryStatusResponse?.Ack;
+
+      if (ack === 'Success' || ack === 'Warning') {
+        console.log(`[Quantity Update] ✅ Set quantity to 1 for ItemID: ${legacyItemId}`);
+      } else {
+        const errorMsg = parsed?.ReviseInventoryStatusResponse?.Errors?.ShortMessage || 'Unknown error';
+        console.error(`[Quantity Update] ❌ Trading API error for ItemID ${legacyItemId}: ${errorMsg}`);
+      }
+    } catch (err) {
+      console.error(`[Quantity Update] ❌ Error updating quantity for ItemID ${legacyItemId}:`, err.response?.data || err.message);
+    }
+  }
 }
 
 // Helper function to build order data object for insert/update
