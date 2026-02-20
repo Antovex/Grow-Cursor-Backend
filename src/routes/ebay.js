@@ -5,6 +5,7 @@ import jwt from 'jsonwebtoken';
 import mongoose from 'mongoose';
 import moment from 'moment-timezone';
 import fs from 'fs';
+import zlib from 'zlib';
 import path from 'path';
 import sharp from 'sharp';
 import FormData from 'form-data';
@@ -240,6 +241,86 @@ router.get('/feed/tasks', requireAuth, async (req, res) => {
     res.status(500).json({
       error: 'Failed to fetch feed tasks',
       details: error.response?.data || error.message
+    });
+  }
+});
+
+// ============================================
+// DOWNLOAD FEED RESULT FILE (Error Details)
+// ============================================
+router.get('/feed/result/:taskId', requireAuth, async (req, res) => {
+  try {
+    const { taskId } = req.params;
+    const { sellerId } = req.query;
+
+    if (!sellerId) {
+      return res.status(400).json({ error: 'Missing sellerId' });
+    }
+
+    // 1. Get Seller & Token
+    const seller = await Seller.findById(sellerId);
+    if (!seller) {
+      return res.status(404).json({ error: 'Seller not found' });
+    }
+
+    const accessToken = await ensureValidToken(seller);
+
+    // 2. Check task exists and is in a completed state
+    const feedUpload = await FeedUpload.findOne({ taskId, seller: sellerId });
+    if (!feedUpload) {
+      return res.status(404).json({ error: 'Task not found' });
+    }
+
+    if (feedUpload.status !== 'COMPLETED' && feedUpload.status !== 'COMPLETED_WITH_ERROR') {
+      return res.status(400).json({ error: 'Result file is only available for completed tasks' });
+    }
+
+    console.log(`[Feed Result] Downloading result file for task ${taskId}...`);
+
+    // 3. Download result file from eBay
+    // GET https://api.ebay.com/sell/feed/v1/task/{task_id}/download_result_file
+    const resultRes = await axios.get(
+      `https://api.ebay.com/sell/feed/v1/task/${taskId}/download_result_file`,
+      {
+        headers: {
+          'Authorization': `Bearer ${accessToken}`,
+          'X-EBAY-C-MARKETPLACE-ID': 'EBAY_US',
+          'Accept': 'application/octet-stream'
+        },
+        responseType: 'arraybuffer'
+      }
+    );
+
+    console.log(`[Feed Result] Received response, size: ${resultRes.data.length} bytes`);
+
+    // 4. Decompress if gzipped, otherwise use raw data
+    let fileContent;
+    try {
+      fileContent = zlib.gunzipSync(Buffer.from(resultRes.data));
+    } catch (e) {
+      // Not gzipped, use raw data
+      fileContent = Buffer.from(resultRes.data);
+    }
+
+    // 5. Send as downloadable CSV
+    const fileName = `errors_${feedUpload.fileName || taskId}.csv`;
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
+    res.send(fileContent);
+
+  } catch (error) {
+    console.error('[Feed Result] Error:', error.message);
+    if (error.response) {
+      console.error('[Feed Result] eBay Status:', error.response.status);
+    }
+
+    if (error.response?.status === 404) {
+      return res.status(404).json({ error: 'Result file not available yet. Task may still be processing.' });
+    }
+
+    res.status(500).json({
+      error: 'Failed to download result file',
+      details: error.response?.data?.toString?.() || error.message
     });
   }
 });
