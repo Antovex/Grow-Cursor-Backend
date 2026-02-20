@@ -2030,6 +2030,10 @@ router.post('/bulk-save', requireAuth, async (req, res) => {
             location: listingData.location,
             customFields: customFieldsMap,
             
+            // Reset download batch so listing re-appears in the active batch queue
+            downloadBatchId: null,
+            downloadedAt: null,
+            
             duplicateCount: (existingListing.duplicateCount || 0) + 1,
             lastDuplicateAttempt: Date.now(),
             updatedAt: Date.now()
