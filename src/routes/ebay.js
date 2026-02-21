@@ -8025,6 +8025,33 @@ router.patch('/returns/:returnId/logs', requireAuth, async (req, res) => {
   }
 });
 
+// Mark / unmark a return as SNAD (manual BBE override)
+router.patch('/returns/:returnId/mark-snad', requireAuth, async (req, res) => {
+  try {
+    const { returnId } = req.params;
+    const { markedAsSNAD } = req.body;
+
+    if (typeof markedAsSNAD !== 'boolean') {
+      return res.status(400).json({ error: 'markedAsSNAD must be a boolean' });
+    }
+
+    const returnDoc = await Return.findOneAndUpdate(
+      { returnId },
+      { markedAsSNAD },
+      { new: true }
+    );
+
+    if (!returnDoc) {
+      return res.status(404).json({ error: 'Return not found' });
+    }
+
+    res.json({ success: true, return: returnDoc });
+  } catch (err) {
+    console.error('Error updating return SNAD status:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Update logs for an order (Cancellation)
 router.patch('/orders/:orderId/logs', requireAuth, async (req, res) => {
   try {
