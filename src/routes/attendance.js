@@ -157,7 +157,7 @@ router.post('/stop', requireAuth, async (req, res) => {
         res.json({
             message: 'Timer stopped',
             attendance,
-            totalHours: (attendance.totalWorkTime / (1000 * 60 * 60)).toFixed(2)
+            totalHours: (() => { const m = Math.floor(attendance.totalWorkTime / 60000); return `${String(Math.floor(m / 60)).padStart(2, '0')}:${String(m % 60).padStart(2, '0')}`; })()
         });
     } catch (error) {
         console.error('Error stopping timer:', error);
@@ -193,7 +193,7 @@ router.get('/status', requireAuth, async (req, res) => {
             status: attendance.status,
             isStrictTimer: user?.isStrictTimer !== false,
             attendance,
-            totalHours: (attendance.totalWorkTime / (1000 * 60 * 60)).toFixed(2)
+            totalHours: (() => { const m = Math.floor(attendance.totalWorkTime / 60000); return `${String(Math.floor(m / 60)).padStart(2, '0')}:${String(m % 60).padStart(2, '0')}`; })()
         });
     } catch (error) {
         console.error('Error fetching status:', error);
