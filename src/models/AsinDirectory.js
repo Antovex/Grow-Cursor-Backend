@@ -19,7 +19,21 @@ const asinDirectorySchema = new mongoose.Schema({
   addedAt: {
     type: Date,
     default: Date.now
-  }
+  },
+
+  // Enrichment fields from ScraperAPI
+  title: { type: String, default: '' },
+  brand: { type: String, default: '' },
+  price: { type: String, default: '' },
+  images: { type: [String], default: [] },
+  description: { type: String, default: '' },
+  color: { type: String, default: '' },
+  compatibility: { type: String, default: '' },
+
+  // Scrape tracking
+  scraped: { type: Boolean, default: false, index: true },
+  scrapedAt: { type: Date, default: null },
+  scrapeError: { type: String, default: null }
 });
 
 // Indexes
