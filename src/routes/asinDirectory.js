@@ -30,6 +30,7 @@ router.get('/', requireAuth, async (req, res) => {
     const limit = parseInt(req.query.limit) || 25;
     const search = req.query.search || '';
     const sortBy = req.query.sortBy || '-addedAt'; // Default: newest first
+    const listProductId = req.query.listProductId || '';
 
     const skip = (page - 1) * limit;
 
@@ -37,6 +38,9 @@ router.get('/', requireAuth, async (req, res) => {
     let query = {};
     if (search) {
       query.asin = { $regex: search.toUpperCase(), $options: 'i' };
+    }
+    if (listProductId) {
+      query.listProductId = listProductId;
     }
 
     // Get total count
