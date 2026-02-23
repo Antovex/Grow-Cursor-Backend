@@ -1,6 +1,25 @@
 import express from 'express';
 import AsinDirectory from '../models/AsinDirectory.js';
 import { requireAuth } from '../middleware/auth.js';
+import { fetchAmazonData } from '../utils/asinAutofill.js';
+
+// Scrape a batch of ASINs in parallel (max 5 at a time) and return enrichment map
+async function scrapeAsinsBatched(asinList, batchSize = 5) {
+  const enrichmentMap = new Map();
+  for (let i = 0; i < asinList.length; i += batchSize) {
+    const batch = asinList.slice(i, i + batchSize);
+    const results = await Promise.allSettled(batch.map(asin => fetchAmazonData(asin)));
+    results.forEach((result, idx) => {
+      const asin = batch[idx];
+      if (result.status === 'fulfilled') {
+        enrichmentMap.set(asin, { ok: true, data: result.value });
+      } else {
+        enrichmentMap.set(asin, { ok: false, error: result.reason?.message || 'Scrape failed' });
+      }
+    });
+  }
+  return enrichmentMap;
+}
 
 const router = express.Router();
 
@@ -11,6 +30,7 @@ router.get('/', requireAuth, async (req, res) => {
     const limit = parseInt(req.query.limit) || 25;
     const search = req.query.search || '';
     const sortBy = req.query.sortBy || '-addedAt'; // Default: newest first
+    const listProductId = req.query.listProductId || '';
 
     const skip = (page - 1) * limit;
 
@@ -18,6 +38,9 @@ router.get('/', requireAuth, async (req, res) => {
     let query = {};
     if (search) {
       query.asin = { $regex: search.toUpperCase(), $options: 'i' };
+    }
+    if (listProductId) {
+      query.listProductId = listProductId;
     }
 
     // Get total count
@@ -100,10 +123,34 @@ router.post('/bulk-manual', requireAuth, async (req, res) => {
       validAsins.push(cleanAsin);
     }
 
-    // Insert ASINs, handling duplicates
+    // Scrape all valid ASINs in parallel batches
+    console.log(`🔍 Scraping ${validAsins.length} ASINs for directory enrichment...`);
+    const enrichmentMap = await scrapeAsinsBatched(validAsins);
+
+    // Insert ASINs with enrichment data
     for (const asin of validAsins) {
       try {
-        await AsinDirectory.create({ asin });
+        const enrichment = enrichmentMap.get(asin);
+        const doc = { asin };
+
+        if (enrichment?.ok) {
+          const d = enrichment.data;
+          doc.title = d.title || '';
+          doc.brand = d.brand || '';
+          doc.price = d.price ? String(d.price) : '';
+          doc.images = Array.isArray(d.images) ? d.images : [];
+          doc.description = d.description || '';
+          doc.color = d.color || '';
+          doc.compatibility = d.compatibility || '';
+          doc.scraped = true;
+          doc.scrapedAt = new Date();
+          doc.scrapeError = null;
+        } else {
+          doc.scraped = false;
+          doc.scrapeError = enrichment?.error || 'Scrape failed';
+        }
+
+        await AsinDirectory.create(doc);
         results.added++;
       } catch (error) {
         if (error.code === 11000) {
@@ -175,10 +222,35 @@ router.post('/bulk-csv', requireAuth, async (req, res) => {
       asins.push({ asin: cleanAsin, row: i + 1 });
     }
 
-    // Insert ASINs
+    // Scrape all valid ASINs in parallel batches
+    const asinStrings = asins.map(a => a.asin);
+    console.log(`🔍 Scraping ${asinStrings.length} ASINs for directory enrichment...`);
+    const enrichmentMap = await scrapeAsinsBatched(asinStrings);
+
+    // Insert ASINs with enrichment data
     for (const { asin, row } of asins) {
       try {
-        await AsinDirectory.create({ asin });
+        const enrichment = enrichmentMap.get(asin);
+        const doc = { asin };
+
+        if (enrichment?.ok) {
+          const d = enrichment.data;
+          doc.title = d.title || '';
+          doc.brand = d.brand || '';
+          doc.price = d.price ? String(d.price) : '';
+          doc.images = Array.isArray(d.images) ? d.images : [];
+          doc.description = d.description || '';
+          doc.color = d.color || '';
+          doc.compatibility = d.compatibility || '';
+          doc.scraped = true;
+          doc.scrapedAt = new Date();
+          doc.scrapeError = null;
+        } else {
+          doc.scraped = false;
+          doc.scrapeError = enrichment?.error || 'Scrape failed';
+        }
+
+        await AsinDirectory.create(doc);
         results.added++;
       } catch (error) {
         if (error.code === 11000) {

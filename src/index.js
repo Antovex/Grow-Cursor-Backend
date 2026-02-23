@@ -56,6 +56,9 @@ import remarkTemplatesRoutes from './routes/remarkTemplates.js';
 import extraExpensesRoutes from './routes/extraExpenses.js';
 import leavesRoutes from './routes/leaves.js';
 import asinDirectoryRoutes from './routes/asinDirectory.js';
+import asinListCategoriesRoutes from './routes/asinListCategories.js';
+import asinListRangesRoutes from './routes/asinListRanges.js';
+import asinListProductsRoutes from './routes/asinListProducts.js';
 import attendanceRoutes from './routes/attendance.js';
 import { initializeScheduledJobs } from './scheduledJobs.js';
 
@@ -132,6 +135,9 @@ app.use('/api/remark-templates', remarkTemplatesRoutes);
 app.use('/api/extra-expenses', extraExpensesRoutes);
 app.use('/api/leaves', leavesRoutes);
 app.use('/api/asin-directory', asinDirectoryRoutes);
+app.use('/api/asin-list-categories', asinListCategoriesRoutes);
+app.use('/api/asin-list-ranges', asinListRangesRoutes);
+app.use('/api/asin-list-products', asinListProductsRoutes);
 // Nomenclature note:
 // `/api/attendance` is a legacy endpoint name kept for compatibility;
 // it serves working-hours tracking behavior (timer sessions), not traditional attendance management.
