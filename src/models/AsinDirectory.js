@@ -33,7 +33,15 @@ const asinDirectorySchema = new mongoose.Schema({
   // Scrape tracking
   scraped: { type: Boolean, default: false, index: true },
   scrapedAt: { type: Date, default: null },
-  scrapeError: { type: String, default: null }
+  scrapeError: { type: String, default: null },
+
+  // Assignment to a product list (Category → Range → Product)
+  listProductId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'AsinListProduct',
+    default: null,
+    index: true
+  }
 });
 
 // Indexes
