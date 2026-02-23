@@ -82,4 +82,22 @@ router.post('/move', requireAuth, async (req, res) => {
   }
 });
 
+// Delete a product and orphan its assigned ASINs
+router.delete('/:id', requireAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    await AsinDirectory.updateMany(
+      { listProductId: id },
+      { $unset: { listProductId: '' } }
+    );
+
+    await AsinListProduct.findByIdAndDelete(id);
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Error deleting asin list product:', error);
+    res.status(500).json({ error: 'Failed to delete product' });
+  }
+});
+
 export default router;
